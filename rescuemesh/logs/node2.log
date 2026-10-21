@@ -1,5 +1,0 @@
-[2m2026-10-20T22:38:20.307690Z[0m [32m INFO[0m [2mrescuemesh::node[0m[2m:[0m cloud node up [3mnode[0m[2m=[0m2 [3mlisten[0m[2m=[0m127.0.0.1:7002 [3mworkers[0m[2m=[0m10 [3massigner[0m[2m=[0m"hash-placeholder"
-[2m2026-10-20T22:38:20.307807Z[0m [32m INFO[0m [2mrescuemesh::node[0m[2m:[0m peer link connected [3mpeer[0m[2m=[0m1 [3maddr[0m[2m=[0m127.0.0.1:7001
-[2m2026-10-20T22:38:20.307808Z[0m [32m INFO[0m [2mrescuemesh::node[0m[2m:[0m peer link connected [3mpeer[0m[2m=[0m3 [3maddr[0m[2m=[0m127.0.0.1:7003
-[2m2026-10-20T22:38:21.834130Z[0m [32m INFO[0m [2mrescuemesh::node[0m[2m:[0m peer inbound connected [3mpeer[0m[2m=[0m1
-[2m2026-10-20T22:38:21.843513Z[0m [32m INFO[0m [2mrescuemesh::node[0m[2m:[0m peer inbound connected [3mpeer[0m[2m=[0m3

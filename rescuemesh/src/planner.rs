@@ -299,7 +299,7 @@ pub fn plan(
                 .slots
                 .iter()
                 .enumerate()
-                .filter(|(_, &k)| k == tk)
+                .filter(|&(_, &k)| k == tk)
                 .map(|(s, _)| sol[s])
                 .collect();
             kept_total += target_picks.len();
