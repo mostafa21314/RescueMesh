@@ -283,11 +283,14 @@ impl Elections {
         let r = self.round(rid, attempt, now_us);
         let outcome = if r.decided.is_some() || r.attempt != attempt {
             BidOutcome::Late
-        } else if r.bids.contains_key(&node) {
-            BidOutcome::Duplicate
         } else {
-            r.bids.insert(node, score_us);
-            BidOutcome::Recorded
+            match r.bids.entry(node) {
+                std::collections::btree_map::Entry::Occupied(_) => BidOutcome::Duplicate,
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(score_us);
+                    BidOutcome::Recorded
+                }
+            }
         };
         match outcome {
             BidOutcome::Late => self.stats.late_bids += 1,
@@ -378,10 +381,10 @@ impl Elections {
     /// The executor has enqueued (or skipped) a request it won: release the
     /// reservation. Idempotent.
     pub fn start_execution(&mut self, rid: &str) {
-        if let Some(r) = self.rounds.get_mut(rid) {
-            if std::mem::take(&mut r.reserved) {
-                self.reserved -= 1;
-            }
+        if let Some(r) = self.rounds.get_mut(rid)
+            && std::mem::take(&mut r.reserved)
+        {
+            self.reserved -= 1;
         }
     }
 

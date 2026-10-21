@@ -163,10 +163,10 @@ async fn worker(
                 if s.is_none() {
                     *s = connect_one(&addrs[i], &tx).await;
                 }
-                if let Some(sink) = s {
-                    if wire::send(sink, &msg).await.is_err() {
-                        *s = None;
-                    }
+                if let Some(sink) = s
+                    && wire::send(sink, &msg).await.is_err()
+                {
+                    *s = None;
                 }
             }
             let deadline = tokio::time::Instant::now() + timeout;

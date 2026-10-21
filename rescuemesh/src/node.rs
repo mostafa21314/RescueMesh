@@ -464,10 +464,10 @@ impl Node {
         if let Some(w) = decided {
             return w;
         }
-        if let Some(rx) = rx {
-            if let Ok(Ok(w)) = tokio::time::timeout(Duration::from_millis(self.cfg.bid_timeout_ms), rx).await {
-                return w;
-            }
+        if let Some(rx) = rx
+            && let Ok(Ok(w)) = tokio::time::timeout(Duration::from_millis(self.cfg.bid_timeout_ms), rx).await
+        {
+            return w;
         }
         let now = self.mono_us();
         let mut el = self.elections.lock();

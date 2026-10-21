@@ -8,6 +8,7 @@
 //!   * responder commitment and resource availability are *derived* from the kept
 //!     plans' assignments (busy-until = latest commitment; available = capacity minus
 //!     unexpired allocations) instead of being updated in place.
+//!
 //! So replicas converge once they have applied the same set of ops.
 //!
 //! Duplicate execution: during membership changes two nodes can both win the
