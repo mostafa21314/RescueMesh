@@ -1,4 +1,5 @@
 use clap::Parser;
+use rescuemesh::assign::AssignerKind;
 use rescuemesh::node::{run, NodeConfig};
 use rescuemesh::planner::PlannerConfig;
 
@@ -38,6 +39,21 @@ struct Args {
     /// Planner: extra perturbed re-solves per request (tunes CPU cost).
     #[arg(long, default_value_t = 6)]
     sensitivity_rounds: u32,
+    /// Executor selection: load-bidding election, or the load-blind hash baseline.
+    #[arg(long, value_enum, default_value_t = AssignerKind::Election)]
+    assigner: AssignerKind,
+    /// Election: decide on the bids received so far after this many ms.
+    #[arg(long, default_value_t = 100)]
+    bid_timeout_ms: u64,
+    /// Election: assumed service time (ms) until the first plan completes.
+    #[arg(long, default_value_t = 10.0)]
+    prior_service_ms: f64,
+    /// Election: CPU calibration probe period (ms).
+    #[arg(long, default_value_t = 200)]
+    probe_ms: u64,
+    /// Emulate a CPU this many times slower (artificial load; 1 = off).
+    #[arg(long, default_value_t = 1.0)]
+    slow_factor: f64,
 }
 
 fn parse_peer(s: &str) -> Result<(u32, String), String> {
@@ -66,6 +82,11 @@ async fn main() -> anyhow::Result<()> {
         responders: a.responders,
         resources: a.resources,
         planner,
+        assigner: a.assigner,
+        bid_timeout_ms: a.bid_timeout_ms,
+        prior_service_ms: a.prior_service_ms,
+        probe_ms: a.probe_ms,
+        slow_factor: a.slow_factor,
     })
     .await
 }

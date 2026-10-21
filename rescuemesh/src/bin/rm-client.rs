@@ -49,8 +49,19 @@ enum Cmd {
         #[arg(long)]
         show_plan: bool,
     },
-    /// Ask every node for its status and compare replicas.
+    /// Ask every node for its status and compare replicas. Election metrics are
+    /// printed as key=value pairs (one line per node) for scripts.
     Status,
+    /// Artificial load: make node N emulate a CPU FACTOR times slower for SECS
+    /// seconds (0 = until changed; --factor 1 turns it off).
+    Slow {
+        #[arg(long)]
+        node: usize,
+        #[arg(long, default_value_t = 4.0)]
+        factor: f64,
+        #[arg(long, default_value_t = 30)]
+        secs: u64,
+    },
 }
 
 struct Row {
@@ -286,10 +297,19 @@ async fn main() -> anyhow::Result<()> {
                 match tokio::time::timeout(Duration::from_secs(2), wire::recv(&mut w)).await {
                     Ok(Ok(Some(Msg::Status(st)))) => {
                         println!(
-                            "node {} @ {a}: version {} plans {} digest {} pending {} active_incidents {} executed_here {} queue {} inflight {} ewma {:.1}ms live {:?} dropped {} assigner {}",
+                            "node {} @ {a}: version {} plans {} digest {} pending {} active_incidents {} executed_here {} queue {} inflight {} reserved {} service_est {:.1}ms probe_ratio {:.2} score {}us slow {} live {:?} dropped {} assigner {}",
                             st.node, st.version, st.plans, st.plans_digest, st.pending, st.active_incidents,
-                            st.executed_here, st.load.queue_len, st.load.inflight, st.load.ewma_service_ms,
+                            st.executed_here, st.load.queue_len, st.load.inflight, st.load.reserved,
+                            st.load.ewma_service_ms, st.load.probe_ratio, st.load.score_us, st.load.slow_factor,
                             st.live, st.dropped_peer_msgs, st.assigner
+                        );
+                        let e = &st.election;
+                        println!(
+                            "  election node={} decided={} won={} full={} timeout={} bids_sent={} bid_bytes_sent={} bids_recv={} dup_bids={} late_bids={} orphans={} open={} dur_mean_us={:.0} dur_p50_us={} dur_p99_us={} dur_max_us={} executed={} duplicate_executions={}",
+                            st.node, e.decided, e.won, e.decided_full, e.decided_timeout, e.bids_sent, e.bid_bytes_sent,
+                            e.bids_received, e.duplicate_bids, e.late_bids, e.orphan_rounds, e.open_rounds,
+                            e.duration_mean_us, e.duration_p50_us, e.duration_p99_us, e.duration_max_us,
+                            st.executed_here, st.duplicate_executions
                         );
                         digests.push((st.plans, st.plans_digest));
                     }
@@ -299,6 +319,15 @@ async fn main() -> anyhow::Result<()> {
             if digests.len() > 1 {
                 let same = digests.windows(2).all(|w| w[0] == w[1]);
                 println!("replicas consistent: {same}");
+            }
+        }
+        Cmd::Slow { node, factor, secs } => {
+            let a = addrs.get(node.wrapping_sub(1)).ok_or_else(|| anyhow::anyhow!("--node must be 1..={}", addrs.len()))?;
+            let mut w = wire::framed(TcpStream::connect(a).await?);
+            wire::send(&mut w, &Msg::Slow { factor, secs }).await?;
+            match tokio::time::timeout(Duration::from_secs(2), wire::recv(&mut w)).await {
+                Ok(Ok(Some(Msg::Ack { message }))) => println!("{message}"),
+                other => anyhow::bail!("{a}: bad reply {other:?}"),
             }
         }
     }
