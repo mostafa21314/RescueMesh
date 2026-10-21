@@ -1,0 +1,5 @@
+target/
+logs/
+*.pid
+*.csv
+.DS_Store
