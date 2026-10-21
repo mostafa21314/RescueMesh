@@ -6,12 +6,17 @@
 //!     `Hello` = peer link, anything else = client session);
 //!   * one outbound link task per peer (reconnects with backoff, fed by a bounded
 //!     channel);
-//!   * a heartbeat task (load report to every peer) and a prune task;
+//!   * a heartbeat task (load report to every peer), a prune task, an election GC
+//!     task and a CPU calibration probe task;
 //!   * CPU-bound planning runs on the blocking pool, bounded by a semaphore of
 //!     `workers` permits. Requests waiting for a permit form the node's queue,
 //!     which is what `queue_len` in the load report measures.
+//!
+//! Executor selection per request is either the load-bidding election
+//! (`election.rs`, default) or the load-blind hash baseline (`assign.rs`).
 
-use crate::assign::{Assigner, HashAssigner};
+use crate::assign::{hash_choose, AssignerKind};
+use crate::election::{self, Elections, ServiceEstimator};
 use crate::campus::{seed_resources, seed_responders, Campus};
 use crate::model::*;
 use crate::planner::{self, PlannerConfig};
@@ -23,7 +28,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, info, warn};
@@ -41,12 +46,73 @@ pub struct NodeConfig {
     pub responders: usize,
     pub resources: usize,
     pub planner: PlannerConfig,
+    pub assigner: AssignerKind,
+    /// Election: decide on the bids received so far after this long.
+    pub bid_timeout_ms: u64,
+    /// Election: service-time prior until the first completion.
+    pub prior_service_ms: f64,
+    /// Election: CPU calibration probe period.
+    pub probe_ms: u64,
+    /// Injected slowdown at startup (1.0 = none); also settable via `rm-client slow`.
+    pub slow_factor: f64,
+}
+
+/// Artificial load injection: emulates a CPU `factor`x slower on this node. After any
+/// timed CPU work (a plan or a probe) that took `t`, the thread sleeps `(factor-1)·t`
+/// while still holding its planner permit. The election sees this only through real
+/// measurement (longer service times, slower probes). Sleeping rather than spinning
+/// keeps the co-located nodes of the one-machine testbed unaffected, as if node and
+/// hog were on their own machine.
+struct Slowdown {
+    factor_milli: AtomicU64,
+    until_ms: AtomicU64,
+}
+
+impl Slowdown {
+    fn set(&self, factor: f64, secs: u64) {
+        self.factor_milli.store((factor.max(1.0) * 1000.0).round() as u64, Relaxed);
+        self.until_ms.store(if secs == 0 { 0 } else { now_ms() + secs * 1000 }, Relaxed);
+    }
+
+    fn factor(&self) -> f64 {
+        let until = self.until_ms.load(Relaxed);
+        if until != 0 && now_ms() >= until {
+            return 1.0;
+        }
+        self.factor_milli.load(Relaxed) as f64 / 1000.0
+    }
+
+    fn stretch(&self, work: Duration) {
+        let f = self.factor();
+        if f > 1.0 {
+            std::thread::sleep(work.mul_f64(f - 1.0));
+        }
+    }
+}
+
+/// RAII gauge: +1 while alive. Keeps `queue_len`/`inflight` exact on every exit path,
+/// so the load metric cannot drift.
+struct Gauge<'a>(&'a AtomicU32);
+
+impl<'a> Gauge<'a> {
+    fn new(c: &'a AtomicU32) -> Self {
+        c.fetch_add(1, Relaxed);
+        Gauge(c)
+    }
+}
+
+impl Drop for Gauge<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Relaxed);
+    }
 }
 
 struct PeerHandle {
     tx: mpsc::Sender<Msg>,
     last_seen_ms: AtomicU64,
     load: Mutex<Option<LoadReport>>,
+    /// Wakes the outbound link out of its reconnect backoff (see `peer_inbound`).
+    kick: Arc<tokio::sync::Notify>,
 }
 
 pub struct Node {
@@ -54,14 +120,17 @@ pub struct Node {
     campus: Campus,
     state: Mutex<ClusterState>,
     peers: HashMap<NodeId, PeerHandle>,
-    assigner: Box<dyn Assigner>,
     workers: Arc<Semaphore>,
+    elections: Mutex<Elections>,
+    estimator: Mutex<ServiceEstimator>,
+    slow: Slowdown,
+    /// Monotonic clock origin for election timings.
+    t0: Instant,
     queue_len: AtomicU32,
     inflight: AtomicU32,
     completed: AtomicU64,
     executed_here: AtomicU64,
     dropped: AtomicU64,
-    ewma_service_ms: Mutex<f64>,
     /// Requests being executed here -> client sessions waiting for the result
     /// (a retry arriving mid-execution joins the waiters instead of re-running).
     waiters: Mutex<HashMap<RequestId, Vec<mpsc::Sender<Msg>>>>,
@@ -76,10 +145,19 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
 
     let mut peers = HashMap::new();
     let mut links = Vec::new();
+    // Peers count as live for one liveness window after boot. Starting from 0 made a
+    // freshly (re)started node see only itself as live and elect itself for every
+    // request until the first heartbeats arrived, i.e. duplicate executions. Now it
+    // waits for the peers' bids, or the bid timeout if they really are down.
+    let boot_ms = now_ms();
     for (pid, addr) in &cfg.peers {
         let (tx, rx) = mpsc::channel(4096);
-        peers.insert(*pid, PeerHandle { tx, last_seen_ms: AtomicU64::new(0), load: Mutex::new(None) });
-        links.push((*pid, addr.clone(), rx));
+        let kick = Arc::new(tokio::sync::Notify::new());
+        peers.insert(
+            *pid,
+            PeerHandle { tx, last_seen_ms: AtomicU64::new(boot_ms), load: Mutex::new(None), kick: kick.clone() },
+        );
+        links.push((*pid, addr.clone(), rx, kick));
     }
 
     let node = Arc::new(Node {
@@ -88,28 +166,35 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         campus,
         state: Mutex::new(state),
         peers,
-        assigner: Box::new(HashAssigner),
+        elections: Mutex::new(Elections::new(cfg.id)),
+        estimator: Mutex::new(ServiceEstimator::new(cfg.prior_service_ms * 1000.0)),
+        slow: Slowdown { factor_milli: AtomicU64::new(1000), until_ms: AtomicU64::new(0) },
+        t0: Instant::now(),
         queue_len: AtomicU32::new(0),
         inflight: AtomicU32::new(0),
         completed: AtomicU64::new(0),
         executed_here: AtomicU64::new(0),
         dropped: AtomicU64::new(0),
-        ewma_service_ms: Mutex::new(0.0),
         waiters: Mutex::new(HashMap::new()),
     });
 
-    for (pid, addr, rx) in links {
-        tokio::spawn(peer_link(cfg.id, pid, addr, rx));
+    for (pid, addr, rx, kick) in links {
+        tokio::spawn(peer_link(cfg.id, pid, addr, rx, kick));
     }
     tokio::spawn(heartbeat_loop(node.clone()));
     tokio::spawn(prune_loop(node.clone()));
+    node.slow.set(cfg.slow_factor, 0);
+    if cfg.assigner == AssignerKind::Election {
+        tokio::spawn(probe_loop(node.clone()));
+        tokio::spawn(election_gc_loop(node.clone()));
+    }
 
     let listener = TcpListener::bind(&cfg.listen).await?;
     info!(
         node = cfg.id,
         listen = %cfg.listen,
         workers = cfg.workers,
-        assigner = node.assigner.name(),
+        assigner = cfg.assigner.name(),
         "cloud node up"
     );
     loop {
@@ -126,7 +211,7 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
 /// Outbound link to one peer. Messages queue in `rx` while disconnected; the
 /// channel is bounded and senders use try_send, so a long outage drops messages
 /// (counted in `dropped`) instead of blocking request handling.
-async fn peer_link(me: NodeId, peer: NodeId, addr: String, mut rx: mpsc::Receiver<Msg>) {
+async fn peer_link(me: NodeId, peer: NodeId, addr: String, mut rx: mpsc::Receiver<Msg>, kick: Arc<tokio::sync::Notify>) {
     let mut backoff = Duration::from_millis(100);
     loop {
         match TcpStream::connect(&addr).await {
@@ -148,7 +233,10 @@ async fn peer_link(me: NodeId, peer: NodeId, addr: String, mut rx: mpsc::Receive
                 }
             }
             Err(_) => {
-                tokio::time::sleep(backoff).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = kick.notified() => {}
+                }
                 backoff = (backoff * 2).min(Duration::from_secs(2));
             }
         }
@@ -169,6 +257,12 @@ async fn handle_conn(node: Arc<Node>, stream: TcpStream) -> anyhow::Result<()> {
 
 async fn peer_inbound(node: Arc<Node>, peer: NodeId, mut w: Wire) -> anyhow::Result<()> {
     info!(peer, "peer inbound connected");
+    // The peer just (re)started: reconnect our side now rather than after up to 2 s of
+    // backoff. Until then it would get no bids from us, decide every round alone on
+    // the bid timeout and elect itself (duplicate executions after a restart).
+    if let Some(h) = node.peers.get(&peer) {
+        h.kick.notify_one();
+    }
     while let Some(msg) = wire::recv(&mut w).await? {
         if let Some(h) = node.peers.get(&peer) {
             h.last_seen_ms.store(now_ms(), Relaxed);
@@ -179,6 +273,7 @@ async fn peer_inbound(node: Arc<Node>, peer: NodeId, mut w: Wire) -> anyhow::Res
                     *h.load.lock() = Some(load);
                 }
             }
+            Msg::Bid { request_id, attempt, node: from, score_us } => node.on_peer_bid(request_id, attempt, from, score_us),
             Msg::Replicate { from, op } => {
                 let id = op.op_id().to_string();
                 if node.state.lock().apply(op) {
@@ -220,6 +315,11 @@ async fn client_session(node: Arc<Node>, w: Wire, first: Msg) -> anyhow::Result<
             Msg::StatusQuery => {
                 let _ = tx.send(Msg::Status(node.status())).await;
             }
+            Msg::Slow { factor, secs } => {
+                node.slow.set(factor, secs);
+                info!(factor, secs, "slowdown injected");
+                let _ = tx.send(Msg::Ack { message: format!("node {} slow factor {factor} for {secs}s", node.cfg.id) }).await;
+            }
             other => {
                 let _ = tx
                     .send(Msg::Error { request_id: None, message: format!("unexpected message: {other:?}") })
@@ -247,27 +347,62 @@ impl Node {
         live
     }
 
+    fn mono_us(&self) -> u64 {
+        self.t0.elapsed().as_micros() as u64
+    }
+
+    /// Requests this node has committed to but not finished: waiting for a worker,
+    /// being planned, or won in an election and not yet enqueued.
+    fn outstanding(&self) -> u32 {
+        self.queue_len.load(Relaxed) + self.inflight.load(Relaxed) + self.elections.lock().reserved()
+    }
+
+    /// The bid: estimated completion time (µs) of one more request here, now.
+    fn score_now(&self) -> u64 {
+        let est = self.estimator.lock().estimate_us();
+        election::score_us(est, self.outstanding(), self.cfg.workers as u32)
+    }
+
     fn load_report(&self) -> LoadReport {
+        let (est, ratio) = {
+            let e = self.estimator.lock();
+            (e.estimate_us(), e.probe_ratio())
+        };
+        // Locals, not inline: a lock guard temporary inside the struct literal would
+        // still be held while score_now() locks the same mutex.
+        let reserved = self.elections.lock().reserved();
+        let score_us = self.score_now();
         LoadReport {
             queue_len: self.queue_len.load(Relaxed),
             inflight: self.inflight.load(Relaxed),
             workers: self.cfg.workers as u32,
+            reserved,
             completed: self.completed.load(Relaxed),
-            ewma_service_ms: *self.ewma_service_ms.lock(),
+            ewma_service_ms: est / 1000.0,
+            probe_ratio: ratio,
+            score_us,
+            slow_factor: self.slow.factor(),
             sent_ms: now_ms(),
         }
     }
 
-    fn broadcast(&self, msg: Msg) {
+    /// Queue `msg` to every peer link; returns how many accepted it.
+    fn broadcast(&self, msg: Msg) -> usize {
+        let mut sent = 0;
         for h in self.peers.values() {
             if h.tx.try_send(msg.clone()).is_err() {
                 self.dropped.fetch_add(1, Relaxed);
+            } else {
+                sent += 1;
             }
         }
+        sent
     }
 
     pub fn status(&self) -> StatusReport {
         let now = now_ms();
+        let load = self.load_report();
+        let election = self.elections.lock().snapshot().finish(); // sort runs after unlock
         let st = self.state.lock();
         StatusReport {
             node: self.cfg.id,
@@ -277,10 +412,12 @@ impl Node {
             plans_digest: format!("{:016x}", st.plans_digest),
             pending: st.pending.len(),
             executed_here: self.executed_here.load(Relaxed),
-            load: self.load_report(),
+            load,
             live: self.live_nodes(),
-            assigner: self.assigner.name().to_string(),
+            assigner: self.cfg.assigner.name().to_string(),
             dropped_peer_msgs: self.dropped.load(Relaxed),
+            election,
+            duplicate_executions: st.duplicate_executions,
         }
     }
 
@@ -288,63 +425,166 @@ impl Node {
         let me = self.cfg.id;
 
         // Idempotency: an already-committed request is answered from the cache by
-        // the node that executed it; the others stay silent.
-        let cached = self.state.lock().plans.get(&rid).cloned();
-        if let Some(plan) = cached {
-            if plan.executed_by == me {
-                let _ = reply.send(Msg::PlanResult { request_id: rid, plan, duplicate: true }).await;
-            }
+        // the node that executed it; the others stay silent (and do not bid).
+        if self.reply_if_committed(&rid, &reply).await {
             return;
         }
 
         self.state.lock().observe_incident(&incident);
-        let live = self.live_nodes();
-        let executor = self.assigner.choose(&rid, &live);
+        let executor = match self.cfg.assigner {
+            AssignerKind::Hash => hash_choose(&rid, &self.live_nodes()),
+            AssignerKind::Election => self.elect(&rid).await,
+        };
         if executor != me {
-            debug!(request = %rid, executor, "not selected; tracking as pending");
-            self.state.lock().pending.insert(
-                rid,
-                Pending { executor, received_ms: now_ms(), incident },
-            );
+            debug!(request = %rid, executor, "not elected; tracking as pending");
+            let mut st = self.state.lock();
+            // The executor's commit may already have arrived while we were deciding.
+            if !st.plans.contains_key(&rid) {
+                st.pending.insert(rid, Pending { executor, attempt: 0, received_ms: now_ms(), incident });
+            }
             return;
         }
+        self.execute(rid, client, incident, reply).await;
+    }
+
+    /// Answer from the committed-plan cache if this node executed the request.
+    /// Returns true if the request is already committed (by anyone).
+    async fn reply_if_committed(&self, rid: &RequestId, reply: &mpsc::Sender<Msg>) -> bool {
+        let cached = self.state.lock().plans.get(rid).cloned();
+        match cached {
+            Some(plan) => {
+                if plan.executed_by == self.cfg.id {
+                    let _ = reply.send(Msg::PlanResult { request_id: rid.clone(), plan, duplicate: true }).await;
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// One election round for `rid` (attempt 0): bid, then wait for the full bid set
+    /// or the bid timeout. A repeated Submit (client retry) joins the same round.
+    async fn elect(&self, rid: &RequestId) -> NodeId {
+        let now = self.mono_us();
+        let score = self.score_now();
+        let live = self.live_nodes();
+        let (fresh, decided, rx) = {
+            let mut el = self.elections.lock();
+            let fresh = el.local_bid(rid, 0, score, now);
+            let decided = el.decision(rid).or_else(|| el.try_decide(rid, &live, now));
+            let rx = if decided.is_none() { el.subscribe(rid) } else { None };
+            (fresh, decided, rx)
+        };
+        if fresh {
+            let msg = Msg::Bid { request_id: rid.clone(), attempt: 0, node: self.cfg.id, score_us: score };
+            let bytes = serde_json::to_vec(&msg).map(|v| v.len() + 4).unwrap_or(0);
+            let sent = self.broadcast(msg);
+            self.elections.lock().note_sent(sent, sent * bytes);
+        }
+        if let Some(w) = decided {
+            return w;
+        }
+        if let Some(rx) = rx
+            && let Ok(Ok(w)) = tokio::time::timeout(Duration::from_millis(self.cfg.bid_timeout_ms), rx).await
+        {
+            return w;
+        }
+        let now = self.mono_us();
+        let mut el = self.elections.lock();
+        // None only if the round was garbage-collected, which takes seconds.
+        el.decide_on_timeout(rid, now).unwrap_or_else(|| hash_choose(rid, &live))
+    }
+
+    fn on_peer_bid(&self, rid: RequestId, attempt: u32, from: NodeId, score_us: u64) {
+        if self.cfg.assigner != AssignerKind::Election {
+            return;
+        }
+        let committed = self.state.lock().plans.contains_key(&rid);
+        let live = self.live_nodes();
+        let now = self.mono_us();
+        let mut el = self.elections.lock();
+        if committed {
+            el.note_late();
+            return;
+        }
+        el.peer_bid(&rid, attempt, from, score_us, now);
+        if let Some(w) = el.try_decide(&rid, &live, now) {
+            debug!(request = %rid, winner = w, "elected on full bid set");
+        }
+    }
+
+    async fn execute(self: Arc<Self>, rid: RequestId, client: String, incident: Incident, reply: mpsc::Sender<Msg>) {
+        let me = self.cfg.id;
 
         // Duplicate arriving while we are still computing: wait for the same result.
-        {
+        // If it finished meanwhile (or a duplicate executor's plan already arrived),
+        // answer from the cache instead of planning again.
+        let committed = {
             let mut w = self.waiters.lock();
             if let Some(v) = w.get_mut(&rid) {
                 v.push(reply);
                 return;
             }
-            w.insert(rid.clone(), vec![reply]);
+            let committed = self.state.lock().plans.contains_key(&rid);
+            if !committed {
+                w.insert(rid.clone(), vec![reply.clone()]);
+            }
+            committed
+        };
+        if committed {
+            self.elections.lock().start_execution(&rid);
+            self.reply_if_committed(&rid, &reply).await;
+            return;
         }
+        drop(reply);
 
-        self.queue_len.fetch_add(1, Relaxed);
+        let queued = Gauge::new(&self.queue_len);
+        self.elections.lock().start_execution(&rid);
         let permit = self.workers.clone().acquire_owned().await.expect("semaphore closed");
-        self.queue_len.fetch_sub(1, Relaxed);
-        self.inflight.fetch_add(1, Relaxed);
+        drop(queued);
+        // While we queued, another executor (duplicate under a split view) may have
+        // committed this request: skip planning. Its executor answers the client.
+        if self.state.lock().plans.contains_key(&rid) {
+            drop(permit);
+            self.waiters.lock().remove(&rid);
+            debug!(request = %rid, "already committed by a peer; skipped planning");
+            return;
+        }
+        let inflight = Gauge::new(&self.inflight);
 
         let snap = self.state.lock().snapshot(now_ms());
         let node = self.clone();
         let (inc2, rid2) = (incident.clone(), rid.clone());
-        let plan = tokio::task::spawn_blocking(move || {
-            planner::plan(&node.cfg.planner, &node.campus, &snap, &inc2, &rid2, me)
+        let res = tokio::task::spawn_blocking(move || {
+            let t = Instant::now();
+            let mut plan = planner::plan(&node.cfg.planner, &node.campus, &snap, &inc2, &rid2, me);
+            node.slow.stretch(t.elapsed());
+            // Service time as the client and the load metric see it (incl. injected slowdown).
+            plan.compute_us = t.elapsed().as_micros() as u64;
+            plan
         })
-        .await
-        .expect("planner panicked");
+        .await;
         drop(permit);
-        self.inflight.fetch_sub(1, Relaxed);
+        drop(inflight);
+        let plan = match res {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(request = %rid, "planner failed: {e}");
+                let txs = self.waiters.lock().remove(&rid).unwrap_or_default();
+                for tx in txs {
+                    let _ = tx.send(Msg::Error { request_id: Some(rid.clone()), message: "planner failed".into() }).await;
+                }
+                return;
+            }
+        };
         self.completed.fetch_add(1, Relaxed);
         self.executed_here.fetch_add(1, Relaxed);
-        {
-            let mut e = self.ewma_service_ms.lock();
-            let ms = plan.compute_us as f64 / 1000.0;
-            *e = if *e == 0.0 { ms } else { 0.8 * *e + 0.2 * ms };
-        }
+        self.estimator.lock().on_completion(plan.compute_us as f64, self.mono_us());
 
         let plan = Arc::new(plan);
         let op = ReplOp::PlanCommitted {
             op_id: format!("plan:{rid}"),
+            attempt: 0,
             incident: Arc::new(incident),
             plan: plan.clone(),
         };
@@ -358,6 +598,63 @@ impl Node {
                 .send(Msg::PlanResult { request_id: rid.clone(), plan: plan.clone(), duplicate: i > 0 })
                 .await;
         }
+    }
+}
+
+/// Fixed CPU micro-benchmark (~0.3 ms at full speed). Median of three runs, so one
+/// preemption does not register as a slowdown but sustained contention does.
+fn probe_us(slow: &Slowdown) -> f64 {
+    let mut runs = [0.0f64; 3];
+    for r in runs.iter_mut() {
+        let t = Instant::now();
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        for i in 0..300_000u64 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x = x.wrapping_add(i);
+        }
+        std::hint::black_box(x);
+        slow.stretch(t.elapsed());
+        *r = t.elapsed().as_secs_f64() * 1e6;
+    }
+    runs.sort_by(f64::total_cmp);
+    runs[1]
+}
+
+async fn probe_loop(node: Arc<Node>) {
+    let mut tick = tokio::time::interval(Duration::from_millis(node.cfg.probe_ms));
+    loop {
+        tick.tick().await;
+        let n = node.clone();
+        if let Ok(us) = tokio::task::spawn_blocking(move || probe_us(&n.slow)).await {
+            node.estimator.lock().on_probe(us, node.mono_us());
+        }
+        // Cold start: borrow the peers' work-per-request estimate (heartbeat data is
+        // stale, but this only seeds a prior) so a node that has not won anything yet
+        // does not bid with an arbitrary default.
+        let peer_work = node
+            .peers
+            .values()
+            .filter_map(|h| h.load.lock().clone())
+            .filter(|l| l.completed >= 5 && l.probe_ratio > 0.0)
+            .map(|l| l.ewma_service_ms * 1000.0 / l.probe_ratio)
+            .min_by(f64::total_cmp);
+        if let Some(w) = peer_work {
+            node.estimator.lock().seed_prior(w);
+        }
+    }
+}
+
+async fn election_gc_loop(node: Arc<Node>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        // Decided rounds: 10 s, so late bids and duplicate Submits still find the round;
+        // a retry in that window re-uses the decision, even if the elected executor has
+        // since crashed (re-election on executor failure is the fault-tolerance bullet,
+        // via `attempt` + `pending`). Orphans (bids without a local Submit): 30 s.
+        node.elections.lock().gc(node.mono_us(), 10_000_000, 30_000_000);
     }
 }
 

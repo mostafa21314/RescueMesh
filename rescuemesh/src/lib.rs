@@ -3,6 +3,7 @@
 
 pub mod assign;
 pub mod campus;
+pub mod election;
 pub mod model;
 pub mod node;
 pub mod planner;
