@@ -22,7 +22,10 @@ For every request `rid` (attempt 0), each node runs:
    Submit never bids and never decides, since it could not execute the request anyway.
 4. **Winner** = the bid with the lowest `(score_bucket(score_us), tiebreak(rid, node), node)`.
    * `score_bucket` keeps 3 mantissa bits of the integer score (an integer log scale, ~6–12 %
-     steps). Differences inside one bucket are below the noise of the estimate and count as ties.
+     steps). Differences inside one bucket count as ties. This resolution is a design choice, not the
+     noise floor: idle, unslowed nodes on the test machine showed probe ratios of 1.5–1.9, far
+     wider than one bucket. The buckets only stop a few-percent EWMA difference from deciding
+     every tie the same way.
    * `tiebreak = splitmix(fnv1a(rid ‖ '#' ‖ node_be32))` gives a different pseudo-random node
      order per request, so ties (an idle cluster, equal nodes) spread evenly and do not always
      favour node 1. The finalizer is needed because FNV-1a barely mixes the last input byte into
@@ -34,9 +37,11 @@ For every request `rid` (attempt 0), each node runs:
    30 s.
 
 The rule is a pure function of the bid set, so **every node that sees the same bids elects the same
-node**. Even when bid sets differ (Section 4), **at least one node always executes**: the node `m`
+node**. Even when bid sets differ (Section 4), at least one node elects itself: the node `m`
 holding the globally lowest bid has its own bid in its set, and the minimum of any set that
-contains the global minimum is `m`.
+contains the global minimum is `m`. That node executes the request **unless it crashes before
+committing**. Then the request is lost: a client retry within the 10 s round TTL re-uses the
+decided round, which still names the dead node, and no re-election exists yet (Section 9).
 
 **Example message flow** (illustrative: node 2 slowed; scores in µs):
 
@@ -57,7 +62,7 @@ t+~60µs  each node now holds {n1,n2,n3}: buckets 6020→83, 5870→83, 23700→
 |---|---|---|
 | `Bid` | `{type:"Bid", request_id, attempt, node, score_us}` | JSON in a 4-byte length-prefixed frame. ~87 B on the wire (measured: 521–526 B per request for 6 bids) |
 | `Slow` / `Ack` | `{factor, secs}` / `{message}` | Admin message for load injection: `rm-client slow --node 2 --factor 4 --secs 30` |
-| Bid timeout | 100 ms (`--bid-timeout-ms`) | ≫ measured election p99 (0.24–2.3 ms) and LAN RTT, so on a healthy cluster it practically never fires (1 in 12,000 measured). It is the delay a request pays while a crashed peer is still inside the 1.5 s liveness window. ≪ the client's 5 s retry timeout |
+| Bid timeout | 100 ms (`--bid-timeout-ms`) | ≫ measured election p99 (0.29–3.3 ms) and LAN RTT, so on a healthy cluster it practically never fires (0–1 in 12,000 measured decisions per run). It is the delay a request pays while a crashed peer is still inside the 1.5 s liveness window. ≪ the client's 5 s retry timeout |
 | Liveness window | 1500 ms, heartbeats every 250 ms | unchanged from bullet 1 |
 | CPU probe | every 200 ms (`--probe-ms`), median of 3 × ~0.3 ms loops | ~0.5 % of one core |
 | Service prior | 10 ms (`--prior-service-ms`), replaced by peers' measured work per request (from heartbeats) until the node's first completion | |
@@ -113,15 +118,25 @@ does no disk I/O, and the clients sit on the same LAN.
 * **Slow node** (`rm-client slow`, or real CPU contention on its machine): its planner samples
   and probes slow down, `S_est` rises within ~0.4 s, and it stops winning except when the others'
   queues make their completion times equally bad. Once the slowdown ends, the probe and the
-  time-decay bring it back within 1–2 s (timeline below).
+  time-decay bring it back within ~1 s (timeline below). This also holds if the node *booted*
+  slowed (`--slow-factor`): the probe baseline is then learnt slowed, and when it later drops, the
+  learnt work estimate and decay floor are rescaled by `new_base/old_base` (measured: node 2 back
+  to its full share within ~1 s of `--factor 1`).
 * **Node down:** its peers still count it as live for up to 1.5 s and decide each round on the
   timeout (100 ms of extra latency, 2 bids per request). After that it leaves the live set and
   rounds decide on 2 bids immediately. Requests it had already won are **not** taken over: that is
   the fault-tolerance bullet. The `pending` entries record `{executor, attempt}` for that work, and
   `Bid.attempt` exists so that a takeover round (attempt 1) is fenced from attempt 0.
-* **Rejoined/restarted node:** it starts with empty counters and seeds its work estimate from the
-  peers' heartbeats, so it is neither starved by a high prior nor flooded by a zero one. Its
-  `reserved` and queue counters make it take its share without herding.
+* **Rejoined/restarted node:** peers count as live for one liveness window after boot, so a
+  fresh node waits for their bids (or the 100 ms timeout) instead of electing itself. An inbound
+  `Hello` from a restarted peer also wakes our outbound link to it out of reconnect backoff. Before
+  both fixes the restarted node decided alone and duplicated work. Churn check (node 3 killed at
+  ~1 s, restarted at ~3 s, 6,000 requests): **218 duplicate executions before, 58 with the
+  boot-liveness fix alone, 0 with both**. It seeds its work estimate from the peers' heartbeats.
+  It **does win disproportionately** after a rejoin, though, for an honest reason: without state
+  transfer its replica is empty, so its plans are genuinely cheaper (2.8–3.5 ms vs 4.2–4.5 ms) and
+  it won ~80–90 % of requests for the rest of the run. This persists until state transfer (the
+  recovery bullet) exists.
 * **Inconsistent views** (a peer's bid arrives at one node before its timeout and at another
   after, or the live sets differ): two nodes can both elect themselves and both execute. This is
   made **harmless and convergent**. When a replica receives a second `PlanCommitted` for the same
@@ -138,15 +153,15 @@ does no disk I/O, and the clients sit on the same LAN.
 Per request with n nodes: **n(n−1) bid messages = 6 for n = 3**, sent in one parallel round and
 always exactly that many (Bully/Ring-style leader elections cost O(n²) or O(n) *per leader
 change*, not per request). Measured on the bid path: **6.00 bids/request, ~525 B/request**,
-election duration (Submit receipt → decision) **p50 47–123 µs, p99 0.24–2.3 ms**. That is
-**one election per request**, i.e. 1,100–1,500 elections/s in these runs. Planning itself takes
+election duration (Submit receipt → decision) **p50 44–117 µs, p99 0.29–3.3 ms**. That is
+**one election per request**, i.e. 1,150–1,600 elections/s in these runs. Planning itself takes
 ~4–5 ms, so the election adds ~1–2 % to the median latency.
 
 ## 6. Alternatives considered
 
 | Alternative | Why not |
 |---|---|
-| Hash of the request id (bullet-1 baseline) | Free and consistent, but load-blind: a slow node keeps getting 1/3 of the work. Measured p99 is 6× worse when one node is slowed (below). It also remaps on any membership change |
+| Hash of the request id (bullet-1 baseline) | Free and consistent, but load-blind: a slow node keeps getting 1/3 of the work. Measured p99 is 5–7× worse when one node is slowed (below). It also remaps on any membership change |
 | Each node picks the least-loaded node from heartbeat loads (no bids) | Loads are up to 250 ms stale, and each node's copy is of a different age, so nodes disagree. All requests within one heartbeat interval also herd onto the same "least loaded" node |
 | Coordinator or leader decides, e.g. the Raft-style coordinator of teammate PR #2 | A single decision means no disagreement. But it adds an extra hop on every request, makes the leader a per-request bottleneck, and causes an election outage whenever the leader fails. PR #2 was reviewed and not integrated; its ideas were reused (credit below) |
 | Bully / Ring | They elect a *long-lived leader* after a failure and say nothing about load. Used per request they degenerate into the coordinator design plus O(n²)/O(n) messages |
@@ -161,52 +176,53 @@ Command: `scripts/experiment.sh`. Raw CSVs and status dumps are in `results/` (g
 
 | config | share n1/n2/n3 (%) | mean ms | p50 | p95 | p99 | max | req/s |
 |---|---|---|---|---|---|---|---|
-| hash, balanced, c=6 | 33.4/32.8/33.8 | 5.18 | 4.91 | 7.20 | 8.62 | 11.51 | 1146 |
-| **election**, balanced, c=6 | 30.9/34.9/34.3 | 4.86 | 4.75 | 6.11 | **6.63** | 8.27 | 1227 |
-| hash, balanced, c=24 | 33.7/33.1/33.2 | 15.16 | 13.11 | 30.94 | 35.55 | 39.87 | 1547 |
-| **election**, balanced, c=24 | 33.2/33.4/33.4 | 15.70 | 15.82 | 19.60 | **22.25** | 30.23 | 1509 |
-| hash, node 2 ×4, c=6 | 33.7/33.1/33.2 | 12.51 | 4.42 | 34.66 | 38.30 | 50.20 | 476 |
-| **election**, node 2 ×4, c=6 | 50.9/**0.1**/49.0 | 5.23 | 5.10 | 6.47 | **7.25** | 22.93 | 1132 |
-| hash, node 2 ×4, c=24 | 33.4/33.2/33.4 | 48.99 | 4.53 | 151.59 | 169.10 | 197.44 | 472 |
-| **election**, node 2 ×4, c=24 | 49.3/**1.1**/49.6 | 19.71 | 19.69 | 23.84 | **27.34** | 31.99 | 1207 |
+| hash, balanced, c=6 | 33.6/32.9/33.4 | 5.15 | 4.82 | 7.20 | 8.62 | 10.31 | 1159 |
+| **election**, balanced, c=6 | 33.5/34.2/32.3 | 4.97 | 4.78 | 6.41 | **6.90** | 9.70 | 1198 |
+| hash, balanced, c=24 | 32.8/33.4/33.8 | 14.44 | 12.61 | 28.32 | 31.73 | 36.86 | 1610 |
+| **election**, balanced, c=24 | 33.6/32.7/33.7 | 14.89 | 14.67 | 19.28 | **25.12** | 58.60 | 1592 |
+| hash, node 2 ×4, c=6 | 33.4/33.5/33.1 | 13.68 | 4.21 | 38.66 | 43.19 | 61.84 | 435 |
+| **election**, node 2 ×4, c=6 | 51.6/**0.0**/48.4 | 5.16 | 4.90 | 6.88 | **8.06** | 10.45 | 1154 |
+| hash, node 2 ×4, c=24 | 33.0/33.3/33.7 | 51.46 | 4.07 | 161.52 | 178.24 | 196.59 | 448 |
+| **election**, node 2 ×4, c=24 | 49.6/**0.6**/49.8 | 19.18 | 19.22 | 23.01 | **25.36** | 48.63 | 1237 |
 
 All 24,000 requests succeeded with 0 retries, 0 duplicate executions and 0 pending. All replicas
-reported the same digest after every run.
+reported the same digest after every run. (A first run before the review fixes gave the same
+picture within a few ms.)
 
 **Election cost** (measured runs, summed over nodes):
 
 | config | elections | full-set / timeout decisions | bids/request | bid bytes/request | duration p50 / p99 / max (µs) |
 |---|---|---|---|---|---|
-| balanced, c=6 | 3000 | 9000 / 0 | 6.00 | 521 | 49 / 242 / 1532 |
-| balanced, c=24 | 3000 | 8999 / 1 | 6.00 | 526 | 123 / 2306 / 101257 |
-| node 2 ×4, c=6 | 3000 | 9000 / 0 | 6.00 | 523 | 47 / 272 / 1715 |
-| node 2 ×4, c=24 | 3000 | 9000 / 0 | 6.00 | 526 | 78 / 1921 / 5812 |
+| balanced, c=6 | 3000 | 9000 / 0 | 6.00 | 521 | 48 / 288 / 101860* |
+| balanced, c=24 | 3000 | 9000 / 0 | 6.00 | 526 | 117 / 3274 / 10830 |
+| node 2 ×4, c=6 | 3000 | 9000 / 0 | 6.00 | 523 | 44 / 396 / 2240 |
+| node 2 ×4, c=24 | 3000 | 9000 / 0 | 6.00 | 526 | 84 / 1673 / 4228 |
 
-(full + timeout counts one decision per node per election. The single timeout was one bid that
-arrived >100 ms late while the CPU was saturated. It did not change the winner.)
+(full + timeout counts one decision per node per election. \*The one 100 ms decision was in the
+warm-up: a bid sent before the peer links were up. A first run had one timeout in 12,000
+measured decisions, while the CPU was saturated, and it did not change the winner.)
 
 **Load change during a run** (demo scenario 1): election, c=6, node 2 slowed ×4 from ~3 s to ~7 s.
 Requests executed per node per second of send time:
 
 | second | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 |
 |---|---|---|---|---|---|---|---|---|---|---|
-| n1 | 211 | 223 | 194 | 265 | 282 | 265 | 290 | 232 | 169 | 181 |
-| n2 | 189 | 215 | 185 | **1** | **0** | **0** | **0** | 93 | 197 | 208 |
-| n3 | 191 | 142 | 185 | 302 | 288 | 291 | 272 | 225 | 184 | 167 |
-| mean ms | 4.10 | 4.27 | 4.57 | 4.42 | 4.42 | 4.58 | 4.58 | 4.81 | 4.83 | 4.66 |
+| n1 | 212 | 211 | 196 | 285 | 279 | 279 | 280 | 232 | 183 | 187 |
+| n2 | 146 | 157 | 166 | **2** | **0** | **0** | **0** | 95 | 169 | 189 |
+| n3 | 221 | 196 | 201 | 278 | 277 | 280 | 279 | 227 | 188 | 173 |
+| mean ms | 4.14 | 4.31 | 4.35 | 4.38 | 4.43 | 4.49 | 4.43 | 4.60 | 4.89 | 4.68 |
 
 **Is the policy fair and effective?**
-* *Effective:* with a slowed node, election cuts p99 6× (169 → 27 ms at c=24, 38 → 7 ms at c=6)
-  and keeps 2.5× the throughput of hash. Hash sends 1/3 of the work to the slow node, where
-  requests average 139 ms. Under balanced load, election still beats hash on the tail (p99 22 vs
-  36 ms at c=24) because it steers around transient queues that hash collides into. The median at
-  c=24 is slightly higher (15.8 vs 13.1 ms) because election evens out the queues instead of
-  leaving some short and some long.
-* *Fair:* on equal nodes the shares are within ±2.5 percentage points of 1/3 (c=24: 33.2/33.4/33.4,
-  c=6: 30.9/34.9/34.3). With a slow node the policy is deliberately not share-fair. It equalises
-  **per-request completion time** instead: at c=24 the 1.1 % of requests node 2 still won averaged
-  22.4 ms, against 19.7 ms on nodes 1 and 3. Under hash, per-node mean latency was 4.4 / 138.6 /
-  4.3 ms.
+* *Effective:* with a slowed node, election cuts p99 by 5–7× (178 → 25 ms at c=24, 43 → 8 ms at
+  c=6) and keeps 2.6× the throughput of hash. Hash sends 1/3 of the work to the slow node, where
+  requests average 146 ms. Under balanced load, election still beats hash on the tail at c=6
+  (p99 6.9 vs 8.6 ms) and at p95 at c=24 (19.3 vs 28.3 ms). At c=24 its p99 is lower too
+  (25.1 vs 31.7 ms), but its median is higher (14.7 vs 12.6 ms): it evens out the queues instead
+  of leaving some short and some long.
+* *Fair:* on equal nodes the shares are within ±1.1 percentage points of 1/3. With a slow node the
+  policy is deliberately not share-fair. It equalises **per-request completion time** instead: at
+  c=24 the 18 requests node 2 still won averaged 27.3 ms, against 19.1–19.2 ms on nodes 1 and 3.
+  Under hash, per-node mean latency was 4.0 / 146.4 / 4.0 ms.
 
 ## 8. Load injection (demo scenario 2)
 
@@ -222,8 +238,16 @@ nodes (an external CPU hog would load all three equally). On separate machines, 
 
 * Agreement needs the same live view, and every bid must arrive before the timeout. Otherwise a
   duplicate execution is possible: it is detected, counted and convergent, but the client may have
-  received the losing plan. There is at-least-once execution among nodes that got the Submit, but
-  no takeover yet if the elected executor crashes.
+  received the losing plan.
+* **No takeover when the elected executor crashes mid-request.** The request is lost, and client
+  retries within the 10 s round TTL re-use the decision naming the dead node. This is the hook for
+  the fault-tolerance bullet. Non-executors hold `pending{executor, attempt}`, `Bid` carries
+  `attempt`, and replicated plans are deduplicated per `(request, executor, attempt)`. On executor
+  failure, the nodes would open an attempt-1 round for the pending requests.
+* A rejoined node with empty state wins most requests until state transfer exists (Section 4).
+* The decay floor `min_work_us` is the all-time minimum work estimate. If the request mix becomes
+  permanently heavier, an idle node's estimate decays toward an optimistic value. Each exploratory
+  win corrects it, so the cost is about one mis-sent request per second per avoided node.
 * Rounds that are open concurrently see the same load (`reserved` only covers won-not-enqueued
   work). Near-simultaneous requests can therefore still cluster, bounded by the ~0.1 ms bid
   window.
