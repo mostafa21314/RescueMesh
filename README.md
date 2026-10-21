@@ -1,9 +1,9 @@
-# RescueMesh — Phase 1, Part 1: Three-node cloud + Incident Processing Service
+# RescueMesh — Phase 1: Three-node cloud, Incident Processing Service, load election
 
-This milestone implements the first Phase 1 bullet: **the three-node cloud and the
-Incident Processing and Coordination Service**. The load-aware election from the
-Phase 0 survey (bullet 2) plugs into a single, marked interface (`src/assign.rs`);
-until then a deterministic, load-blind placeholder picks the executor.
+Implemented so far: **bullet 1**, the three-node cloud and the Incident Processing and
+Coordination Service, and **bullet 2**, a distributed per-request load-bidding election that
+picks the executing peer. The election's algorithm, load metric, justification and
+measured evidence are in [`rescuemesh/docs/ELECTION.md`](rescuemesh/docs/ELECTION.md).
 
 ## Build and run
 
@@ -15,7 +15,11 @@ cargo test --release --lib          # planner unit tests
 scripts/run_local.sh                 # ports 7001-7003, logs in logs/
 target/release/rm-client status      # per-node state + replica consistency check
 target/release/rm-client load --concurrency 8 --requests 500 --out run.csv
+target/release/rm-client slow --node 2 --factor 4 --secs 30   # inject load on node 2
 scripts/stop_local.sh
+
+scripts/run_local.sh --assigner hash  # load-blind baseline instead of the election
+scripts/experiment.sh                 # hash vs election x balanced vs slowed -> results/<stamp>/summary.md
 ```
 
 On the three cloud machines (example IPs):
@@ -43,8 +47,9 @@ rm-client --nodes 10.0.0.1:7001,10.0.0.2:7001,10.0.0.3:7001 load --concurrency 3
           ▼              ▼              ▼
      ┌─────────┐    ┌─────────┐    ┌─────────┐
      │ node 1  │◄──►│ node 2  │◄──►│ node 3  │   full mesh of peer links:
-     └─────────┘    └─────────┘    └─────────┘   Heartbeat(load), Replicate(op)
-          │  each node: same request → Assigner.choose(request_id, live set)
+     └─────────┘    └─────────┘    └─────────┘   Bid, Heartbeat(load), Replicate(op)
+          │  each node: Submit → Bid{score = est. completion time} to peers
+          │  all bids (or 100 ms) → same deterministic winner on every node
           │  executor plans, commits, replicates, replies; others record pending
           ▼
      PlanResult (only from the executor)
@@ -56,20 +61,26 @@ rm-client --nodes 10.0.0.1:7001,10.0.0.2:7001,10.0.0.3:7001 load --concurrency 3
 | `campus.rs` | Seeded synthetic campus: 12×12 zone graph, 160 responders, 120 resource offers |
 | `planner.rs` | Priority + joint optimal assignment + sensitivity analysis + route |
 | `state.rs` | Replicated state, idempotent op application, convergence digest |
-| `assign.rs` | **Election swap-in point** (`Assigner` trait); `HashAssigner` placeholder |
-| `node.rs` | Listener, peer links, heartbeats, request handling, replication |
+| `election.rs` | Load-bidding election: decision rule, round state machine, load estimator |
+| `assign.rs` | `--assigner {election,hash}`; load-blind hash baseline; FNV-1a |
+| `node.rs` | Listener, peer links, heartbeats, bids, CPU probe, slowdown knob, request handling, replication |
 | `proto.rs`, `wire.rs` | Message formats and framing |
-| `bin/rm-node.rs`, `bin/rm-client.rs` | Node process and test/load client |
+| `bin/rm-node.rs`, `bin/rm-client.rs` | Node process and test/load/admin client |
+| `scripts/experiment.sh` | Election vs hash experiment and summary tables |
 
 ## Request lifecycle
 
 1. The client multicasts `Submit{request_id, client_id, incident}` to every node.
 2. Each node checks its idempotency cache. If the request is already committed, only
    the node that executed it re-sends the cached plan (`duplicate: true`).
-3. Each node records the incident and calls `assigner.choose(request_id, live)`, where
-   `live` is itself plus every peer heard from within `--peer-timeout-ms` (1500 ms).
-   All nodes with the same live view pick the same executor.
-4. Non-executors store the request in `pending` (input for failover detection later).
+3. Each node records the incident, computes its load score (estimated completion time of
+   one more request here) and sends `Bid` to its peers. Once it holds bids from every node
+   in its live set (itself plus every peer heard from within `--peer-timeout-ms`, 1500 ms)
+   or after `--bid-timeout-ms` (100 ms), it elects the lowest bid (ties broken by a
+   per-request hash). All nodes that saw the same bids elect the same executor.
+   With `--assigner hash` this step is `fnv1a(request_id) % live.len()` instead.
+4. Non-executors store the request in `pending` with the elected executor and attempt
+   (input for failover detection later).
 5. The executor waits for a planner worker, takes a snapshot of state, runs the
    planner on the blocking pool, applies `PlanCommitted` locally, broadcasts it to
    peers as `Replicate`, and replies `PlanResult`.
@@ -105,13 +116,16 @@ State is a set of uniquely identified, immutable records. Every change is a
 `ReplOp` with a unique `op_id`; applying it twice does nothing, and ops commute:
 
 * incidents, plans and assignments are inserted by unique key (set union);
-* responder commitment is `busy_until = max(old, new)`;
-* resource availability is **derived** (capacity minus unexpired allocations), never
-  decremented in place.
+* responder commitment and resource availability are **derived** from the kept plans'
+  assignments (latest commitment; capacity minus unexpired allocations), never updated
+  in place;
+* if two nodes both executed a request (possible while views disagree), every replica
+  keeps the plan with the lowest `(attempt, tiebreak(request_id, executed_by))` whatever
+  the arrival order and counts a `duplicate_execution`.
 
 So any two replicas that have applied the same set of ops hold the same state,
-regardless of order. `plans_digest` (XOR of FNV-1a hashes of plan ids) is an
-order-independent fingerprint; `rm-client status` compares it across nodes.
+regardless of order. `plans_digest` (XOR of FNV-1a hashes of `request_id@executed_by`)
+is an order-independent fingerprint; `rm-client status` compares it across nodes.
 
 **Known limit (by design, for later bullets/Phase 2):** two executors planning
 concurrently can both allocate the last unit of a resource. Detecting and reconciling
@@ -130,10 +144,12 @@ whose first frame is `Hello` is a peer link.
 | `StatusQuery` / `Status` | client ↔ node | node state, load, digest, live set |
 | `Error` | node → client | `request_id?`, `message` |
 | `Hello` | node → peer (first frame) | `node` |
-| `Heartbeat` | node → peers, every 250 ms | `node`, `load` (queue_len, inflight, workers, completed, ewma_service_ms) |
-| `Replicate` | executor → peers | `from`, `op` (`PlanCommitted{op_id, incident, plan}`) |
+| `Heartbeat` | node → peers, every 250 ms | `node`, `load` (queue_len, inflight, reserved, workers, completed, service estimate, probe ratio, score) |
+| `Bid` | node → peers, once per request | `request_id`, `attempt`, `node`, `score_us` |
+| `Replicate` | executor → peers | `from`, `op` (`PlanCommitted{op_id, attempt, incident, plan}`) |
+| `Slow` / `Ack` | admin client ↔ node | `factor`, `secs` / `message` (load injection) |
 
-**Timeouts and retries.** Peer liveness window 1500 ms. Peer links reconnect with
+**Timeouts and retries.** Peer liveness window 1500 ms. Election bid timeout 100 ms. Peer links reconnect with
 exponential backoff (100 ms → 2 s). The client retries with the **same**
 `request_id` after `--timeout-ms` (default 5 s), up to `--attempts` (default 3).
 **Duplicates** are suppressed at two points: the committed-plan cache, and a waiter
@@ -145,9 +161,10 @@ starting a second computation).
 **Cloud node:** one process; tokio multi-threaded runtime for all network I/O; one
 task per client connection and one per received request; CPU-bound planning on the
 blocking thread pool, capped by a semaphore of `--workers` permits (default: CPU
-count). Requests waiting for a permit form the node's queue; `queue_len`,
-`inflight` and the EWMA service time are reported in every heartbeat — these are the
-load signals the election in bullet 2 will rank on. The state lock is held only to
+count). Requests waiting for a permit form the node's queue. `queue_len`, `inflight`,
+won-but-not-enqueued requests and the service-time estimate (planner EWMA × a 200 ms
+CPU calibration probe) make up the election score; they are also reported in
+heartbeats and `rm-client status`. The state lock is held only to
 take a snapshot or apply an op, never during planning.
 
 **Client:** N independent workers, each a closed loop (send, wait, repeat) with its
@@ -174,7 +191,7 @@ setup.
 
 | Bullet | Hook already in place |
 |---|---|
-| 2. Load-aware election | Replace `HashAssigner` in `assign.rs`; load reports already flow via `Heartbeat` |
+| 2. Load-aware election | **Done**: `election.rs`, see `rescuemesh/docs/ELECTION.md` |
 | 3. Concurrency docs | Model described above; workers/queue are configurable and reported |
 | 4. Fault injection | Add a "silenced" flag in `node.rs` that drops inbound/outbound frames |
 | 5. Rejoin & recovery | `state.log` (ordered ops) and `pending` are the transfer/catch-up inputs |
@@ -190,7 +207,8 @@ setup.
 | Derived resource availability | Decrement on assignment | Decrements do not commute and break convergence under concurrent executors |
 | Hungarian joint assignment + sensitivity rounds | Greedy nearest responder | Meets the brief's "substantial enough to create meaningful load"; deterministic; cost is tunable |
 | Seeded identical campus on every node | Transfer initial state | No bootstrap protocol needed; all data synthetic as required |
-| Placeholder hash assigner | Implement election now | Keeps bullet 1 testable in isolation; one interface to replace |
+| Placeholder hash assigner (bullet 1) | Implement election now | Kept bullet 1 testable in isolation; retained as `--assigner hash` baseline |
+| Leaderless per-request load bidding (bullet 2) | Coordinator/Raft leader (PR #2), heartbeat-load picking, Bully/Ring | No extra hop or leader outage; fresh per-request load; 6 msgs/request. Details in ELECTION.md |
 
 ## Libraries vs. our own code
 
@@ -198,6 +216,6 @@ Libraries: `tokio` (async runtime, TCP), `tokio-util` (length-delimited framing)
 `serde`/`serde_json` (serialization), `clap` (CLI), `tracing` (logs), `rand`
 (seeded synthetic data), `parking_lot` (mutex), `uuid` (client run ids).
 Team-designed and implemented: the message protocol, peer mesh and liveness
-tracking, executor selection, replication and idempotency scheme, convergence
+tracking, the load-bidding election and its load metric (CPU probe, EWMA, decay), replication and idempotency scheme, convergence
 digest, and the planning algorithm (priority model, Dijkstra, Hungarian solver,
 sensitivity analysis).
