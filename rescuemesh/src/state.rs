@@ -112,7 +112,9 @@ impl ClusterState {
     /// Apply a replicated op. Returns false if it was already applied.
     pub fn apply(&mut self, op: ReplOp) -> bool {
         let ReplOp::PlanCommitted { op_id, attempt, incident, plan } = &op;
-        if !self.applied.insert(format!("{op_id}@{}", plan.executed_by)) {
+        // One op per (request, executor, attempt): retries of the same op are no-ops, a
+        // second executor's plan or a later attempt is a different op.
+        if !self.applied.insert(format!("{op_id}@{}#{attempt}", plan.executed_by)) {
             return false;
         }
         let mut inc = (**incident).clone();
@@ -256,12 +258,16 @@ mod tests {
         let (p1, p2) = (op(&c, &a, &inc, 1), op(&c, &a, &inc, 2));
         assert!(a.apply(p1.clone()) && a.apply(p2.clone()));
         assert!(b.apply(p2.clone()) && b.apply(p1.clone()));
-        assert!(!a.apply(p1), "same (request, executor) op is idempotent");
+        assert!(!a.apply(p1.clone()), "same (request, executor, attempt) op is idempotent");
+        // A later attempt by the same executor (future takeover) is a distinct op.
+        let ReplOp::PlanCommitted { op_id, incident, plan, .. } = p1;
+        assert!(a.apply(ReplOp::PlanCommitted { op_id, attempt: 1, incident, plan }));
+        assert_eq!(a.duplicate_executions, 2);
         assert_eq!(a.plans_digest, b.plans_digest);
         assert_eq!(a.plans["req-1"].executed_by, b.plans["req-1"].executed_by);
-        assert_eq!((a.duplicate_executions, b.duplicate_executions), (1, 1));
         let busy = |s: &ClusterState| s.snapshot(2_000).responders.iter().map(|r| r.busy_until_ms).collect::<Vec<_>>();
         assert_eq!(busy(&a), busy(&b));
+        assert_eq!(b.duplicate_executions, 1);
         let mut ids_a: Vec<_> = a.assignments.keys().cloned().collect();
         let mut ids_b: Vec<_> = b.assignments.keys().cloned().collect();
         ids_a.sort();

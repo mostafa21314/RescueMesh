@@ -136,6 +136,14 @@ impl ServiceEstimator {
             let mut w: Vec<f64> = self.probes.iter().copied().collect();
             w.sort_by(f64::total_cmp);
             let median = w[w.len() / 2];
+            // work_us is in baseline-probe units. If the baseline was first measured on
+            // a slowed CPU (e.g. booted with --slow-factor) and now drops, re-express the
+            // learnt work in the new, faster units instead of keeping slowed values.
+            if self.probe_base_us.is_finite() && median < self.probe_base_us {
+                let k = median / self.probe_base_us;
+                self.work_us *= k;
+                self.min_work_us *= k;
+            }
             self.probe_base_us = self.probe_base_us.min(median);
             self.ratio = (median / self.probe_base_us).max(1.0);
         }
@@ -413,18 +421,35 @@ impl Elections {
         self.stats.orphan_rounds += orphans;
     }
 
+    /// Cheap copy of the counters and durations, taken under the node's lock;
+    /// `StatsSnapshot::finish` (the sort) runs after it is released.
+    pub fn snapshot(&self) -> StatsSnapshot {
+        let mut stats = self.stats.clone();
+        stats.open_rounds = self.rounds.len();
+        stats.duration_mean_us = self.duration_sum as f64 / stats.decided.max(1) as f64;
+        StatsSnapshot { stats, durations: self.durations.clone() }
+    }
+
     pub fn stats(&self) -> ElectionStats {
-        let mut s = self.stats.clone();
-        s.open_rounds = self.rounds.len();
-        if !self.durations.is_empty() {
-            let mut d = self.durations.clone();
+        self.snapshot().finish()
+    }
+}
+
+pub struct StatsSnapshot {
+    stats: ElectionStats,
+    durations: Vec<u64>,
+}
+
+impl StatsSnapshot {
+    pub fn finish(mut self) -> ElectionStats {
+        let d = &mut self.durations;
+        if !d.is_empty() {
             d.sort_unstable();
             let pct = |p: f64| d[((p / 100.0) * (d.len() - 1) as f64).round() as usize];
-            s.duration_p50_us = pct(50.0);
-            s.duration_p99_us = pct(99.0);
-            s.duration_mean_us = self.duration_sum as f64 / s.decided.max(1) as f64;
+            self.stats.duration_p50_us = pct(50.0);
+            self.stats.duration_p99_us = pct(99.0);
         }
-        s
+        self.stats
     }
 }
 
@@ -506,6 +531,30 @@ mod tests {
             e.on_probe(300.0, 400_000 + k); // recovered, with no completions in between
         }
         assert!((e.estimate_us() - 10_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn baseline_learnt_while_slowed_is_rescaled() {
+        // Booted 4x slowed: the first probes (1200 us) become the baseline, so the
+        // ratio reads 1 and work is learnt in slowed units.
+        let mut e = ServiceEstimator::new(10_000.0);
+        let mut t = 0;
+        for _ in 0..5 {
+            e.on_probe(1_200.0, t);
+        }
+        for _ in 0..10 {
+            t += 10_000;
+            e.on_completion(16_000.0, t);
+        }
+        assert!((e.probe_ratio() - 1.0).abs() < 1e-9);
+        assert!((e.estimate_us() - 16_000.0).abs() < 1.0);
+        // Slowdown removed: once the median drops, the estimate follows immediately,
+        // and the decay floor is rescaled too.
+        for k in 0..3 {
+            e.on_probe(300.0, t + 1 + k);
+        }
+        assert!((e.estimate_us() - 4_000.0).abs() < 1.0, "{}", e.estimate_us());
+        assert!((e.min_work_us - 4_000.0).abs() < 1.0);
     }
 
     #[test]

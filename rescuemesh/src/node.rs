@@ -111,6 +111,8 @@ struct PeerHandle {
     tx: mpsc::Sender<Msg>,
     last_seen_ms: AtomicU64,
     load: Mutex<Option<LoadReport>>,
+    /// Wakes the outbound link out of its reconnect backoff (see `peer_inbound`).
+    kick: Arc<tokio::sync::Notify>,
 }
 
 pub struct Node {
@@ -143,10 +145,19 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
 
     let mut peers = HashMap::new();
     let mut links = Vec::new();
+    // Peers count as live for one liveness window after boot. Starting from 0 made a
+    // freshly (re)started node see only itself as live and elect itself for every
+    // request until the first heartbeats arrived, i.e. duplicate executions. Now it
+    // waits for the peers' bids, or the bid timeout if they really are down.
+    let boot_ms = now_ms();
     for (pid, addr) in &cfg.peers {
         let (tx, rx) = mpsc::channel(4096);
-        peers.insert(*pid, PeerHandle { tx, last_seen_ms: AtomicU64::new(0), load: Mutex::new(None) });
-        links.push((*pid, addr.clone(), rx));
+        let kick = Arc::new(tokio::sync::Notify::new());
+        peers.insert(
+            *pid,
+            PeerHandle { tx, last_seen_ms: AtomicU64::new(boot_ms), load: Mutex::new(None), kick: kick.clone() },
+        );
+        links.push((*pid, addr.clone(), rx, kick));
     }
 
     let node = Arc::new(Node {
@@ -167,8 +178,8 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
         waiters: Mutex::new(HashMap::new()),
     });
 
-    for (pid, addr, rx) in links {
-        tokio::spawn(peer_link(cfg.id, pid, addr, rx));
+    for (pid, addr, rx, kick) in links {
+        tokio::spawn(peer_link(cfg.id, pid, addr, rx, kick));
     }
     tokio::spawn(heartbeat_loop(node.clone()));
     tokio::spawn(prune_loop(node.clone()));
@@ -200,7 +211,7 @@ pub async fn run(cfg: NodeConfig) -> anyhow::Result<()> {
 /// Outbound link to one peer. Messages queue in `rx` while disconnected; the
 /// channel is bounded and senders use try_send, so a long outage drops messages
 /// (counted in `dropped`) instead of blocking request handling.
-async fn peer_link(me: NodeId, peer: NodeId, addr: String, mut rx: mpsc::Receiver<Msg>) {
+async fn peer_link(me: NodeId, peer: NodeId, addr: String, mut rx: mpsc::Receiver<Msg>, kick: Arc<tokio::sync::Notify>) {
     let mut backoff = Duration::from_millis(100);
     loop {
         match TcpStream::connect(&addr).await {
@@ -222,7 +233,10 @@ async fn peer_link(me: NodeId, peer: NodeId, addr: String, mut rx: mpsc::Receive
                 }
             }
             Err(_) => {
-                tokio::time::sleep(backoff).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = kick.notified() => {}
+                }
                 backoff = (backoff * 2).min(Duration::from_secs(2));
             }
         }
@@ -243,6 +257,12 @@ async fn handle_conn(node: Arc<Node>, stream: TcpStream) -> anyhow::Result<()> {
 
 async fn peer_inbound(node: Arc<Node>, peer: NodeId, mut w: Wire) -> anyhow::Result<()> {
     info!(peer, "peer inbound connected");
+    // The peer just (re)started: reconnect our side now rather than after up to 2 s of
+    // backoff. Until then it would get no bids from us, decide every round alone on
+    // the bid timeout and elect itself (duplicate executions after a restart).
+    if let Some(h) = node.peers.get(&peer) {
+        h.kick.notify_one();
+    }
     while let Some(msg) = wire::recv(&mut w).await? {
         if let Some(h) = node.peers.get(&peer) {
             h.last_seen_ms.store(now_ms(), Relaxed);
@@ -382,7 +402,7 @@ impl Node {
     pub fn status(&self) -> StatusReport {
         let now = now_ms();
         let load = self.load_report();
-        let election = self.elections.lock().stats();
+        let election = self.elections.lock().snapshot().finish(); // sort runs after unlock
         let st = self.state.lock();
         StatusReport {
             node: self.cfg.id,
@@ -522,6 +542,14 @@ impl Node {
         self.elections.lock().start_execution(&rid);
         let permit = self.workers.clone().acquire_owned().await.expect("semaphore closed");
         drop(queued);
+        // While we queued, another executor (duplicate under a split view) may have
+        // committed this request: skip planning. Its executor answers the client.
+        if self.state.lock().plans.contains_key(&rid) {
+            drop(permit);
+            self.waiters.lock().remove(&rid);
+            debug!(request = %rid, "already committed by a peer; skipped planning");
+            return;
+        }
         let inflight = Gauge::new(&self.inflight);
 
         let snap = self.state.lock().snapshot(now_ms());
@@ -622,7 +650,10 @@ async fn election_gc_loop(node: Arc<Node>) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tick.tick().await;
-        // Decided rounds: 10 s (covers late bids and client retries); orphans: 30 s.
+        // Decided rounds: 10 s, so late bids and duplicate Submits still find the round;
+        // a retry in that window re-uses the decision, even if the elected executor has
+        // since crashed (re-election on executor failure is the fault-tolerance bullet,
+        // via `attempt` + `pending`). Orphans (bids without a local Submit): 30 s.
         node.elections.lock().gc(node.mono_us(), 10_000_000, 30_000_000);
     }
 }
