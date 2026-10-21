@@ -9,7 +9,7 @@ measured evidence are in [`rescuemesh/docs/ELECTION.md`](rescuemesh/docs/ELECTIO
 
 ```bash
 cargo build --release
-cargo test --release --lib          # planner unit tests
+cargo test --release                # planner, election and state unit tests
 
 # all three nodes on one machine
 scripts/run_local.sh                 # ports 7001-7003, logs in logs/
