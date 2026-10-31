@@ -4,6 +4,9 @@ This guide takes you from a USB stick (or a fresh clone) to a running three-node
 cloud with clients on laptops. Find your role in the list below, follow its
 section from top to bottom, then go to [Lab day](#lab-day).
 
+For the short version with one node per machine (`scripts/up.sh` /
+`scripts/up.ps1`), see [quick-setup.md](quick-setup.md).
+
 | Role | Section |
 |---|---|
 | Windows lab PC running a cloud node | [a](#a-windows-lab-pc-running-a-cloud-node) |
