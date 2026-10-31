@@ -145,7 +145,7 @@ fn default_queue_capacity() -> usize {
 }
 
 fn default_table_ttl_ms() -> u64 {
-    300_000
+    1_800_000
 }
 
 impl NodeConfig {

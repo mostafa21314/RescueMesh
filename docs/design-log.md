@@ -131,8 +131,8 @@ agreed design.
 - **Reason:** the request table is what a new server takes over (Part B), and what
   tells a retry apart from a first attempt. Answering from results means a retry
   after the server's crash is served without recomputing or reassigning. Entries
-  expire after `table_ttl_ms` = 300 s, much longer than a client's retry window
-  (5 × 1 s), so a late retry still finds its result.
+  expire after `table_ttl_ms` (30 min since D38; first 300 s), much longer than a
+  client's retry window (5 × 1 s), so a late retry still finds its result.
 
 ### D12. Conflict rule for replicated plans
 - **Alternatives:** last writer wins; first writer wins; a deterministic rule on the
@@ -504,3 +504,72 @@ agreed design.
 - **Measured:** third row of the D34 table. 600/600 answered in all 3 runs, 1 election
   after the crash, p50 18–69 ms, p99 ≈1.1 s, throughput at the offered 200 req/s;
   94–128 Busy replies per run, at most 4 attempts for any request.
+
+### D38. table_ttl_ms = 1 800 000 (30 min), was 300 000 (decided)
+- **Problem:** in local test runs with 3 nodes and the client, the 5-minute TTL
+  expired results tables mid-session. Each node stamps a result when *it* stores
+  it (computed or received by `Replicate`), so the nodes expire the same result at
+  slightly different moments, and a status taken around then showed different
+  result counts and digests for reasons unrelated to replication.
+- **Alternatives:** keep 300 s and take status within 5 min of a run; disable the
+  sweep; a longer TTL.
+- **Choice:** `table_ttl_ms = 1800000` in every node config (`config/` and
+  `config/local/`), and as the code default.
+- **Reason:** 30 min covers a test session, so digests compare replication and
+  nothing else. Memory is not a concern at these volumes (thousands of entries).
+- **Side effect:** a retry arriving after its entries expired is not answered from
+  the results table. The node no longer knows the request, so it is treated as new
+  and recomputed: the plan can differ from the first one, and the first plan's
+  ledger holds are not released by the sweep. With a 5 s retry window this needs a
+  client that resends after 30 min, which ours never does.
+
+## Local test results (Mac, preliminary)
+
+3 local nodes and the client on one Mac (`config/local/`), release build. Preliminary:
+one machine, no network between the nodes; to be repeated in the lab.
+
+- **Normal run:** 200 requests, all 200 answered on attempt 1; p50 7.9 ms, p99
+  11.5 ms. 1 election; 6 ElectBid messages in total, against 1,200 if we elected per
+  request (3 nodes × 2 peers × 200).
+- **The first election was decided by load:** bids node1 = 37, node2 = 39,
+  node3 = 39 (milli-units, D24), so node 1 won. The election took 0.46 ms, and
+  each node sent 2 messages (its bid to each peer).
+- **Failover:** the current server was killed mid-run (3,000 requests at
+  50 req/s), twice. Both times the two survivors elected a new server in a new
+  epoch and agreed on it; about 8 requests needed a retry; the results tables
+  were identical after the run.
+- **Status during a run:** a status taken while requests are in flight can show
+  one node a result ahead of the others, because replication is asynchronous:
+  the server replies to the client first and replicates after. Digests only
+  match once nothing is in flight. `client --status --settle` now waits for that
+  before comparing (below).
+- **`--settle`:** `client --status --settle [SECS]` (default 10 s) polls every
+  100 ms until every reachable node reports `queue 0` and `running 0` on two
+  consecutive polls, then prints the status and compares digests. Two polls in a
+  row cover the moment between a job finishing and its `Replicate` being sent. If
+  the cluster doesn't settle in time, it says so before printing. It doesn't see
+  frames still in a peer link's queue (limitation a, below).
+
+## Known limitations (open, for bullet 5)
+
+a. **The peer link's backlog has no useful limit.** While a peer is down, its link
+   keeps every undelivered message (`Replicate`, but also `ElectBid`) and sends
+   them all when the peer returns. That gave node 3 a partial catch-up after a
+   restart, but it is a side effect, not a protocol: the queue is bounded only by
+   count (`QUEUE_LIMIT` = 4096 frames per peer; beyond that new frames are dropped
+   and counted in `peer_drops`), not by age or bytes. At 50 req/s that is
+   ≈80 s of results held in memory; anything beyond is lost silently to the
+   returning node, and stale bids from long-finished elections are delivered too.
+   Needs a real bound (age or bytes, and only `Replicate`), or replacing by the
+   recovery/sync protocol, where the returning node pulls what it missed
+   (`TODO(recovery/sync)` in `node.rs`).
+b. **A restarted node can win an election while stale.** It starts knowing no
+   server, so its first request can trigger an immediate `no_server` election
+   (D23), and with an empty queue its load bid is the lowest, so it may win and
+   serve from a ledger and results table that are missing everything it didn't
+   see. Rejoining nodes must not bid or serve until caught up (`ready = false`,
+   issue #28).
+c. **A restarted node loses the results it served before crashing.** Tables and
+   the ledger are in memory only. Its peers hold the results it replicated; any
+   it computed but hadn't yet replicated are gone, and it gets nothing back
+   except what limitation a happens to redeliver.

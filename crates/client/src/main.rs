@@ -1,6 +1,7 @@
 use clap::Parser;
 use client::{query_status, synth_incident, Client, Outcome};
 use common::config::ClientConfig;
+use common::msg::NodeStatus;
 use common::rng::Rng;
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -32,6 +33,10 @@ struct Args {
     /// Print each node's status and whether their results tables agree, then exit.
     #[arg(long)]
     status: bool,
+    /// With --status: first wait, up to SECS (default 10), until no node has
+    /// queued or running jobs, so in-flight replication doesn't skew the digests.
+    #[arg(long, value_name = "SECS", num_args = 0..=1, default_missing_value = "10", requires = "status")]
+    settle: Option<u64>,
 }
 
 #[tokio::main]
@@ -44,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let cfg = ClientConfig::load(&args.config)?;
     if args.status {
-        return print_status(&cfg).await;
+        return print_status(&cfg, args.settle.map(Duration::from_secs)).await;
     }
 
     let zones = cfg.campus.zones();
@@ -156,10 +161,48 @@ fn summarize(outcomes: &[Outcome], wall: Duration, client: &Client) {
     );
 }
 
-async fn print_status(cfg: &ClientConfig) -> anyhow::Result<()> {
-    let mut digests = Vec::new();
+async fn query_all(cfg: &ClientConfig) -> Vec<anyhow::Result<NodeStatus>> {
+    let timeout = Duration::from_millis(cfg.request_timeout_ms);
+    let mut out = Vec::new();
     for addr in &cfg.nodes {
-        match query_status(addr, Duration::from_millis(cfg.request_timeout_ms)).await {
+        out.push(query_status(addr, timeout).await);
+    }
+    out
+}
+
+/// Polls every node until all reachable ones report no queued or running jobs
+/// on two polls in a row (the second covers a job that just finished but whose
+/// `Replicate` isn't sent yet), or until `limit`. Returns the last poll.
+async fn settled(cfg: &ClientConfig, limit: Duration) -> Vec<anyhow::Result<NodeStatus>> {
+    const POLL: Duration = Duration::from_millis(100);
+    let deadline = Instant::now() + limit;
+    let mut quiet_polls = 0;
+    loop {
+        let statuses = query_all(cfg).await;
+        let idle = statuses
+            .iter()
+            .flatten()
+            .all(|s| s.queue_len == 0 && s.running == 0);
+        quiet_polls = if idle { quiet_polls + 1 } else { 0 };
+        if quiet_polls >= 2 {
+            return statuses;
+        }
+        if Instant::now() >= deadline {
+            println!("not settled after {limit:?}: jobs still queued or running; comparing anyway");
+            return statuses;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
+async fn print_status(cfg: &ClientConfig, settle: Option<Duration>) -> anyhow::Result<()> {
+    let statuses = match settle {
+        Some(limit) => settled(cfg, limit).await,
+        None => query_all(cfg).await,
+    };
+    let mut digests = Vec::new();
+    for (addr, status) in cfg.nodes.iter().zip(statuses) {
+        match status {
             Ok(s) => {
                 println!(
                     "{addr}: node {} epoch {} server {:?} requests {} results {} digest {:016x} queue {} running {} pending_cost {} conflicts {} dup_replicates {} replans {} overcommits {} peer_drops {} last_seen {:?}",

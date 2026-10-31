@@ -172,7 +172,10 @@ dropped on step-down, late results), table sizes, an order-independent digest of
 queue length, running jobs, pending cost, conflict/duplicate/replan counters,
 when each peer was last heard from, and messages and bytes per type, sent and
 received. `client --status` queries every node and reports whether the digests
-agree.
+agree. Replication is asynchronous (reply first, replicate after), so while
+requests are in flight one node can be a result ahead; `--status --settle [SECS]`
+(default 10 s) first polls every 100 ms until every reachable node shows queue 0
+and running 0 on two polls in a row, then compares.
 
 ## Timeouts, retries, backoff
 
@@ -191,7 +194,7 @@ agree.
 | Peer reconnect backoff | 100 ms doubling to 2 s | `peers::BACKOFF_*` | A peer link opens when its first message is queued; a frame whose write failed is resent after reconnecting (at-least-once while both ends are up). |
 | Peer queue | 4096 messages | `peers::QUEUE_LIMIT` | Beyond it, messages to that peer are dropped and counted (`peer_queue_drops`). |
 | Finished per-request keys | 60 s | `election::FINISHED_KEEP` | Late bids for them are ignored. |
-| Table TTL | `table_ttl_ms` = 300 000 | node.toml | Request- and results-table entries older than this are removed (swept every second). Must be much longer than a client's full retry window (5 × 1 s). |
+| Table TTL | `table_ttl_ms` = 1 800 000 (30 min, D38) | node.toml | Request- and results-table entries older than this are removed (swept every second); a retry after that is recomputed, not answered from the table. Must be much longer than a client's full retry window (5 × 1 s). |
 
 No heartbeats: nodes send each other nothing except `Replicate` and `ElectBid`.
 A client's retry is the failure detector.

@@ -36,6 +36,7 @@ cargo test            # unit tests + integration tests (500 requests, failover, 
 scripts/run_local.sh                    # builds, starts nodes on 7001-7003, logs in logs/
 target/release/client --config config/local/client.toml --count 500 --rate 100 --complexity 5
 target/release/client --config config/local/client.toml --status   # per-node state, tables equal?
+target/release/client --config config/local/client.toml --status --settle   # same, after waiting (≤10 s) for in-flight jobs
 scripts/run_local.sh stop
 ```
 
