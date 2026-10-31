@@ -27,7 +27,10 @@ pub struct ShortestPaths {
 
 impl Graph {
     pub fn new(n: usize) -> Self {
-        Graph { edges: Vec::new(), adj: vec![Vec::new(); n] }
+        Graph {
+            edges: Vec::new(),
+            adj: vec![Vec::new(); n],
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -48,7 +51,12 @@ impl Graph {
     /// Dijkstra from `src` with per-edge weights from `weight(edge_index)`.
     /// With `stop_at = Some(t)` it returns as soon as `t` is settled; other
     /// distances may then be incomplete.
-    pub fn dijkstra(&self, src: u32, stop_at: Option<u32>, weight: impl Fn(usize) -> u32) -> ShortestPaths {
+    pub fn dijkstra(
+        &self,
+        src: u32,
+        stop_at: Option<u32>,
+        weight: impl Fn(usize) -> u32,
+    ) -> ShortestPaths {
         let n = self.len();
         let mut dist = vec![UNREACHABLE; n];
         let mut parent = vec![NO_PARENT; n];

@@ -12,7 +12,10 @@ pub fn solve(cost: &[Vec<i64>]) -> (Vec<usize>, i64) {
     }
     let m = cost[0].len();
     assert!(n <= m, "hungarian: {n} rows > {m} columns");
-    assert!(cost.iter().all(|r| r.len() == m), "hungarian: ragged matrix");
+    assert!(
+        cost.iter().all(|r| r.len() == m),
+        "hungarian: ragged matrix"
+    );
 
     // 1-based: u[i] row potentials, v[j] column potentials, p[j] = row matched
     // to column j (0 = none), way[j] = previous column on the augmenting path.
@@ -75,7 +78,11 @@ pub fn solve(cost: &[Vec<i64>]) -> (Vec<usize>, i64) {
             col_of_row[p[j] - 1] = j - 1;
         }
     }
-    let total = col_of_row.iter().enumerate().map(|(i, &j)| cost[i][j]).sum();
+    let total = col_of_row
+        .iter()
+        .enumerate()
+        .map(|(i, &j)| cost[i][j])
+        .sum();
     (col_of_row, total)
 }
 
@@ -110,8 +117,9 @@ mod tests {
         for _ in 0..2000 {
             let n = rng.range(1, 5) as usize;
             let m = rng.range(n as u64, 6) as usize;
-            let cost: Vec<Vec<i64>> =
-                (0..n).map(|_| (0..m).map(|_| rng.range(0, 40) as i64 - 10).collect()).collect();
+            let cost: Vec<Vec<i64>> = (0..n)
+                .map(|_| (0..m).map(|_| rng.range(0, 40) as i64 - 10).collect())
+                .collect();
             let (cols, total) = solve(&cost);
             let mut seen = cols.clone();
             seen.sort();

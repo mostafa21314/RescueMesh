@@ -11,9 +11,15 @@ use std::path::Path;
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("reading {path}: {source}")]
-    Read { path: String, source: std::io::Error },
+    Read {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("parsing {path}: {source}")]
-    Parse { path: String, source: toml::de::Error },
+    Parse {
+        path: String,
+        source: toml::de::Error,
+    },
     #[error("invalid config: {0}")]
     Invalid(String),
 }
@@ -39,6 +45,19 @@ pub enum Policy {
     RoundRobin,
 }
 
+/// What the load score's CPU term measures.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CpuSource {
+    /// Whole-machine CPU use: sees any load on the machine, including other
+    /// programs, but nodes sharing a machine see the same value.
+    #[default]
+    Machine,
+    /// This node process's CPU use, as a share of all cores: tells co-located
+    /// nodes apart, but is blind to other programs.
+    Process,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Weights {
     pub pending: f64,
@@ -48,7 +67,11 @@ pub struct Weights {
 
 impl Default for Weights {
     fn default() -> Self {
-        Weights { pending: 0.5, cpu: 0.3, service_time: 0.2 }
+        Weights {
+            pending: 0.5,
+            cpu: 0.3,
+            service_time: 0.2,
+        }
     }
 }
 
@@ -65,7 +88,11 @@ pub struct CampusParams {
 
 impl Default for CampusParams {
     fn default() -> Self {
-        CampusParams { grid: 16, responders: 150, resources: 100 }
+        CampusParams {
+            grid: 16,
+            responders: 150,
+            resources: 100,
+        }
     }
 }
 
@@ -88,6 +115,13 @@ pub struct NodeConfig {
     pub weights: Weights,
     pub bid_timeout_ms: u64,
     pub degraded_after_ms: u64,
+    /// A retry can trigger an election only after the current server has
+    /// held the role this long (0 disables). Keep it equal to the client's
+    /// request_timeout_ms.
+    #[serde(default = "default_min_tenure_ms")]
+    pub min_tenure_ms: u64,
+    #[serde(default)]
+    pub cpu_source: CpuSource,
     /// Planner worker threads.
     pub workers: usize,
     /// Seed for the synthetic campus; must match on every node.
@@ -100,6 +134,10 @@ pub struct NodeConfig {
     pub table_ttl_ms: u64,
     #[serde(default)]
     pub campus: CampusParams,
+}
+
+fn default_min_tenure_ms() -> u64 {
+    1000 // the client's default request_timeout_ms
 }
 
 fn default_queue_capacity() -> usize {
@@ -121,17 +159,30 @@ impl NodeConfig {
         let mut ids = HashSet::from([self.node_id]);
         for p in &self.peers {
             if !ids.insert(p.id) {
-                return Err(ConfigError::Invalid(format!("node id {} appears twice", p.id)));
+                return Err(ConfigError::Invalid(format!(
+                    "node id {} appears twice",
+                    p.id
+                )));
             }
         }
         if self.workers == 0 {
             return Err(ConfigError::Invalid("workers must be at least 1".into()));
         }
         if self.queue_capacity == 0 {
-            return Err(ConfigError::Invalid("queue_capacity must be at least 1".into()));
+            return Err(ConfigError::Invalid(
+                "queue_capacity must be at least 1".into(),
+            ));
+        }
+        if self.peers.len() != 2 {
+            return Err(ConfigError::Invalid(format!(
+                "need exactly 2 peers, got {}",
+                self.peers.len()
+            )));
         }
         if self.campus.grid < 2 || self.campus.responders == 0 {
-            return Err(ConfigError::Invalid("campus needs grid >= 2 and responders >= 1".into()));
+            return Err(ConfigError::Invalid(
+                "campus needs grid >= 2 and responders >= 1".into(),
+            ));
         }
         Ok(())
     }
@@ -152,7 +203,9 @@ impl ClientConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let cfg: ClientConfig = load_toml(path.as_ref())?;
         if cfg.nodes.is_empty() || cfg.max_attempts == 0 {
-            return Err(ConfigError::Invalid("need at least one node and max_attempts >= 1".into()));
+            return Err(ConfigError::Invalid(
+                "need at least one node and max_attempts >= 1".into(),
+            ));
         }
         Ok(cfg)
     }
@@ -160,6 +213,12 @@ impl ClientConfig {
 
 fn load_toml<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, ConfigError> {
     let shown = path.display().to_string();
-    let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read { path: shown.clone(), source })?;
-    toml::from_str(&text).map_err(|source| ConfigError::Parse { path: shown, source })
+    let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: shown.clone(),
+        source,
+    })?;
+    toml::from_str(&text).map_err(|source| ConfigError::Parse {
+        path: shown,
+        source,
+    })
 }

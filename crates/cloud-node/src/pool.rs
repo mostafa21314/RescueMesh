@@ -44,7 +44,13 @@ impl<J: Send + 'static> Pool<J> {
         F: Fn(J) + Send + Sync + 'static,
     {
         let inner = Arc::new(Inner {
-            q: Mutex::new(Queue { jobs: VecDeque::new(), queued_cost: 0, running_cost: 0, running: 0, shutdown: false }),
+            q: Mutex::new(Queue {
+                jobs: VecDeque::new(),
+                queued_cost: 0,
+                running_cost: 0,
+                running: 0,
+                shutdown: false,
+            }),
             cv: Condvar::new(),
             capacity,
         });
@@ -59,13 +65,30 @@ impl<J: Send + 'static> Pool<J> {
                     .expect("spawn planner thread")
             })
             .collect();
-        Pool { inner, threads: Mutex::new(threads) }
+        Pool {
+            inner,
+            threads: Mutex::new(threads),
+        }
     }
 
     /// Queues `job`, or hands it back if the queue is full.
     pub fn try_submit(&self, cost: u64, job: J) -> Result<(), J> {
         let mut q = self.inner.q.lock().unwrap();
         if q.shutdown || q.jobs.len() >= self.inner.capacity {
+            return Err(job);
+        }
+        q.queued_cost += cost;
+        q.jobs.push_back((cost, job));
+        drop(q);
+        self.inner.cv.notify_one();
+        Ok(())
+    }
+
+    /// Queues `job` even if the queue is full (a new server taking over its
+    /// request table must execute every not-completed request).
+    pub fn force_submit(&self, cost: u64, job: J) -> Result<(), J> {
+        let mut q = self.inner.q.lock().unwrap();
+        if q.shutdown {
             return Err(job);
         }
         q.queued_cost += cost;
@@ -84,7 +107,11 @@ impl<J: Send + 'static> Pool<J> {
 
     pub fn load(&self) -> PoolLoad {
         let q = self.inner.q.lock().unwrap();
-        PoolLoad { queued: q.jobs.len(), running: q.running, pending_cost: q.queued_cost + q.running_cost }
+        PoolLoad {
+            queued: q.jobs.len(),
+            running: q.running,
+            pending_cost: q.queued_cost + q.running_cost,
+        }
     }
 
     /// Stops the workers after their current job; queued jobs are discarded.
@@ -148,7 +175,14 @@ mod tests {
         pool.try_submit(3, 2).unwrap();
         pool.try_submit(4, 3).unwrap();
         assert_eq!(pool.try_submit(1, 4), Err(4), "queue of 2 is full");
-        assert_eq!(pool.load(), PoolLoad { queued: 2, running: 1, pending_cost: 12 });
+        assert_eq!(
+            pool.load(),
+            PoolLoad {
+                queued: 2,
+                running: 1,
+                pending_cost: 12
+            }
+        );
 
         assert_eq!(pool.drop_queued(), vec![2, 3]);
         assert_eq!(pool.load().pending_cost, 5);

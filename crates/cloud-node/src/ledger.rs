@@ -65,7 +65,11 @@ impl Ledger {
             .filter(|r| r.availability == Availability::Available)
             .map(|r| (r.resource_id, r.quantity))
             .collect();
-        Ledger { responders: HashMap::new(), resources: HashMap::new(), capacity }
+        Ledger {
+            responders: HashMap::new(),
+            resources: HashMap::new(),
+            capacity,
+        }
     }
 
     pub fn snapshot(&self, now_ms: u64) -> Snapshot {
@@ -84,9 +88,12 @@ impl Ledger {
     }
 
     fn used(&self, id: ResourceId, now_ms: u64) -> u32 {
-        self.resources
-            .get(&id)
-            .map_or(0, |hs| hs.iter().filter(|h| h.expires_at_ms > now_ms).map(|h| h.quantity).sum())
+        self.resources.get(&id).map_or(0, |hs| {
+            hs.iter()
+                .filter(|h| h.expires_at_ms > now_ms)
+                .map(|h| h.quantity)
+                .sum()
+        })
     }
 
     /// True if every responder and resource unit in `plan` is still free (or
@@ -97,7 +104,11 @@ impl Ledger {
                 Some(h) => h.expires_at_ms <= now_ms || h.request_id == request_id,
                 None => true,
             },
-            Assignee::Resource { resource_id, quantity, .. } => {
+            Assignee::Resource {
+                resource_id,
+                quantity,
+                ..
+            } => {
                 let held = self
                     .resources
                     .get(&resource_id)
@@ -114,7 +125,11 @@ impl Ledger {
         for a in &plan.assignments {
             match a.assignee {
                 Assignee::Responder { responder_id, .. } => {
-                    let new = Hold { request_id, priority: plan.priority, expires_at_ms: a.expires_at_ms };
+                    let new = Hold {
+                        request_id,
+                        priority: plan.priority,
+                        expires_at_ms: a.expires_at_ms,
+                    };
                     match self.responders.get(&responder_id) {
                         None => {
                             self.responders.insert(responder_id, new);
@@ -126,16 +141,27 @@ impl Ledger {
                         Some(old) => {
                             let new_wins = (new.priority, std::cmp::Reverse(new.request_id))
                                 > (old.priority, std::cmp::Reverse(old.request_id));
-                            let (kept, dropped) =
-                                if new_wins { (request_id, old.request_id) } else { (old.request_id, request_id) };
+                            let (kept, dropped) = if new_wins {
+                                (request_id, old.request_id)
+                            } else {
+                                (old.request_id, request_id)
+                            };
                             if new_wins {
                                 self.responders.insert(responder_id, new);
                             }
-                            out.conflicts.push(Conflict { responder_id, kept, dropped });
+                            out.conflicts.push(Conflict {
+                                responder_id,
+                                kept,
+                                dropped,
+                            });
                         }
                     }
                 }
-                Assignee::Resource { resource_id, quantity, .. } => {
+                Assignee::Resource {
+                    resource_id,
+                    quantity,
+                    ..
+                } => {
                     let used = self.used(resource_id, now_ms);
                     let cap = self.capacity.get(&resource_id).copied().unwrap_or(0);
                     let holds = self.resources.entry(resource_id).or_default();
@@ -146,11 +172,38 @@ impl Ledger {
                     if used + quantity > cap {
                         out.resource_overcommits += 1;
                     }
-                    holds.push(ResourceHold { request_id, quantity, expires_at_ms: a.expires_at_ms });
+                    holds.push(ResourceHold {
+                        request_id,
+                        quantity,
+                        expires_at_ms: a.expires_at_ms,
+                    });
                 }
             }
         }
         out
+    }
+
+    /// Undoes `plan`'s holds for `request_id` (a result that lost to a
+    /// preferred one for the same request). Holds of other requests stay.
+    pub fn release(&mut self, request_id: RequestId, plan: &Plan) {
+        for a in &plan.assignments {
+            match a.assignee {
+                Assignee::Responder { responder_id, .. } => {
+                    if self
+                        .responders
+                        .get(&responder_id)
+                        .is_some_and(|h| h.request_id == request_id)
+                    {
+                        self.responders.remove(&responder_id);
+                    }
+                }
+                Assignee::Resource { resource_id, .. } => {
+                    if let Some(hs) = self.resources.get_mut(&resource_id) {
+                        hs.retain(|h| h.request_id != request_id);
+                    }
+                }
+            }
+        }
     }
 
     pub fn holder(&self, responder_id: ResponderId) -> Option<&Hold> {
@@ -165,7 +218,10 @@ mod tests {
     use uuid::Uuid;
 
     fn rid(seq: u64) -> RequestId {
-        RequestId { client_id: Uuid::nil(), seq }
+        RequestId {
+            client_id: Uuid::nil(),
+            seq,
+        }
     }
 
     fn plan_with(priority: u32, responder_id: ResponderId) -> Plan {
@@ -175,7 +231,10 @@ mod tests {
             ranked_responders: vec![],
             assignments: vec![Assignment {
                 incident_id: Uuid::nil(),
-                assignee: Assignee::Responder { responder_id, role: Capability::FirstAid },
+                assignee: Assignee::Responder {
+                    responder_id,
+                    role: Capability::FirstAid,
+                },
                 created_at_ms: 0,
                 expires_at_ms: 10_000,
             }],
@@ -187,13 +246,23 @@ mod tests {
     }
 
     fn ledger() -> Ledger {
-        Ledger::new(&Campus::generate(1, CampusParams { grid: 3, responders: 5, resources: 3 }))
+        Ledger::new(&Campus::generate(
+            1,
+            CampusParams {
+                grid: 3,
+                responders: 5,
+                resources: 3,
+            },
+        ))
     }
 
     #[test]
     fn higher_priority_keeps_responder_in_any_order() {
         let (lo, hi) = (plan_with(300, 4), plan_with(700, 4));
-        for order in [[(rid(1), &lo), (rid(2), &hi)], [(rid(2), &hi), (rid(1), &lo)]] {
+        for order in [
+            [(rid(1), &lo), (rid(2), &hi)],
+            [(rid(2), &hi), (rid(1), &lo)],
+        ] {
             let mut l = ledger();
             let mut conflicts = 0;
             for (r, p) in order {
@@ -210,7 +279,25 @@ mod tests {
         let mut l = ledger();
         l.apply(rid(9), &p, 0);
         let c = l.apply(rid(3), &p, 0).conflicts;
-        assert_eq!(c, vec![Conflict { responder_id: 2, kept: rid(3), dropped: rid(9) }]);
+        assert_eq!(
+            c,
+            vec![Conflict {
+                responder_id: 2,
+                kept: rid(3),
+                dropped: rid(9)
+            }]
+        );
+    }
+
+    #[test]
+    fn release_frees_only_this_requests_holds() {
+        let mut l = ledger();
+        l.apply(rid(1), &plan_with(500, 1), 0);
+        l.apply(rid(2), &plan_with(500, 2), 0);
+        l.release(rid(1), &plan_with(500, 1));
+        l.release(rid(1), &plan_with(500, 2)); // held by request 2: untouched
+        assert!(l.holder(1).is_none());
+        assert_eq!(l.holder(2).unwrap().request_id, rid(2));
     }
 
     #[test]

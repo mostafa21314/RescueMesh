@@ -1,5 +1,7 @@
 //! RescueMesh cloud node: the Incident Processing and Coordination Service.
 //!
+//! * `election`  – load-aware election state machine (sans-IO)
+//! * `load`      – CPU sampler, service-time EWMA, load score
 //! * `campus`    – seeded synthetic campus (zone graph, responders, resources)
 //! * `graph`     – Dijkstra over the zone graph
 //! * `hungarian` – our minimum-cost assignment solver
@@ -11,9 +13,11 @@
 //! * `node`      – listener, request handling, replication
 
 pub mod campus;
+pub mod election;
 pub mod graph;
 pub mod hungarian;
 pub mod ledger;
+pub mod load;
 pub mod node;
 pub mod peers;
 pub mod planner;

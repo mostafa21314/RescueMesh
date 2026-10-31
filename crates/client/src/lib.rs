@@ -8,7 +8,7 @@
 
 use common::config::ClientConfig;
 use common::counters::Counters;
-use common::rng::Rng;
+use common::rng::{mix, Rng};
 use common::wire::{read_frame, write_frame};
 use common::*;
 use std::collections::{BTreeMap, HashMap};
@@ -21,9 +21,22 @@ use uuid::Uuid;
 
 pub const BACKOFF_MIN: Duration = Duration::from_millis(100);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(2);
-/// After a Busy reply the client waits `BUSY_PAUSE × attempt` before resending,
-/// so a full queue isn't hammered with instant retries.
-pub const BUSY_PAUSE: Duration = Duration::from_millis(20);
+/// First pause after a Busy reply; it doubles with every attempt (see `busy_pause`).
+pub const BUSY_BASE: Duration = Duration::from_millis(50);
+/// Jitter added to a Busy pause: up to this share of the pause, in percent.
+pub const BUSY_JITTER_PCT: u64 = 25;
+
+/// How long to wait after attempt `attempt` (1-based) got Busy before
+/// resending with `attempt + 1`: min(50 ms × 2^(attempt−1), timeout), plus
+/// 0–25 % jitter so clients turned away together don't come back together.
+/// `salt` picks the jitter (per request and attempt); it is a hash, so a run
+/// with the same seed retries at the same times.
+pub fn busy_pause(attempt: u32, timeout: Duration, salt: u64) -> Duration {
+    let doubled = BUSY_BASE.saturating_mul(1u32 << attempt.saturating_sub(1).min(20));
+    let base = doubled.min(timeout);
+    let per_mille = mix(salt) % (BUSY_JITTER_PCT * 10 + 1); // 0..=250 ‰
+    base + base * per_mille as u32 / 1000
+}
 
 /// What happened to one request.
 #[derive(Clone, Debug)]
@@ -71,7 +84,9 @@ struct Dispatch {
 impl Dispatch {
     fn deliver(&self, msg: Message) {
         let request_id = match &msg {
-            Message::PlanResponse { request_id, epoch, .. } => {
+            Message::PlanResponse {
+                request_id, epoch, ..
+            } => {
                 self.epoch.fetch_max(*epoch, Ordering::Relaxed);
                 *request_id
             }
@@ -107,7 +122,13 @@ impl Client {
                 tx
             })
             .collect();
-        Client { cfg, client_id: Uuid::new_v4(), seq: AtomicU64::new(0), links, dispatch }
+        Client {
+            cfg,
+            client_id: Uuid::new_v4(),
+            seq: AtomicU64::new(0),
+            links,
+            dispatch,
+        }
     }
 
     pub fn client_id(&self) -> Uuid {
@@ -128,7 +149,10 @@ impl Client {
 
     /// Submits one incident and waits for a plan or for the attempts to run out.
     pub async fn submit(&self, incident: Incident, complexity: u32) -> Outcome {
-        let request_id = RequestId { client_id: self.client_id, seq: self.seq.fetch_add(1, Ordering::Relaxed) };
+        let request_id = RequestId {
+            client_id: self.client_id,
+            seq: self.seq.fetch_add(1, Ordering::Relaxed),
+        };
         let (tx, mut rx) = mpsc::unbounded_channel();
         self.dispatch.pending.lock().unwrap().insert(request_id, tx);
 
@@ -163,7 +187,13 @@ impl Client {
             let deadline = tokio::time::Instant::now() + timeout;
             let busy = loop {
                 match tokio::time::timeout_at(deadline, rx.recv()).await {
-                    Ok(Some(Message::PlanResponse { served_by, epoch, degraded, plan, .. })) => {
+                    Ok(Some(Message::PlanResponse {
+                        served_by,
+                        epoch,
+                        degraded,
+                        plan,
+                        ..
+                    })) => {
                         out.response_at_ms = Some(unix_ms());
                         out.latency = Some(start.elapsed());
                         out.served_by = Some(served_by);
@@ -180,8 +210,13 @@ impl Client {
                     Ok(None) | Err(_) => break false,
                 }
             };
+            // A Busy retry still raises the attempt number, so a server that
+            // stays overloaded can be replaced (subject to min_tenure_ms).
             if busy && attempt < self.cfg.max_attempts {
-                tokio::time::sleep(BUSY_PAUSE * attempt).await;
+                let salt = self.client_id.as_u64_pair().0
+                    ^ request_id.seq.rotate_left(17)
+                    ^ attempt as u64;
+                tokio::time::sleep(busy_pause(attempt, timeout, salt)).await;
             }
         }
         self.dispatch.pending.lock().unwrap().remove(&request_id);
@@ -201,12 +236,24 @@ impl Client {
 /// One node's connection: opened on demand, reopened with backoff. While the
 /// node is unreachable, frames for it are dropped (the retry rule covers it)
 /// rather than queued, so a dead node never delays requests to live ones.
-async fn link_task(addr: String, timeout: Duration, mut rx: mpsc::UnboundedReceiver<Message>, dispatch: Arc<Dispatch>) {
-    let mut writer: Option<(tokio::net::tcp::OwnedWriteHalf, Arc<AtomicBool>, tokio::task::JoinHandle<()>)> = None;
+async fn link_task(
+    addr: String,
+    timeout: Duration,
+    mut rx: mpsc::UnboundedReceiver<Message>,
+    dispatch: Arc<Dispatch>,
+) {
+    let mut writer: Option<(
+        tokio::net::tcp::OwnedWriteHalf,
+        Arc<AtomicBool>,
+        tokio::task::JoinHandle<()>,
+    )> = None;
     let mut backoff = BACKOFF_MIN;
     let mut next_try = Instant::now();
     while let Some(msg) = rx.recv().await {
-        if writer.as_ref().is_some_and(|(_, alive, _)| !alive.load(Ordering::Relaxed)) {
+        if writer
+            .as_ref()
+            .is_some_and(|(_, alive, _)| !alive.load(Ordering::Relaxed))
+        {
             writer = None;
         }
         if writer.is_none() {
@@ -247,7 +294,11 @@ async fn link_task(addr: String, timeout: Duration, mut rx: mpsc::UnboundedRecei
     }
 }
 
-async fn read_loop(mut rd: tokio::net::tcp::OwnedReadHalf, alive: Arc<AtomicBool>, dispatch: Arc<Dispatch>) {
+async fn read_loop(
+    mut rd: tokio::net::tcp::OwnedReadHalf,
+    alive: Arc<AtomicBool>,
+    dispatch: Arc<Dispatch>,
+) {
     while let Ok(Some((msg, n))) = read_frame(&mut rd).await {
         dispatch.received.add(msg.kind(), n);
         dispatch.deliver(msg);
@@ -289,5 +340,36 @@ pub fn synth_incident(rng: &mut Rng, zones: u32, reporter: &str) -> Incident {
         timestamp_ms: unix_ms(),
         status: IncidentStatus::Reported,
         ttl_ms: rng.range(5_000, 30_000),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn busy_pause_doubles_caps_at_timeout_and_jitters_up_to_25_percent() {
+        let timeout = Duration::from_millis(1000);
+        for attempt in 1..=6u32 {
+            let base = (50u64 << (attempt - 1)).min(1000);
+            let mut seen = std::collections::BTreeSet::new();
+            for salt in 0..500u64 {
+                let p = busy_pause(attempt, timeout, salt).as_millis() as u64;
+                assert!(
+                    p >= base && p <= base + base / 4,
+                    "attempt {attempt}: {p} ms vs base {base}"
+                );
+                seen.insert(p);
+            }
+            assert!(seen.len() > 1, "jitter varies with the salt");
+        }
+        // Same inputs, same pause.
+        assert_eq!(busy_pause(3, timeout, 42), busy_pause(3, timeout, 42));
+        // Huge attempt numbers don't overflow; the cap holds.
+        assert!(busy_pause(u32::MAX, timeout, 7) <= timeout + timeout / 4);
+        // Over the default 5 attempts the pauses add up to ≥ 750 ms (50+100+200+400),
+        // most of a takeover backlog's drain time (≈1 s measured).
+        let total: Duration = (1..5).map(|a| busy_pause(a, timeout, 0)).sum();
+        assert!(total >= Duration::from_millis(750));
     }
 }

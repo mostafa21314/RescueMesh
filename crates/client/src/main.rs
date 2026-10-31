@@ -49,7 +49,9 @@ async fn main() -> anyhow::Result<()> {
 
     let zones = cfg.campus.zones();
     let client = Arc::new(Client::new(cfg));
-    let seed = args.seed.unwrap_or_else(|| client.client_id().as_u64_pair().0);
+    let seed = args
+        .seed
+        .unwrap_or_else(|| client.client_id().as_u64_pair().0);
     let mut rng = Rng::new(seed);
     let reporter = format!("client-{}", &client.client_id().simple().to_string()[..8]);
     tracing::info!(client = %client.client_id(), count = args.count, rate = args.rate, complexity = args.complexity, seed, "starting run");
@@ -58,7 +60,10 @@ async fn main() -> anyhow::Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
     for i in 0..args.count {
         if args.rate > 0.0 {
-            tokio::time::sleep_until((start + Duration::from_secs_f64(i as f64 / args.rate)).into()).await;
+            tokio::time::sleep_until(
+                (start + Duration::from_secs_f64(i as f64 / args.rate)).into(),
+            )
+            .await;
         }
         let incident = synth_incident(&mut rng, zones, &reporter);
         let c = client.clone();
@@ -87,7 +92,9 @@ fn write_csv(path: &PathBuf, outcomes: &[Outcome]) -> anyhow::Result<()> {
             o.request_id.seq,
             o.sent_at_ms,
             opt(o.response_at_ms),
-            o.latency.map(|d| format!("{:.3}", d.as_secs_f64() * 1e3)).unwrap_or_default(),
+            o.latency
+                .map(|d| format!("{:.3}", d.as_secs_f64() * 1e3))
+                .unwrap_or_default(),
             opt(o.served_by.map(u64::from)),
             opt(o.epoch),
             o.degraded,
@@ -101,9 +108,19 @@ fn write_csv(path: &PathBuf, outcomes: &[Outcome]) -> anyhow::Result<()> {
 
 fn summarize(outcomes: &[Outcome], wall: Duration, client: &Client) {
     let answered: Vec<&Outcome> = outcomes.iter().filter(|o| o.answered()).collect();
-    let mut lat: Vec<f64> = answered.iter().filter_map(|o| o.latency).map(|d| d.as_secs_f64() * 1e3).collect();
+    let mut lat: Vec<f64> = answered
+        .iter()
+        .filter_map(|o| o.latency)
+        .map(|d| d.as_secs_f64() * 1e3)
+        .collect();
     lat.sort_by(|a, b| a.total_cmp(b));
-    let pct = |p: f64| if lat.is_empty() { f64::NAN } else { lat[((lat.len() - 1) as f64 * p).round() as usize] };
+    let pct = |p: f64| {
+        if lat.is_empty() {
+            f64::NAN
+        } else {
+            lat[((lat.len() - 1) as f64 * p).round() as usize]
+        }
+    };
     let mut served: BTreeMap<u32, usize> = BTreeMap::new();
     let mut attempts: BTreeMap<u32, usize> = BTreeMap::new();
     for o in &answered {
@@ -121,10 +138,22 @@ fn summarize(outcomes: &[Outcome], wall: Duration, client: &Client) {
         wall.as_secs_f64(),
         answered.len() as f64 / wall.as_secs_f64()
     );
-    println!("latency ms  p50 {:.2}  p95 {:.2}  p99 {:.2}  max {:.2}", pct(0.5), pct(0.95), pct(0.99), pct(1.0));
-    println!("served_by {served:?}  attempts {attempts:?}  busy replies {busy}  highest epoch {}", client.highest_epoch());
+    println!(
+        "latency ms  p50 {:.2}  p95 {:.2}  p99 {:.2}  max {:.2}",
+        pct(0.5),
+        pct(0.95),
+        pct(0.99),
+        pct(1.0)
+    );
+    println!(
+        "served_by {served:?}  attempts {attempts:?}  busy replies {busy}  highest epoch {}",
+        client.highest_epoch()
+    );
     let t = client.traffic();
-    println!("sent {:?}\nreceived {:?}\nunsent frames (node down) {}", t.sent, t.received, t.unsent);
+    println!(
+        "sent {:?}\nreceived {:?}\nunsent frames (node down) {}",
+        t.sent, t.received, t.unsent
+    );
 }
 
 async fn print_status(cfg: &ClientConfig) -> anyhow::Result<()> {
@@ -138,6 +167,12 @@ async fn print_status(cfg: &ClientConfig) -> anyhow::Result<()> {
                     s.pending_cost, s.replicate_conflicts, s.duplicate_replicates, s.local_replans,
                     s.resource_overcommits, s.peer_queue_drops, s.peer_last_seen_ms
                 );
+                println!(
+                    "    degraded {} elections decided {} alone {} splits {} step_downs {} suppressed_triggers {} dropped_on_step_down {} late_results {}",
+                    s.degraded, s.elections_decided, s.elections_alone, s.split_resolutions, s.step_downs,
+                    s.suppressed_triggers,
+                    s.dropped_on_step_down, s.late_results
+                );
                 println!("    sent {:?}\n    received {:?}", s.sent, s.received);
                 digests.push((s.results, s.results_digest));
             }
@@ -146,7 +181,14 @@ async fn print_status(cfg: &ClientConfig) -> anyhow::Result<()> {
     }
     if digests.len() > 1 {
         let same = digests.windows(2).all(|w| w[0] == w[1]);
-        println!("results tables {}", if same { "IDENTICAL on all reachable nodes" } else { "DIFFER" });
+        println!(
+            "results tables {}",
+            if same {
+                "IDENTICAL on all reachable nodes"
+            } else {
+                "DIFFER"
+            }
+        );
     }
     Ok(())
 }

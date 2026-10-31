@@ -6,12 +6,14 @@ peers = [
   { id = 3, addr = "127.0.0.1:7003" },
 ]
 
-# Election (Part B; parsed but not used yet: node 1 serves as a placeholder).
+# Election.
 election_mode = "on_demand"     # or "per_request"
 policy = "Composite"            # Composite | QueueOnly | CpuOnly | RoundRobin
 weights = { pending = 0.5, cpu = 0.3, service_time = 0.2 }
 bid_timeout_ms = 100
 degraded_after_ms = 3000
+min_tenure_ms = 1000            # retries trigger elections only after the server held the role this long (= client timeout)
+cpu_source = "machine"          # CPU term: "machine" (whole machine) or "process" (this node only)
 
 # Processing.
 workers = 4                     # planner threads

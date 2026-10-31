@@ -7,14 +7,15 @@ Phase 1 status:
 | Bullet | State |
 |---|---|
 | 1. Three-node cloud + Incident Processing and Coordination Service | **done (Part A)** |
-| 2. Distributed election for workload assignment, with a load metric | next (Part B); node 1 serves as a marked placeholder |
+| 2. Distributed election for workload assignment, with a load metric | **done (Part B)**: on-demand, retry-triggered election; per-request mode for comparison |
 | 3–6. Concurrency write-up, fault injection, recovery, stress tests | later |
 
 ## Layout
 
 ```
 crates/common      data model, request ids, messages, framing, config, PRNG, counters
-crates/cloud-node  the node: campus, Dijkstra, Hungarian, planner, pool, ledger, tables, peers
+crates/cloud-node  the node: campus, Dijkstra, Hungarian, planner, pool, ledger, tables, peers,
+                   load score, election
 crates/client      client library + CLI (fan-out to all nodes, retries)
 config/            lab configs (node1-3.toml, client.toml); config/local/ = all on 127.0.0.1
 scripts/           run_local.sh / run_local.ps1: start or stop 3 nodes locally
@@ -25,7 +26,8 @@ docs/              protocol.md, design-log.md, library-vs-ours.md
 
 ```bash
 cargo build --release
-cargo test            # unit tests + 3-node integration tests (500 requests)
+cargo test            # unit tests + integration tests (500 requests, failover, per-request,
+                      # --burn-threads with real processes)
 ```
 
 ## Run locally (three nodes on 127.0.0.1)
@@ -38,6 +40,21 @@ scripts/run_local.sh stop
 ```
 
 Windows: `.\scripts\run_local.ps1` and `.\scripts\run_local.ps1 stop`.
+
+Election experiments:
+
+```bash
+BURN_NODE=1 BURN_THREADS=4 scripts/run_local.sh   # node 1 also burns 4 CPU threads
+kill $(cat logs/node1.pid)                         # crash a node mid-run
+grep election logs/node*.log                       # one line per election
+```
+
+Mode and policy are per-node config: `election_mode = "on_demand" | "per_request"`,
+`policy = "Composite" | "QueueOnly" | "CpuOnly" | "RoundRobin"`,
+`cpu_source = "machine" | "process"` (on one machine, only `"process"` tells the
+nodes' CPU load apart), `min_tenure_ms` (a retry can trigger an election only
+after the server has held the role this long; keep it equal to the client's
+`request_timeout_ms`). All three nodes must use the same mode and policy.
 
 Client flags: `--count` incidents, `--rate` per second (0 = all at once),
 `--complexity` planner cost per request, `--seed` for repeatable incidents, `--out`

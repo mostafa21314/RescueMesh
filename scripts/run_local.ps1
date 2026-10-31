@@ -3,11 +3,12 @@
 #
 #   .\scripts\run_local.ps1          build (release) and start all three
 #   .\scripts\run_local.ps1 stop     stop them
+#   .\scripts\run_local.ps1 -BurnNode 1 -BurnThreads 4   node 1 also burns 4 CPU threads
 #
 # Then, for example:
 #   .\target\release\client.exe --config config\local\client.toml --count 500 --rate 100 --complexity 5
 #   .\target\release\client.exe --config config\local\client.toml --status
-param([string]$Action = "start")
+param([string]$Action = "start", [int]$BurnNode = 0, [int]$BurnThreads = 4)
 $ErrorActionPreference = "Stop"
 Set-Location (Join-Path $PSScriptRoot "..")
 New-Item -ItemType Directory -Force -Path logs | Out-Null
@@ -32,7 +33,7 @@ if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
 if (-not $env:RUST_LOG) { $env:RUST_LOG = "info" }
 foreach ($i in 1..3) {
     $proc = Start-Process -FilePath "target\release\cloud-node.exe" `
-        -ArgumentList "--config", "config\local\node$i.toml" `
+        -ArgumentList (@("--config", "config\local\node$i.toml") + $(if ($i -eq $BurnNode) { @("--burn-threads", "$BurnThreads") } else { @() })) `
         -RedirectStandardOutput "logs\node$i.log" -RedirectStandardError "logs\node$i.err.log" `
         -NoNewWindow -PassThru
     $proc.Id | Out-File -Encoding ascii "logs\node$i.pid"

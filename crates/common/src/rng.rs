@@ -54,8 +54,14 @@ mod tests {
 
     #[test]
     fn same_seed_same_sequence() {
-        let a: Vec<u64> = { let mut r = Rng::new(42); (0..8).map(|_| r.next_u64()).collect() };
-        let b: Vec<u64> = { let mut r = Rng::new(42); (0..8).map(|_| r.next_u64()).collect() };
+        let a: Vec<u64> = {
+            let mut r = Rng::new(42);
+            (0..8).map(|_| r.next_u64()).collect()
+        };
+        let b: Vec<u64> = {
+            let mut r = Rng::new(42);
+            (0..8).map(|_| r.next_u64()).collect()
+        };
         assert_eq!(a, b);
     }
 

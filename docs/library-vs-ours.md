@@ -14,7 +14,7 @@ and conflict resolution are our code.
 | `clap` | Command-line flags | |
 | `tracing`, `tracing-subscriber` | Structured logs, `RUST_LOG` filtering | |
 | `anyhow`, `thiserror` | Error plumbing | |
-| `sysinfo` | *Part B*: CPU usage samples for the load score | |
+| `sysinfo` | Reading CPU usage (whole machine or this process) for the load score's CPU term | Sampling schedule, EWMA, normalization (ours) |
 | `tokio-util` | Allowed, not used: its length-delimited codec needs `futures` stream/sink extension traits, which aren't on the allowed list, and the 4-byte length prefix takes 30 lines (`common::wire`) | |
 
 ## Ours
@@ -33,4 +33,6 @@ and conflict resolution are our code.
 | Peer links: on-demand connect, reconnect with backoff, last-seen tracking, traffic counters | `cloud-node::peers`, `common::counters` |
 | Request handling, deduplication of in-flight retries, replication | `cloud-node::node` |
 | Client: unicast fan-out, first-response-wins, retry with the same request_id, epoch stamping | `client` |
-| *Part B*: load score, on-demand election, epochs and step-down, degraded mode | not yet |
+| Load score: CPU sampler thread, EWMAs, normalization, policies, `--burn-threads` | `cloud-node::load` |
+| Election: triggers, bids, 2-of-3 decision, incumbent exclusion, epochs and step-down, takeover, split-winner resolution, degraded mode, per-request mode | `cloud-node::election` (sans-IO), wired in `cloud-node::node` |
+| One-result-per-request rule and ledger release for superseded results | `cloud-node::tables`, `cloud-node::ledger` |
