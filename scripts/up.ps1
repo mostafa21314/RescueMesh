@@ -43,6 +43,8 @@ if (-not ($bins | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })) {
     try { cargo build --release; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } finally { Pop-Location }
 }
 
+# set_ips.ps1 only sets an exit code on failure, so clear any earlier one first.
+$global:LASTEXITCODE = 0
 & (Join-Path $here 'set_ips.ps1') $Ip1 $Ip3 $Ip2
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
