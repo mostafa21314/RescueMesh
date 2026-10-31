@@ -1,4 +1,4 @@
-# Replace MACHINE_A_IP / MACHINE_B_IP before use.
+# Fill in the IPs with scripts/set_ips.sh (or .ps1) A_IP B_IP [C_IP]. See docs/deployment.md.
 nodes = ["MACHINE_A_IP:7001", "MACHINE_A_IP:7002", "MACHINE_B_IP:7003"]
 request_timeout_ms = 1000       # to be re-set to ~2x the measured p99 normal latency
 max_attempts = 5

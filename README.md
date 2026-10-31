@@ -18,8 +18,9 @@ crates/cloud-node  the node: campus, Dijkstra, Hungarian, planner, pool, ledger,
                    load score, election
 crates/client      client library + CLI (fan-out to all nodes, retries)
 config/            lab configs (node1-3.toml, client.toml); config/local/ = all on 127.0.0.1
-scripts/           run_local.sh / run_local.ps1: start or stop 3 nodes locally
-docs/              protocol.md, design-log.md, library-vs-ours.md
+scripts/           run_local: start or stop 3 nodes locally; lab: set_ips, start_node,
+                   open_ports (Windows), check_cluster; package.sh builds dist/<target>/
+docs/              protocol.md, design-log.md, library-vs-ours.md, deployment.md
 ```
 
 ## Build and test
@@ -64,19 +65,21 @@ served_by, epoch, attempts, Busy replies).
 
 ## Run in the lab
 
-Edit `MACHINE_A_IP` / `MACHINE_B_IP` in `config/node*.toml` and `config/client.toml`.
-Current topology: node1 and node2 on machine A (ports 7001, 7002), node3 on machine B
-(7003). To move node2, change only its IP in the four files.
+Step by step for each machine (Windows and Linux lab PCs, Mac and Windows client
+laptops), builds, firewall, lab-day order, test sequence and troubleshooting:
+[docs/deployment.md](docs/deployment.md). In short, current topology: node1 and
+node2 on machine A (ports 7001, 7002), node3 on machine B (7003).
 
 ```bash
-# machine A
-target/release/cloud-node --config config/node1.toml
-target/release/cloud-node --config config/node2.toml
-# machine B
-target/release/cloud-node --config config/node3.toml
-# any client machine
+scripts/set_ips.sh A_IP B_IP [C_IP]     # every machine, same arguments (C_IP: node2 moves to C)
+scripts/start_node.sh 1                 # machine A (and 2, in a second terminal); machine B: 3
+scripts/check_cluster.sh                # any machine: reachable / refused / timeout per node, then --status
 target/release/client --config config/client.toml --count 1000 --rate 100 --complexity 5
 ```
+
+Windows: the same scripts as `.ps1`, run with
+`powershell -ExecutionPolicy Bypass -File scripts\<name>.ps1 ...`;
+`scripts\open_ports.ps1` (admin) opens 7001-7003 in the firewall.
 
 `seed` and `[campus]` must match on every node: each one generates the same synthetic
 campus locally. Log level: `RUST_LOG=debug` for per-request lines.
@@ -86,3 +89,4 @@ campus locally. Log level: `RUST_LOG=debug` for per-request lines.
 - [docs/protocol.md](docs/protocol.md): messages, timeouts, retry rules
 - [docs/design-log.md](docs/design-log.md): each decision, its alternatives, and why
 - [docs/library-vs-ours.md](docs/library-vs-ours.md): what crates provide vs. our code
+- [docs/deployment.md](docs/deployment.md): running on lab PCs and laptops

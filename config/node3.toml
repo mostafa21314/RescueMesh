@@ -1,6 +1,6 @@
 # Lab topology (two machines for now): node1 and node2 on MACHINE_A, node3 on MACHINE_B.
-# node2 is on MACHINE_A temporarily; to move it, change only its IP here and in the
-# other two node files and client.toml. Replace MACHINE_A_IP / MACHINE_B_IP before use.
+# Fill in the IPs with scripts/set_ips.sh (or .ps1) A_IP B_IP; to move node2 to a
+# third machine, re-run it with C_IP as well. See docs/deployment.md.
 node_id = 3
 listen = "0.0.0.0:7003"
 peers = [
