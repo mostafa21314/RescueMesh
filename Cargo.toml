@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/common", "crates/cloud-node", "crates/client"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# The only third-party crates this project may use (see docs/library-vs-ours.md).
+# No consensus/Raft/Paxos crate: election and replication are our own code.
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+common = { path = "crates/common" }
+client = { path = "crates/client" }
+
+[profile.release]
+debug = 1

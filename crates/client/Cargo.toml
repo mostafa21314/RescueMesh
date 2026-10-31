@@ -1,0 +1,23 @@
+[package]
+name = "client"
+description = "RescueMesh client: submits incidents to all cloud nodes and retries"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "client"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+common.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

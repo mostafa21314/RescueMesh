@@ -1,0 +1,4 @@
+# All three nodes on this machine.
+nodes = ["127.0.0.1:7001", "127.0.0.1:7002", "127.0.0.1:7003"]
+request_timeout_ms = 1000       # to be re-set to ~2x the measured p99 normal latency
+max_attempts = 5
