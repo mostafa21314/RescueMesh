@@ -3,3 +3,5 @@ logs/
 *.pid
 *.csv
 .DS_Store
+dist/
+bin1/

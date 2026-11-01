@@ -12,7 +12,10 @@ pub const MAX_FRAME: usize = 16 << 20;
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, msg: &Message) -> io::Result<usize> {
     let body = serde_json::to_vec(msg)?;
     if body.len() > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "frame too large",
+        ));
     }
     let mut buf = Vec::with_capacity(4 + body.len());
     buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
@@ -32,7 +35,10 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<(M
     }
     let len = u32::from_be_bytes(len) as usize;
     if len > MAX_FRAME {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
@@ -47,7 +53,12 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip() {
-        let msg = Message::Busy { request_id: RequestId { client_id: uuid::Uuid::nil(), seq: 7 } };
+        let msg = Message::Busy {
+            request_id: RequestId {
+                client_id: uuid::Uuid::nil(),
+                seq: 7,
+            },
+        };
         let mut buf = Vec::new();
         let n = write_frame(&mut buf, &msg).await.unwrap();
         assert_eq!(n, buf.len());

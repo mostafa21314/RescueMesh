@@ -34,6 +34,27 @@ pub enum Message {
         request_id: RequestId,
         plan: Plan,
         incident: Incident,
+        /// The origin computed the plan while serving alone (degraded mode).
+        #[serde(default)]
+        degraded: bool,
+    },
+    /// Node → both peers: a bid in an election.
+    ///
+    /// On-demand mode: `request_id` is `None` and the election is for
+    /// `target_epoch`. Per-request mode: the election is for
+    /// (`request_id`, `attempt`) and `target_epoch` is unused (0).
+    ElectBid {
+        target_epoch: Epoch,
+        node_id: NodeId,
+        /// Load score in milli-units, 0..=1000; lower is less loaded.
+        score: u32,
+        /// The server whose failure triggered this election, as the bidder
+        /// knows it (`None` at startup or when unknown).
+        incumbent: Option<NodeId>,
+        #[serde(default)]
+        request_id: Option<RequestId>,
+        #[serde(default)]
+        attempt: u32,
     },
     /// Serving node → client: the planning queue is full.
     Busy { request_id: RequestId },
@@ -51,6 +72,7 @@ impl Message {
             Message::PlanResponse { .. } => "PlanResponse",
             Message::Replicate { .. } => "Replicate",
             Message::Busy { .. } => "Busy",
+            Message::ElectBid { .. } => "ElectBid",
             Message::StatusRequest => "StatusRequest",
             Message::Status(_) => "Status",
         }
@@ -62,6 +84,19 @@ pub struct NodeStatus {
     pub node_id: NodeId,
     pub epoch: Epoch,
     pub server: Option<NodeId>,
+    pub degraded: bool,
+    /// Elections decided with at least 2 bids / ended with only this node's bid.
+    pub elections_decided: u64,
+    pub elections_alone: u64,
+    /// Times this node saw two servers in one epoch and resolved it.
+    pub split_resolutions: u64,
+    pub step_downs: u64,
+    /// Retry triggers ignored because the server's tenure was below min_tenure.
+    pub suppressed_triggers: u64,
+    /// Queued jobs dropped on stepping down.
+    pub dropped_on_step_down: u64,
+    /// Plans finished after this node stopped serving their epoch.
+    pub late_results: u64,
     pub requests: usize,
     pub results: usize,
     /// Order-independent fingerprint of the results table; equal tables give
@@ -93,6 +128,14 @@ mod tests {
             node_id: 1,
             epoch: 0,
             server: Some(1),
+            degraded: false,
+            elections_decided: 1,
+            elections_alone: 0,
+            split_resolutions: 0,
+            step_downs: 0,
+            suppressed_triggers: 0,
+            dropped_on_step_down: 0,
+            late_results: 0,
             requests: 3,
             results: 3,
             results_digest: 99,

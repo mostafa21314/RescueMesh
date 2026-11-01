@@ -57,7 +57,11 @@ impl Campus {
                     }
                 }
                 caps.sort();
-                Responder { id, zone: rng.below(n as u64) as u32, capabilities: caps }
+                Responder {
+                    id,
+                    zone: rng.below(n as u64) as u32,
+                    capabilities: caps,
+                }
             })
             .collect();
 
@@ -67,7 +71,11 @@ impl Campus {
                 owner: format!("dept-{}", rng.range(1, 8)),
                 kind: ResourceType::ALL[rng.below(ResourceType::ALL.len() as u64) as usize],
                 quantity: rng.range(1, 4) as u32,
-                availability: if rng.chance(100) { Availability::Offline } else { Availability::Available },
+                availability: if rng.chance(100) {
+                    Availability::Offline
+                } else {
+                    Availability::Available
+                },
                 zone: rng.below(n as u64) as u32,
                 lease_expiry_ms: None,
             })
@@ -75,7 +83,13 @@ impl Campus {
 
         let base_dist = (0..n).map(|z| graph.base_dijkstra(z).dist).collect();
 
-        Campus { params, graph, responders, resources, base_dist }
+        Campus {
+            params,
+            graph,
+            responders,
+            resources,
+            base_dist,
+        }
     }
 
     pub fn zones(&self) -> u32 {
@@ -107,6 +121,9 @@ mod tests {
         assert_eq!(c.graph.len(), p.zones() as usize);
         assert_eq!(c.responders.len(), p.responders as usize);
         assert_eq!(c.resources.len(), p.resources as usize);
-        assert!(c.base_dist.iter().all(|row| row.iter().all(|d| *d != UNREACHABLE)));
+        assert!(c
+            .base_dist
+            .iter()
+            .all(|row| row.iter().all(|d| *d != UNREACHABLE)));
     }
 }

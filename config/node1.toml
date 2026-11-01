@@ -1,6 +1,6 @@
 # Lab topology (two machines for now): node1 and node2 on MACHINE_A, node3 on MACHINE_B.
-# node2 is on MACHINE_A temporarily; to move it, change only its IP here and in the
-# other two node files and client.toml. Replace MACHINE_A_IP / MACHINE_B_IP before use.
+# Fill in the IPs with scripts/set_ips.sh (or .ps1) A_IP B_IP; to move node2 to a
+# third machine, re-run it with C_IP as well. See docs/deployment.md.
 node_id = 1
 listen = "0.0.0.0:7001"
 peers = [
@@ -8,15 +8,17 @@ peers = [
   { id = 3, addr = "MACHINE_B_IP:7003" },
 ]
 
-# Election (Part B; parsed but not used yet: node 1 serves as a placeholder).
+# Election.
 election_mode = "on_demand"     # or "per_request"
 policy = "Composite"            # Composite | QueueOnly | CpuOnly | RoundRobin
 weights = { pending = 0.5, cpu = 0.3, service_time = 0.2 }
 bid_timeout_ms = 100
 degraded_after_ms = 3000
+min_tenure_ms = 1000            # retries trigger elections only after the server held the role this long (= client timeout)
+cpu_source = "machine"          # CPU term: "machine" (whole machine) or "process" (this node only)
 
 # Processing.
 workers = 4                     # planner threads
 seed = 42                       # synthetic campus; must match on every node
 queue_capacity = 64             # queued jobs before replying Busy
-table_ttl_ms = 300000           # request/results table entry lifetime
+table_ttl_ms = 1800000          # request/results table entry lifetime (30 min, D38)

@@ -45,7 +45,10 @@ pub fn expected_cost(complexity: u32) -> u64 {
 pub fn priority(campus: &Campus, snap: &Snapshot, incident: &Incident, now_ms: u64) -> u32 {
     let sev = incident.severity.clamp(1, 5) as u64 * 200;
     let age = now_ms.saturating_sub(incident.timestamp_ms);
-    let age = (age * 1000).checked_div(incident.ttl_ms).unwrap_or(1000).min(1000);
+    let age = (age * 1000)
+        .checked_div(incident.ttl_ms)
+        .unwrap_or(1000)
+        .min(1000);
 
     // Scarcity: share of capable responders already busy, and share of
     // required resource types with no unit left.
@@ -58,27 +61,47 @@ pub fn priority(campus: &Campus, snap: &Snapshot, incident: &Incident, now_ms: u
     let busy_share = if capable.is_empty() {
         1000
     } else {
-        capable.iter().filter(|r| snap.busy.contains(&r.id)).count() as u64 * 1000 / capable.len() as u64
+        capable.iter().filter(|r| snap.busy.contains(&r.id)).count() as u64 * 1000
+            / capable.len() as u64
     };
     let kinds = incident.category.required_resources();
-    let short = kinds.iter().filter(|k| best_resource(campus, snap, **k, 0).is_none()).count() as u64;
+    let short = kinds
+        .iter()
+        .filter(|k| best_resource(campus, snap, **k, 0).is_none())
+        .count() as u64;
     let res_share = short * 1000 / kinds.len().max(1) as u64;
     let scarcity = (2 * busy_share + res_share) / 3;
 
     ((500 * sev + 200 * age + 300 * scarcity) / 1000) as u32
 }
 
-fn best_resource<'a>(campus: &'a Campus, snap: &Snapshot, kind: ResourceType, zone: ZoneId) -> Option<&'a ResourceOffer> {
+fn best_resource<'a>(
+    campus: &'a Campus,
+    snap: &Snapshot,
+    kind: ResourceType,
+    zone: ZoneId,
+) -> Option<&'a ResourceOffer> {
     campus
         .resources
         .iter()
         .filter(|r| r.kind == kind && snap.remaining.get(&r.resource_id).copied().unwrap_or(0) > 0)
-        .min_by_key(|r| (campus.base_dist[r.zone as usize][zone as usize], r.resource_id))
+        .min_by_key(|r| {
+            (
+                campus.base_dist[r.zone as usize][zone as usize],
+                r.resource_id,
+            )
+        })
 }
 
 /// Mean travel cost from each zone in `from` to `target` over `scenarios`
 /// perturbed copies of the graph.
-fn scenario_etas(campus: &Campus, from: &[ZoneId], target: ZoneId, scenarios: u32, salt: u64) -> Vec<u32> {
+fn scenario_etas(
+    campus: &Campus,
+    from: &[ZoneId],
+    target: ZoneId,
+    scenarios: u32,
+    salt: u64,
+) -> Vec<u32> {
     let g = &campus.graph;
     let mut sum = vec![0u64; from.len()];
     for s in 0..scenarios {
@@ -94,7 +117,13 @@ fn scenario_etas(campus: &Campus, from: &[ZoneId], target: ZoneId, scenarios: u3
     sum.iter().map(|t| (t / scenarios as u64) as u32).collect()
 }
 
-pub fn plan(campus: &Campus, snap: &Snapshot, incident: &Incident, complexity: u32, now_ms: u64) -> Plan {
+pub fn plan(
+    campus: &Campus,
+    snap: &Snapshot,
+    incident: &Incident,
+    complexity: u32,
+    now_ms: u64,
+) -> Plan {
     let zone = incident.zone % campus.zones();
     let prio = priority(campus, snap, incident, now_ms);
     let roles = roles_for(incident);
@@ -115,13 +144,24 @@ pub fn plan(campus: &Campus, snap: &Snapshot, incident: &Incident, complexity: u
     let p = prio as i64;
     let cost = |r: &Responder, role: Capability| -> i64 {
         let travel = eta_of(r.zone) as i64 * 10 * (1000 + p) / 1000;
-        let mismatch = if r.capabilities.contains(&role) { 0 } else { MISMATCH_PENALTY * (2000 - p) / 1000 };
+        let mismatch = if r.capabilities.contains(&role) {
+            0
+        } else {
+            MISMATCH_PENALTY * (2000 - p) / 1000
+        };
         travel + mismatch
     };
 
-    let free: Vec<&Responder> = campus.responders.iter().filter(|r| !snap.busy.contains(&r.id)).collect();
+    let free: Vec<&Responder> = campus
+        .responders
+        .iter()
+        .filter(|r| !snap.busy.contains(&r.id))
+        .collect();
     let filled = roles.len().min(free.len());
-    let matrix: Vec<Vec<i64>> = roles[..filled].iter().map(|&role| free.iter().map(|r| cost(r, role)).collect()).collect();
+    let matrix: Vec<Vec<i64>> = roles[..filled]
+        .iter()
+        .map(|&role| free.iter().map(|r| cost(r, role)).collect())
+        .collect();
     let (cols, _) = hungarian::solve(&matrix);
 
     let mut assignments: Vec<Assignment> = cols
@@ -129,12 +169,18 @@ pub fn plan(campus: &Campus, snap: &Snapshot, incident: &Incident, complexity: u
         .zip(&roles)
         .map(|(&j, &role)| Assignment {
             incident_id: incident.incident_id,
-            assignee: Assignee::Responder { responder_id: free[j].id, role },
+            assignee: Assignee::Responder {
+                responder_id: free[j].id,
+                role,
+            },
             created_at_ms: created,
             expires_at_ms: expires,
         })
         .collect();
-    let mut shortfall: Vec<Shortfall> = roles[filled..].iter().map(|&role| Shortfall::Responder { role }).collect();
+    let mut shortfall: Vec<Shortfall> = roles[filled..]
+        .iter()
+        .map(|&role| Shortfall::Responder { role })
+        .collect();
 
     let mut ranked: Vec<RankedResponder> = free
         .iter()
@@ -151,7 +197,11 @@ pub fn plan(campus: &Campus, snap: &Snapshot, incident: &Incident, complexity: u
         match best_resource(campus, snap, kind, zone) {
             Some(offer) => assignments.push(Assignment {
                 incident_id: incident.incident_id,
-                assignee: Assignee::Resource { resource_id: offer.resource_id, kind, quantity: 1 },
+                assignee: Assignee::Resource {
+                    resource_id: offer.resource_id,
+                    kind,
+                    quantity: 1,
+                },
                 created_at_ms: created,
                 expires_at_ms: expires,
             }),
@@ -205,7 +255,13 @@ mod tests {
         for s in 0..20 {
             let inc = incident(s, (s % 5 + 1) as u8);
             let a = plan(&c, &snap, &inc, 3, 5_000);
-            let b = plan(&Campus::generate(42, CampusParams::default()), &snap, &inc, 3, 5_000);
+            let b = plan(
+                &Campus::generate(42, CampusParams::default()),
+                &snap,
+                &inc,
+                3,
+                5_000,
+            );
             assert_eq!(a, b);
             // A JSON round trip keeps the plan identical (integers only).
             let back: Plan = serde_json::from_str(&serde_json::to_string(&a).unwrap()).unwrap();
@@ -237,7 +293,13 @@ mod tests {
         snap.busy.extend(0..150);
         let p = plan(&c, &snap, &incident(1, 3), 1, 5_000);
         assert_eq!(p.responder_ids().count(), 0);
-        assert_eq!(p.shortfall.iter().filter(|s| matches!(s, Shortfall::Responder { .. })).count(), 2);
+        assert_eq!(
+            p.shortfall
+                .iter()
+                .filter(|s| matches!(s, Shortfall::Responder { .. }))
+                .count(),
+            2
+        );
         assert!(p.route.is_empty());
     }
 

@@ -1,8 +1,10 @@
 # Design log
 
 One entry per decision: the alternatives considered, the choice, and the reason.
-Entries marked *(Part B)* are decided but not implemented yet. Values marked *to be
-measured* are first guesses, to be re-set from lab measurements.
+Values marked *to be measured* are first guesses, to be re-set from lab
+measurements. Entries marked *(my call — please review)* were decided during
+Part B without the team's input, choosing the option most consistent with the
+agreed design.
 
 ## Architecture
 
@@ -13,8 +15,8 @@ measured* are first guesses, to be re-set from lab measurements.
   tables, and can serve.
 - **Reason:** a fixed primary is a single point of failure and needs its own failover
   path anyway. With equal peers, failover is just "elect someone else", and the same
-  code serves in every role. Until Part B, node 1 serves as a marked placeholder
-  (`node::PLACEHOLDER_SERVER`).
+  code serves in every role. (Part A used node 1 as a fixed placeholder server;
+  Part B replaced it with the election.)
 
 ### D2. Unicast fan-out vs. multicast
 - **Alternatives:** IP multicast to a group address; client sends to one node, which
@@ -113,8 +115,9 @@ measured* are first guesses, to be re-set from lab measurements.
 ### D10. Busy reply
 - **Alternatives:** an unbounded queue; drop silently and let the client time out; an
   explicit `Busy`.
-- **Choice:** reply `Busy` when the queue is full; the client waits 20 ms × attempt
-  and resends with `attempt + 1`.
+- **Choice:** reply `Busy` when the queue is full; the client waits, then resends with
+  `attempt + 1`. (The wait was 20 ms × attempt; D37 replaced it with exponential
+  backoff plus jitter.)
 - **Reason:** an unbounded queue turns overload into unbounded latency; dropping
   silently costs the client a whole timeout. `Busy` tells the client right away,
   and because it counts as a retry, in Part B it can move work away from an
@@ -128,8 +131,8 @@ measured* are first guesses, to be re-set from lab measurements.
 - **Reason:** the request table is what a new server takes over (Part B), and what
   tells a retry apart from a first attempt. Answering from results means a retry
   after the server's crash is served without recomputing or reassigning. Entries
-  expire after `table_ttl_ms` = 300 s, much longer than a client's retry window
-  (5 × 1 s), so a late retry still finds its result.
+  expire after `table_ttl_ms` (30 min since D38; first 300 s), much longer than a
+  client's retry window (5 × 1 s), so a late retry still finds its result.
 
 ### D12. Conflict rule for replicated plans
 - **Alternatives:** last writer wins; first writer wins; a deterministic rule on the
@@ -139,7 +142,7 @@ measured* are first guesses, to be re-set from lab measurements.
 - **Reason:** last/first writer depends on arrival order, which differs between
   replicas. A rule on the two claims alone gives the same holder on every replica
   in any order (unit-tested both orders). It only matters when two nodes served in
-  the same epoch (Part B split winners).
+  the same epoch (split winners, D19) or a late result races its replacement (D27).
 
 ### D13. Peer links on demand, one TCP connection per direction
 - **Alternatives:** a permanent mesh with keep-alives; one shared connection per pair;
@@ -153,7 +156,7 @@ measured* are first guesses, to be re-set from lab measurements.
   that is down for long needs the recovery protocol to catch up anyway (bullet 5),
   so the buffer is bounded rather than unbounded.
 
-## Election *(Part B)*
+## Election
 
 ### D14. DECISION CHANGED: per-request election → on-demand, retry-triggered election
 - **Alternatives:** our survey's per-request election (every request triggers a bid
@@ -168,7 +171,12 @@ measured* are first guesses, to be re-set from lab measurements.
   and a wait) to every request, even when nothing is wrong. With an on-demand
   election, the normal path costs no election traffic and elections happen only
   when the client sees a problem. Keeping the per-request mode lets the experiments
-  measure the difference rather than assert it.
+  measure the difference rather than assert it. First measurement (three nodes on
+  one laptop, 1000 requests at 200 req/s, complexity 5, no faults): on-demand
+  sent 6 ElectBid frames in total (one startup election), per-request 6000
+  (≈1 MB); p50 latency 4.9 vs 5.0 ms, p99 9.9 vs 8.1 ms. On loopback the bid round
+  costs well under a millisecond, so the latency difference is noise there; in
+  the lab it adds one RTT plus the wait for the slowest bid to every request.
 
 ### D15. No heartbeats: the client retry is the failure detector
 - **Alternatives:** periodic heartbeats between servers; the client's retry.
@@ -234,8 +242,10 @@ measured* are first guesses, to be re-set from lab measurements.
   differently at different nodes, so two nodes can each believe they won the
   same epoch. This is not consensus and we do not claim it cannot happen. When a
   node sees a Replicate from another server of the same epoch, the lower node_id
-  keeps the role and the other steps down; occurrences are counted, and the
-  ledger's conflict rule (D12) keeps assignments consistent meanwhile.
+  keeps the role and the other steps down; a bystander that believed in a third
+  server takes the lower of the two. Occurrences are counted
+  (`split_resolutions`); meanwhile the ledger rule (D12) and the result rule (D27)
+  keep assignments and results consistent.
 
 ### D20. Degraded mode after 3 s alone, vs. the spec's 20 s silence
 - **Alternatives:** never serve alone; serve alone immediately; serve alone after a wait.
@@ -256,8 +266,10 @@ measured* are first guesses, to be re-set from lab measurements.
 - **Choice:** 100 ms.
 - **Reason:** expected lab RTT is well under 1 ms, so 100 ms is >100× RTT: a
   slow-but-alive peer still gets its bid in, while an election with a dead peer
-  costs only 100 ms on top of the client's timeout. *To be measured:* lab RTT
-  distribution, then re-set to a comfortable multiple of its p99.
+  costs only 100 ms on top of the client's timeout. Measured locally: a 3-bid
+  election decides in 0.3–0.7 ms; a 2-bid one (dead peer) takes the full
+  ≈101 ms. *To be measured:* lab RTT distribution, then re-set to a comfortable
+  multiple of its p99.
 
 ### D22. request_timeout_ms = 1000, max_attempts = 5
 - **Alternatives:** a fixed short timeout; a fixed long one; one derived from measured
@@ -268,3 +280,296 @@ measured* are first guesses, to be re-set from lab measurements.
   local smoke run measured p99 ≈ 10 ms at complexity 5 and 200 req/s, so 1000 ms
   is very conservative until lab numbers exist. Five attempts span ≈ 5 s, longer
   than the 3 s degraded threshold (D20).
+
+## Part B implementation decisions
+
+### D23. Startup election on the first request, not at boot *(my call — please review)*
+- **Alternatives:** elect as soon as the process starts; elect when the first
+  request arrives.
+- **Choice:** a node starts with no known server and no election. The first
+  request it receives triggers `no_server`; all three nodes get that request
+  (fan-out), so all three trigger the same election for epoch 1.
+- **Reason:** at boot the peers are often not up yet, so the election would hear
+  only its own bid and decide nothing; nothing needs a server before a request
+  exists. It is still trigger (a) of the design ("no known server, at startup"),
+  and it keeps the system silent while idle (D15).
+
+### D24. Score normalization and quantization *(my call — please review)*
+- **Alternatives:** raw terms; `min(x / cap, 1)`; `x / (x + h)`; float vs.
+  integer scores.
+- **Choice:** pending = p / (p + 10), where p is pending expected cost per worker in
+  complexity units; cpu = EWMA of CPU use in [0, 1]; service_time = s / (s + 2),
+  where s is the EWMA of planning time **per complexity unit** in ms. The weighted
+  sum is divided by the weight total and quantized to milli-units (0..=1000).
+- **Reason:** `x / (x + h)` maps [0, ∞) onto [0, 1) and never saturates, so of two
+  overloaded nodes the more loaded still scores higher (`min(x/cap, 1)` would tie
+  them). Half-points: 10 units per worker ≈ 10 ms of queued work at the measured
+  ≈1 ms/unit; 2 ms/unit is twice the measured planning speed. Time per *unit*
+  keeps a node that happened to serve heavy requests from looking slow.
+  Integer scores: every node compares the same values, whereas a float that
+  went through JSON could differ by one unit in the last place from the sender's
+  copy. Quantizing also makes idle nodes tie exactly, so the node_id tie-break
+  decides instead of measurement noise. *Constants to be revisited with lab data.*
+
+### D25. CPU term source: machine vs. process *(my call — please review)*
+- **Alternatives:** whole-machine CPU only; this process's CPU only; configurable.
+- **Choice:** `cpu_source = "machine"` (default) or `"process"`.
+- **Reason:** machine CPU sees external load (other programs), which is what the
+  CPU term is for, but nodes sharing a machine (node1 and node2 on machine A for
+  now) see the same value, and that's correct: they really share the CPU.
+  Process CPU (this node's threads as a share of all cores) tells co-located nodes
+  apart but is blind to other programs. The `--burn-threads` integration test
+  runs three node processes on one machine with `"process"`; with `"machine"` it
+  could not distinguish them.
+
+### D26. RoundRobin key *(my call — please review)*
+- **Alternatives:** hash(request_id) in both modes; target epoch in on-demand mode.
+- **Choice:** per-request mode: hash(request_id, attempt) mod candidates, as
+  specified. On-demand mode: hash(target_epoch) mod candidates.
+- **Reason:** in on-demand mode several retries (different request_ids) can trigger
+  the same election, and each node may have seen a different one first; the
+  target epoch is the one key every bidder agrees on.
+
+### D27. One result per request: higher epoch, then lower served_by *(my call — please review)*
+- **Alternatives:** first result wins; last result wins; a rule on the results.
+- **Choice:** when a node holds two different results for one request (a late
+  result from a server that stepped down, or two servers in one epoch), it keeps
+  the one with the higher epoch, then the lower `served_by`, and releases the
+  loser's ledger holds. Late results are stored and replicated under this rule,
+  but not sent to the client.
+- **Reason:** first/last-wins depends on arrival order, so replicas could end up
+  holding different plans for the same request. With an order-independent rule
+  they converge (unit-tested in four orders). The higher epoch is the newer
+  server's view of the ledger. **Limitation:** during a handover, a node holding a
+  late result can answer a client's retry with it before the newer result
+  arrives, so a client may hold a plan the cluster later supersedes.
+
+### D28. Which incumbent is excluded *(my call — please review)*
+- **Alternatives:** the incumbent named by the triggering node; every incumbent named
+  in any bid.
+- **Choice:** every incumbent named in the bids received is excluded (unless that
+  leaves no candidate).
+- **Reason:** bids normally agree on the incumbent. When they don't (after a split),
+  excluding all of them still gives every node that holds the same bids the same
+  decision.
+
+### D29. A bid for the next epoch makes the server step down at once *(my call — please review)*
+- **Alternatives:** keep serving until the decision; step down on the first bid.
+- **Choice:** a node that receives a bid for an epoch it hasn't joined steps down
+  immediately (and adopts `target − 1` if it was further behind), then bids.
+- **Reason:** the design lists "a bid" among the messages that carry a higher epoch
+  and cause step-down. A bid means a peer believes the current server failed. The
+  incumbent can't win (D17), so serving on until the decision would only produce
+  late results.
+
+### D30. Adopting a higher client_epoch leaves the server unknown *(my call — please review)*
+- **Alternatives:** guess the server; ask a peer; treat the server as unknown.
+- **Choice:** adopt the epoch with server = unknown, which then triggers a `no_server`
+  election on the next request. A Replicate with a higher epoch names its origin
+  as the server, so it is adopted with a known server.
+- **Reason:** the client's epoch doesn't say who serves, and asking a peer would add
+  a protocol step. **Cost:** a node that missed an election (e.g. it was down)
+  can force one extra election when a client tells it about the new epoch. Part
+  of the rejoin problem (bullet 5).
+
+### D31. Degraded mode details *(my call — please review)*
+- **Choice:** while degraded, retries do not trigger elections (there is nobody to
+  elect, and the node must not step down from serving alone). Degraded mode ends on
+  any peer message or on adopting a higher epoch; the node's server becomes
+  unknown unless that message names one. `Replicate` carries a `degraded` flag
+  (an addition to the message as first specified), so peers store exactly the
+  response the client got.
+- **Reason:** follows "serves alone ... never changes the epoch while degraded ...
+  any peer message ends degraded mode", and keeps the results tables equal after
+  a degraded period.
+
+### D32. Per-request mode details *(my call — please review)*
+- **Choice:** `ElectBid` carries optional `request_id` and `attempt` (an addition to
+  the message); a retry is a new election (new key). Decided keys are remembered for
+  60 s so a late bid can't restart them. A node that wins before the client's
+  message reaches it queues the request when the message arrives. The winner
+  queues the request at once, so its pending cost already includes it when it
+  bids on the next request.
+- **Reason:** the same bid exchange as on-demand mode, keyed per request; no
+  incumbent rule and no epochs, as specified.
+
+### D33. Takeover ignores the queue limit *(my call — please review)*
+- **Alternatives:** take over only what fits in the queue and leave the rest to client
+  retries; take over everything.
+- **Choice:** the new server queues every not-completed request, oldest first, even
+  past `queue_capacity`. `Busy` still applies to new arrivals.
+- **Reason:** the design says the new server "immediately executes every not-completed
+  request". Leaving some to retries also produced more Busy replies, more
+  elections (D34) and lower throughput: in the local failover run below,
+  throughput went from 120 to 169 req/s, and p50 latency from 1.5 s to 0.69 s.
+
+### D34. Hysteresis: a retry moves the role only after `min_tenure_ms` (decided)
+- **Problem:** after a server crash, the two survivors handed the role back and forth:
+  epochs 2→8 in ≈0.8 s (three local processes, 600 requests at 200 req/s, complexity
+  5, `queue_capacity` 64, server killed 1.2 s in). Every request was still answered,
+  but six of the seven elections were wasted.
+- **Cause:** the backlog moves with the role. The new server inherits every
+  not-completed request (D33), so its queue overflows and new arrivals get `Busy`.
+  Their retry arrives 20 ms later, in the same epoch, which is trigger (b).
+  Incumbent exclusion then hands the role, and the whole backlog, to the other
+  survivor, and the cycle repeats every ≈125 ms until the backlog drains.
+- **Alternatives:** never treat Busy-caused retries as triggers (gives up moving work
+  off an overloaded server); size `queue_capacity` to the takeover backlog (only
+  hides it); hysteresis on the role.
+- **Choice:** hysteresis, per our survey §5.7. A retry can trigger an election only
+  if the current server has held the role for at least `min_tenure_ms` (new config
+  field; default 1000 ms = the client's `request_timeout_ms`; 0 disables).
+  Elections triggered by "no server known" are exempt, and so is a retry while no
+  server is known. Tenure is measured from when this node learned the server's role
+  (decided the election, or adopted the epoch from that server's Replicate).
+  Suppressed triggers are counted (`suppressed_triggers` in Status) and logged one
+  line each; the retried request is then handled normally (queued, or Busy).
+- **Cost:** a server that crashes within `min_tenure_ms` of being elected is detected
+  up to one client timeout later than without the rule. Under sustained overload,
+  retry elections still happen, but at most one per `min_tenure_ms` instead of one
+  per Busy retry.
+- **Measured** (same scenario, same release build; `min_tenure_ms = 0` vs `1000`,
+  3 runs each):
+
+  | min_tenure_ms | elections after the crash | final epoch | suppressed triggers | answered | throughput | p50 / p99 latency |
+  |---|---|---|---|---|---|---|
+  | 0 (before) | 7, 7, 7 | 8 | 0 | 600/600 every run | 167–170 req/s | 702–712 ms / 2003 ms |
+  | 1000 (after) | 1, 1, 1 | 2 | 316, 320, 284 | **593, 590, 597** | 197–199 req/s | 17–18 ms / 1084–1099 ms |
+  | 1000 + D37 Busy backoff | 1, 1, 1 | 2 | 256, 188, 192 | **600, 600, 600** | 200 req/s | 18–69 ms / 1097–1099 ms |
+
+  One election now detects the crash, and nothing follows. The second row lost 3–10
+  requests per run to Busy exhausting the client's attempts; D37 fixed that (third
+  row: no request needed more than 4 of its 5 attempts). In the in-process failover test (debug build, no Busy
+  because the queue holds 1024), elections after the crash went from ≈125 ms apart
+  to at most one per second (3–4 elections in 4.5–5 s while the new server worked
+  through the backlog); the test asserts that rate.
+
+### D35. The election as a sans-IO state machine
+- **Alternatives:** election logic inside the networking code; a pure state machine
+  driven by events with explicit time.
+- **Choice:** `election::Core` takes events (request, bid, timer, Replicate) with
+  `now` and returns actions (send bid, arm timer, step down, take over, execute,
+  log). The node carries out the actions.
+- **Reason:** every rule (order independence, tie-break, incumbent exclusion,
+  2-of-3 after timeout, old-epoch retries, step-down, split winners, degraded
+  after 3 s) is unit-tested with synthetic times, with no sockets or sleeps.
+
+### D36. Rejoining an election re-sends the same bid (accepted)
+- **Alternatives:** bid afresh whenever (re)joining; re-send the bid already sent
+  for that target epoch.
+- **Choice:** a node remembers the bid it sent for each target epoch. If it rejoins
+  that election within 10 × `bid_timeout_ms` (its own timer fired before a peer's
+  bid arrived, so it decided nothing), it re-sends the same bid. After that window
+  it bids afresh.
+- **Reason:** found by the failover test under heavy parallel test load, where bids
+  took up to ≈340 ms against a 100 ms timeout. Node B decided from A's first bid;
+  A timed out alone, then rejoined when B's late bid arrived, with a *fresh*
+  score. The two nodes had then decided from different bids, could pick different
+  winners, and could each believe the other was serving, so nobody served;
+  repeated, two requests ran out of attempts. Re-sending the same bid is the
+  design's "each node bids once per election", and makes both nodes decide from
+  identical bids. It mirrors Raft, where a node votes at most once per term: a
+  bid is the node's single statement for that epoch, so it must not change when
+  the node rejoins; re-sending it unchanged keeps every node deciding from the
+  same values. The window keeps a lonely node from re-sending a stale score
+  forever. (B ignores A's re-sent bid because it already decided that epoch, but
+  A now reaches the same winner.)
+
+### D37. Exponential backoff with jitter after Busy (decided)
+- **Problem:** with D34 in place, 3–10 of 600 requests per run went unanswered in the
+  failover scenario (table in D34). Every one got `Busy` on all 5 attempts.
+- **Cause:** the client paused only 20 ms × attempt after `Busy` (D10), so its 5
+  attempts ran out in ≈200 ms, while the new server's queue held the inherited
+  backlog for ≈1 s. Before D34, each Busy retry moved the role to a server with a
+  fresh queue, which hid this.
+- **Alternatives:**
+  1. Client: back off exponentially on `Busy`.
+  2. Server: requests taken over (D33) don't count against `queue_capacity`.
+  3. `Busy` doesn't consume an attempt.
+- **Choice:** option 1. After attempt *n* gets `Busy`, the client waits
+  min(50 ms × 2^(n−1), `request_timeout_ms`) plus 0–25 % jitter, then resends with
+  attempt *n* + 1. Over the default 5 attempts the pauses add up to ≥ 750 ms
+  (50 + 100 + 200 + 400, plus jitter), most of a takeover backlog's measured drain
+  time. The jitter keeps clients that were turned away together from coming back
+  together. It is a hash of (client, request, attempt), so a run with the same seed
+  retries at the same times. Busy retries still raise the attempt number, so a
+  server that stays overloaded can still be replaced (subject to `min_tenure_ms`).
+- **Why not option 2:** it removes the queue bound during a takeover. The new server
+  would accept new work without limit on top of the backlog it inherited, which is
+  the unbounded-queue overload `Busy` exists to prevent (D10).
+- **Why not option 3:** if `Busy` didn't consume an attempt, a Busy retry would never
+  carry a higher attempt number, so it could never trigger a re-election. That
+  removes the high-queue trigger of our election design: an overloaded server
+  could only be replaced via timeouts, never via its own `Busy` replies.
+- **Measured:** third row of the D34 table. 600/600 answered in all 3 runs, 1 election
+  after the crash, p50 18–69 ms, p99 ≈1.1 s, throughput at the offered 200 req/s;
+  94–128 Busy replies per run, at most 4 attempts for any request.
+
+### D38. table_ttl_ms = 1 800 000 (30 min), was 300 000 (decided)
+- **Problem:** in local test runs with 3 nodes and the client, the 5-minute TTL
+  expired results tables mid-session. Each node stamps a result when *it* stores
+  it (computed or received by `Replicate`), so the nodes expire the same result at
+  slightly different moments, and a status taken around then showed different
+  result counts and digests for reasons unrelated to replication.
+- **Alternatives:** keep 300 s and take status within 5 min of a run; disable the
+  sweep; a longer TTL.
+- **Choice:** `table_ttl_ms = 1800000` in every node config (`config/` and
+  `config/local/`), and as the code default.
+- **Reason:** 30 min covers a test session, so digests compare replication and
+  nothing else. Memory is not a concern at these volumes (thousands of entries).
+- **Side effect:** a retry arriving after its entries expired is not answered from
+  the results table. The node no longer knows the request, so it is treated as new
+  and recomputed: the plan can differ from the first one, and the first plan's
+  ledger holds are not released by the sweep. With a 5 s retry window this needs a
+  client that resends after 30 min, which ours never does.
+
+## Local test results (Mac, preliminary)
+
+3 local nodes and the client on one Mac (`config/local/`), release build. Preliminary:
+one machine, no network between the nodes; to be repeated in the lab.
+
+- **Normal run:** 200 requests, all 200 answered on attempt 1; p50 7.9 ms, p99
+  11.5 ms. 1 election; 6 ElectBid messages in total, against 1,200 if we elected per
+  request (3 nodes × 2 peers × 200).
+- **The first election was decided by load:** bids node1 = 37, node2 = 39,
+  node3 = 39 (milli-units, D24), so node 1 won. The election took 0.46 ms, and
+  each node sent 2 messages (its bid to each peer).
+- **Failover:** the current server was killed mid-run (3,000 requests at
+  50 req/s), twice. Both times the two survivors elected a new server in a new
+  epoch and agreed on it; about 8 requests needed a retry; the results tables
+  were identical after the run.
+- **Status during a run:** a status taken while requests are in flight can show
+  one node a result ahead of the others, because replication is asynchronous:
+  the server replies to the client first and replicates after. Digests only
+  match once nothing is in flight. `client --status --settle` now waits for that
+  before comparing (below).
+- **`--settle`:** `client --status --settle [SECS]` (default 10 s) polls every
+  100 ms until every reachable node reports `queue 0` and `running 0` on two
+  consecutive polls, then prints the status and compares digests. Two polls in a
+  row cover the moment between a job finishing and its `Replicate` being sent. If
+  the cluster doesn't settle in time, it says so before printing. It doesn't see
+  frames still in a peer link's queue (limitation a, below).
+
+## Known limitations (open, for bullet 5)
+
+a. **The peer link's backlog has no useful limit.** While a peer is down, its link
+   keeps every undelivered message (`Replicate`, but also `ElectBid`) and sends
+   them all when the peer returns. That gave node 3 a partial catch-up after a
+   restart, but it is a side effect, not a protocol: the queue is bounded only by
+   count (`QUEUE_LIMIT` = 4096 frames per peer; beyond that new frames are dropped
+   and counted in `peer_drops`), not by age or bytes. At 50 req/s that is
+   ≈80 s of results held in memory; anything beyond is lost silently to the
+   returning node, and stale bids from long-finished elections are delivered too.
+   Needs a real bound (age or bytes, and only `Replicate`), or replacing by the
+   recovery/sync protocol, where the returning node pulls what it missed
+   (`TODO(recovery/sync)` in `node.rs`).
+b. **A restarted node can win an election while stale.** It starts knowing no
+   server, so its first request can trigger an immediate `no_server` election
+   (D23), and with an empty queue its load bid is the lowest, so it may win and
+   serve from a ledger and results table that are missing everything it didn't
+   see. Rejoining nodes must not bid or serve until caught up (`ready = false`,
+   issue #28).
+c. **A restarted node loses the results it served before crashing.** Tables and
+   the ledger are in memory only. Its peers hold the results it replicated; any
+   it computed but hadn't yet replicated are gone, and it gets nothing back
+   except what limitation a happens to redeliver.

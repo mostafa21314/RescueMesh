@@ -172,8 +172,15 @@ pub struct Responder {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Assignee {
-    Responder { responder_id: ResponderId, role: Capability },
-    Resource { resource_id: ResourceId, kind: ResourceType, quantity: u32 },
+    Responder {
+        responder_id: ResponderId,
+        role: Capability,
+    },
+    Resource {
+        resource_id: ResourceId,
+        kind: ResourceType,
+        quantity: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

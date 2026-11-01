@@ -40,6 +40,21 @@ impl Response {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum Offer {
+    /// First result for the request.
+    Stored,
+    /// Preferred over the result held, which is returned.
+    Replaced(Response),
+    /// The result held is preferred (or identical); the offer is ignored.
+    Kept,
+}
+
+/// True if `new` should replace `old`: higher epoch, then lower served_by.
+pub fn preferred(new: &Response, old: &Response) -> bool {
+    (new.epoch, std::cmp::Reverse(new.served_by)) > (old.epoch, std::cmp::Reverse(old.served_by))
+}
+
 /// The entry as it was before `record` updated it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Previous {
@@ -68,7 +83,11 @@ impl Tables {
     ) -> Option<Previous> {
         match self.requests.get_mut(&request_id) {
             Some(e) => {
-                let prev = Previous { attempt: e.last_attempt, epoch: e.last_epoch, completed: e.completed };
+                let prev = Previous {
+                    attempt: e.last_attempt,
+                    epoch: e.last_epoch,
+                    completed: e.completed,
+                };
                 if attempt > e.last_attempt {
                     e.last_attempt = attempt;
                     e.last_epoch = epoch;
@@ -92,10 +111,20 @@ impl Tables {
         }
     }
 
-    /// Stores a result and marks the request completed, creating its request
-    /// entry if this node never saw the client's message. Returns false if a
-    /// result was already held (the new one is ignored).
-    pub fn complete(&mut self, request_id: RequestId, response: Response, incident: &Incident, now: Instant) -> bool {
+    /// Offers a result for `request_id` and marks the request completed,
+    /// creating its request entry if this node never saw the client's message.
+    ///
+    /// Two different results for one request (a late result from a server
+    /// that stepped down, or two servers in one epoch) are resolved the same
+    /// way on every node, whatever order they arrive in: the higher epoch
+    /// wins, then the lower `served_by`.
+    pub fn offer(
+        &mut self,
+        request_id: RequestId,
+        response: Response,
+        incident: &Incident,
+        now: Instant,
+    ) -> Offer {
         self.requests
             .entry(request_id)
             .or_insert_with(|| RequestEntry {
@@ -107,11 +136,28 @@ impl Tables {
                 complexity: 0,
             })
             .completed = true;
-        if self.results.contains_key(&request_id) {
-            return false;
+        match self.results.get_mut(&request_id) {
+            None => {
+                self.results.insert(request_id, (now, response));
+                Offer::Stored
+            }
+            Some((_, old)) if preferred(&response, old) => {
+                Offer::Replaced(std::mem::replace(old, response))
+            }
+            Some(_) => Offer::Kept,
         }
-        self.results.insert(request_id, (now, response));
-        true
+    }
+
+    /// Not-completed requests, oldest first: what a new server takes over.
+    pub fn pending_oldest_first(&self) -> Vec<RequestId> {
+        let mut v: Vec<(Instant, RequestId)> = self
+            .requests
+            .iter()
+            .filter(|(_, e)| !e.completed)
+            .map(|(r, e)| (e.first_seen, *r))
+            .collect();
+        v.sort();
+        v.into_iter().map(|(_, r)| r).collect()
     }
 
     pub fn result(&self, request_id: &RequestId) -> Option<&Response> {
@@ -124,8 +170,14 @@ impl Tables {
 
     /// Drops entries older than `ttl`.
     pub fn sweep(&mut self, now: Instant, ttl: Duration) {
-        self.requests.retain(|_, e| now.duration_since(e.first_seen) < ttl);
-        self.results.retain(|_, (t, _)| now.duration_since(*t) < ttl);
+        self.requests
+            .retain(|_, e| now.duration_since(e.first_seen) < ttl);
+        self.results
+            .retain(|_, (t, _)| now.duration_since(*t) < ttl);
+    }
+
+    pub fn has_request(&self, request_id: &RequestId) -> bool {
+        self.requests.contains_key(request_id)
     }
 
     pub fn len(&self) -> (usize, usize) {
@@ -133,7 +185,10 @@ impl Tables {
     }
 
     pub fn results_snapshot(&self) -> BTreeMap<RequestId, Response> {
-        self.results.iter().map(|(k, (_, r))| (*k, r.clone())).collect()
+        self.results
+            .iter()
+            .map(|(k, (_, r))| (*k, r.clone()))
+            .collect()
     }
 
     /// Order-independent fingerprint: wrapping sum of per-entry hashes.
@@ -166,19 +221,98 @@ mod tests {
     #[test]
     fn record_tracks_highest_attempt_and_its_epoch() {
         let mut t = Tables::default();
-        let r = RequestId { client_id: Uuid::nil(), seq: 1 };
+        let r = RequestId {
+            client_id: Uuid::nil(),
+            seq: 1,
+        };
         let now = Instant::now();
         assert_eq!(t.record(r, 1, 0, &incident(), 1, now), None);
-        assert_eq!(t.record(r, 2, 3, &incident(), 1, now), Some(Previous { attempt: 1, epoch: 0, completed: false }));
+        assert_eq!(
+            t.record(r, 2, 3, &incident(), 1, now),
+            Some(Previous {
+                attempt: 1,
+                epoch: 0,
+                completed: false
+            })
+        );
         // A late, lower attempt doesn't move the entry back.
-        assert_eq!(t.record(r, 1, 4, &incident(), 1, now), Some(Previous { attempt: 2, epoch: 3, completed: false }));
+        assert_eq!(
+            t.record(r, 1, 4, &incident(), 1, now),
+            Some(Previous {
+                attempt: 2,
+                epoch: 3,
+                completed: false
+            })
+        );
         assert_eq!(t.request(&r).unwrap().last_epoch, 3);
+    }
+
+    fn response(served_by: NodeId, epoch: Epoch) -> Response {
+        Response {
+            served_by,
+            epoch,
+            degraded: false,
+            plan: Plan {
+                incident_id: Uuid::nil(),
+                priority: served_by,
+                ranked_responders: vec![],
+                assignments: vec![],
+                route: vec![],
+                route_cost: 0,
+                shortfall: vec![],
+                planned_at_ms: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn conflicting_results_converge_in_any_order() {
+        let r = RequestId {
+            client_id: Uuid::nil(),
+            seq: 1,
+        };
+        let now = Instant::now();
+        let offers = [response(3, 1), response(1, 2), response(2, 2)];
+        for order in [[0, 1, 2], [2, 1, 0], [1, 0, 2], [2, 0, 1]] {
+            let mut t = Tables::default();
+            for i in order {
+                t.offer(r, offers[i].clone(), &incident(), now);
+            }
+            assert_eq!(t.result(&r), Some(&response(1, 2)), "order {order:?}");
+            assert!(t.request(&r).unwrap().completed);
+        }
+        let mut t = Tables::default();
+        assert_eq!(t.offer(r, response(1, 1), &incident(), now), Offer::Stored);
+        assert_eq!(t.offer(r, response(1, 1), &incident(), now), Offer::Kept);
+        assert_eq!(
+            t.offer(r, response(2, 2), &incident(), now),
+            Offer::Replaced(response(1, 1))
+        );
+    }
+
+    #[test]
+    fn takeover_order_is_oldest_first_and_skips_completed() {
+        let mut t = Tables::default();
+        let t0 = Instant::now();
+        let r = |seq| RequestId {
+            client_id: Uuid::nil(),
+            seq,
+        };
+        t.record(r(5), 1, 0, &incident(), 1, t0 + Duration::from_millis(2));
+        t.record(r(9), 1, 0, &incident(), 1, t0);
+        t.record(r(1), 1, 0, &incident(), 1, t0 + Duration::from_millis(1));
+        t.record(r(2), 1, 0, &incident(), 1, t0 + Duration::from_millis(3));
+        t.offer(r(1), response(1, 1), &incident(), t0);
+        assert_eq!(t.pending_oldest_first(), vec![r(9), r(5), r(2)]);
     }
 
     #[test]
     fn sweep_expires_old_entries() {
         let mut t = Tables::default();
-        let r = RequestId { client_id: Uuid::nil(), seq: 1 };
+        let r = RequestId {
+            client_id: Uuid::nil(),
+            seq: 1,
+        };
         let then = Instant::now();
         t.record(r, 1, 0, &incident(), 1, then);
         t.sweep(then + Duration::from_secs(1), Duration::from_secs(10));

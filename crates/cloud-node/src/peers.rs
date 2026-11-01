@@ -43,9 +43,18 @@ impl PeerLinks {
         for p in peers {
             let (tx, rx) = mpsc::channel(QUEUE_LIMIT);
             links.insert(p.id, tx);
-            tasks.push(tokio::spawn(link_task(p.id, p.addr.clone(), rx, sent.clone())));
+            tasks.push(tokio::spawn(link_task(
+                p.id,
+                p.addr.clone(),
+                rx,
+                sent.clone(),
+            )));
         }
-        let me = Arc::new(PeerLinks { links, last_seen: Mutex::new(HashMap::new()), drops: AtomicU64::new(0) });
+        let me = Arc::new(PeerLinks {
+            links,
+            last_seen: Mutex::new(HashMap::new()),
+            drops: AtomicU64::new(0),
+        });
         (me, tasks)
     }
 
@@ -85,7 +94,12 @@ impl PeerLinks {
     }
 }
 
-async fn link_task(peer: NodeId, addr: String, mut rx: mpsc::Receiver<Message>, sent: Arc<Counters>) {
+async fn link_task(
+    peer: NodeId,
+    addr: String,
+    mut rx: mpsc::Receiver<Message>,
+    sent: Arc<Counters>,
+) {
     let mut conn: Option<TcpStream> = None;
     let mut backoff = BACKOFF_MIN;
     let mut failures = 0u32;
