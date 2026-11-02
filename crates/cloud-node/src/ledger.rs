@@ -52,6 +52,9 @@ pub struct Applied {
 #[derive(Debug)]
 pub struct Ledger {
     responders: HashMap<ResponderId, Hold>,
+    /// Retain losing claims too, so replacing a winning plan restores the next
+    /// valid holder rather than incorrectly making the responder free.
+    claims: HashMap<ResponderId, HashMap<RequestId, Hold>>,
     resources: HashMap<ResourceId, Vec<ResourceHold>>,
     /// Units each usable offer starts with (offline or lapsed offers: absent).
     capacity: HashMap<ResourceId, u32>,
@@ -67,6 +70,7 @@ impl Ledger {
             .collect();
         Ledger {
             responders: HashMap::new(),
+            claims: HashMap::new(),
             resources: HashMap::new(),
             capacity,
         }
@@ -74,9 +78,9 @@ impl Ledger {
 
     pub fn snapshot(&self, now_ms: u64) -> Snapshot {
         let busy = self
-            .responders
+            .claims
             .iter()
-            .filter(|(_, h)| h.expires_at_ms > now_ms)
+            .filter(|(_, claims)| claims.values().any(|h| h.expires_at_ms > now_ms))
             .map(|(id, _)| *id)
             .collect();
         let remaining = self
@@ -100,7 +104,7 @@ impl Ledger {
     /// already held by this same request).
     pub fn can_commit(&self, request_id: RequestId, plan: &Plan, now_ms: u64) -> bool {
         plan.assignments.iter().all(|a| match a.assignee {
-            Assignee::Responder { responder_id, .. } => match self.responders.get(&responder_id) {
+            Assignee::Responder { responder_id, .. } => match self.winner(responder_id, now_ms) {
                 Some(h) => h.expires_at_ms <= now_ms || h.request_id == request_id,
                 None => true,
             },
@@ -123,6 +127,9 @@ impl Ledger {
     pub fn apply(&mut self, request_id: RequestId, plan: &Plan, now_ms: u64) -> Applied {
         let mut out = Applied::default();
         for a in &plan.assignments {
+            if a.expires_at_ms <= now_ms {
+                continue;
+            }
             match a.assignee {
                 Assignee::Responder { responder_id, .. } => {
                     let new = Hold {
@@ -130,32 +137,26 @@ impl Ledger {
                         priority: plan.priority,
                         expires_at_ms: a.expires_at_ms,
                     };
-                    match self.responders.get(&responder_id) {
-                        None => {
-                            self.responders.insert(responder_id, new);
-                        }
-                        Some(old) if old.request_id == request_id => {}
-                        Some(old) if old.expires_at_ms <= now_ms => {
-                            self.responders.insert(responder_id, new);
-                        }
-                        Some(old) => {
-                            let new_wins = (new.priority, std::cmp::Reverse(new.request_id))
-                                > (old.priority, std::cmp::Reverse(old.request_id));
-                            let (kept, dropped) = if new_wins {
-                                (request_id, old.request_id)
-                            } else {
-                                (old.request_id, request_id)
-                            };
-                            if new_wins {
-                                self.responders.insert(responder_id, new);
-                            }
-                            out.conflicts.push(Conflict {
-                                responder_id,
-                                kept,
-                                dropped,
-                            });
-                        }
+                    let old = self.winner(responder_id, now_ms).cloned();
+                    self.claims
+                        .entry(responder_id)
+                        .or_default()
+                        .insert(request_id, new.clone());
+                    if let Some(old) = old.filter(|old| old.request_id != request_id) {
+                        let new_wins = (new.priority, std::cmp::Reverse(new.request_id))
+                            > (old.priority, std::cmp::Reverse(old.request_id));
+                        let (kept, dropped) = if new_wins {
+                            (request_id, old.request_id)
+                        } else {
+                            (old.request_id, request_id)
+                        };
+                        out.conflicts.push(Conflict {
+                            responder_id,
+                            kept,
+                            dropped,
+                        });
                     }
+                    self.refresh(responder_id, now_ms);
                 }
                 Assignee::Resource {
                     resource_id,
@@ -185,17 +186,14 @@ impl Ledger {
 
     /// Undoes `plan`'s holds for `request_id` (a result that lost to a
     /// preferred one for the same request). Holds of other requests stay.
-    pub fn release(&mut self, request_id: RequestId, plan: &Plan) {
+    pub fn release(&mut self, request_id: RequestId, plan: &Plan, now_ms: u64) {
         for a in &plan.assignments {
             match a.assignee {
                 Assignee::Responder { responder_id, .. } => {
-                    if self
-                        .responders
-                        .get(&responder_id)
-                        .is_some_and(|h| h.request_id == request_id)
-                    {
-                        self.responders.remove(&responder_id);
+                    if let Some(claims) = self.claims.get_mut(&responder_id) {
+                        claims.remove(&request_id);
                     }
+                    self.refresh(responder_id, now_ms);
                 }
                 Assignee::Resource { resource_id, .. } => {
                     if let Some(hs) = self.resources.get_mut(&resource_id) {
@@ -208,6 +206,28 @@ impl Ledger {
 
     pub fn holder(&self, responder_id: ResponderId) -> Option<&Hold> {
         self.responders.get(&responder_id)
+    }
+
+    fn winner(&self, responder: ResponderId, now_ms: u64) -> Option<&Hold> {
+        self.claims
+            .get(&responder)?
+            .values()
+            .filter(|h| h.expires_at_ms > now_ms)
+            .max_by_key(|h| (h.priority, std::cmp::Reverse(h.request_id)))
+    }
+
+    fn refresh(&mut self, responder: ResponderId, now_ms: u64) {
+        if let Some(claims) = self.claims.get_mut(&responder) {
+            claims.retain(|_, h| h.expires_at_ms > now_ms);
+        }
+        match self.winner(responder, now_ms).cloned() {
+            Some(hold) => {
+                self.responders.insert(responder, hold);
+            }
+            None => {
+                self.responders.remove(&responder);
+            }
+        }
     }
 }
 
@@ -294,8 +314,8 @@ mod tests {
         let mut l = ledger();
         l.apply(rid(1), &plan_with(500, 1), 0);
         l.apply(rid(2), &plan_with(500, 2), 0);
-        l.release(rid(1), &plan_with(500, 1));
-        l.release(rid(1), &plan_with(500, 2)); // held by request 2: untouched
+        l.release(rid(1), &plan_with(500, 1), 0);
+        l.release(rid(1), &plan_with(500, 2), 0); // held by request 2: untouched
         assert!(l.holder(1).is_none());
         assert_eq!(l.holder(2).unwrap().request_id, rid(2));
     }
@@ -308,5 +328,35 @@ mod tests {
         assert!(l.apply(rid(1), &p, 0).conflicts.is_empty());
         assert!(!l.can_commit(rid(2), &p, 5_000));
         assert!(l.can_commit(rid(2), &p, 10_000));
+    }
+
+    #[test]
+    fn expired_delayed_claim_cannot_erase_a_live_reservation() {
+        let mut l = ledger();
+        let mut live = plan_with(100, 1);
+        live.assignments[0].expires_at_ms = 30_000;
+        l.apply(rid(2), &live, 20_000);
+        l.apply(rid(1), &plan_with(900, 1), 20_000);
+        assert_eq!(l.holder(1).unwrap().request_id, rid(2));
+        assert!(l.snapshot(20_000).busy.contains(&1));
+        assert!(!l.can_commit(rid(3), &live, 20_000));
+    }
+
+    #[test]
+    fn replacing_a_winning_plan_restores_the_displaced_claim() {
+        let low = plan_with(100, 1);
+        let old = plan_with(900, 1);
+        let new = plan_with(900, 2);
+        let mut a = ledger();
+        a.apply(rid(1), &low, 0);
+        a.apply(rid(2), &old, 0);
+        a.release(rid(2), &old, 0);
+        a.apply(rid(2), &new, 0);
+        let mut b = ledger();
+        b.apply(rid(2), &new, 0);
+        b.apply(rid(1), &low, 0);
+        assert_eq!(a.holder(1), b.holder(1));
+        assert_eq!(a.holder(2), b.holder(2));
+        assert_eq!(a.snapshot(0), b.snapshot(0));
     }
 }

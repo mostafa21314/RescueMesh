@@ -22,6 +22,7 @@ pub mod node;
 pub mod peers;
 pub mod planner;
 pub mod pool;
+mod recovery;
 pub mod tables;
 
 pub use node::{start, start_with_listener, NodeHandle};

@@ -1,7 +1,9 @@
 # RescueMesh wire protocol (Phase 1)
 
-Status: bullets 1 and 2 implemented (Part A: cloud and Incident Processing Service;
-Part B: on-demand load-aware election, with per-request election as a comparison mode).
+Status: cloud service, on-demand load-aware election, concurrent processing, and
+temporary-outage injection/rejoin are implemented. See
+[concurrency and failures](concurrency-and-failures.md) for the parallelization
+write-up, demo commands, and the limits of the recovery model.
 
 ## Transport and framing
 
@@ -121,8 +123,10 @@ Part B: on-demand load-aware election, with per-request election as a comparison
     higher target replaces the election in progress.
   - Every trigger for the same target joins the one election; each node bids
     once per election. A node that rejoins an election it already bid in
-    (within 10 × `bid_timeout_ms`) re-sends that same bid, so all nodes decide
-    from identical bids.
+    re-sends that same bid for the entire target epoch. A fresh score requires
+    a new target epoch. This prevents nodes deciding from different samples of
+    the same bidder after a long message delay; different subsets can still
+    produce split winners, handled by the existing reconciliation rule.
 - Per-request mode (`request_id`, `attempt` present, `target_epoch` = 0): the bid
   exchange for that request attempt. Keys already decided are remembered for 60 s,
   so late bids don't restart them.
@@ -196,8 +200,31 @@ and running 0 on two polls in a row, then compares.
 | Finished per-request keys | 60 s | `election::FINISHED_KEEP` | Late bids for them are ignored. |
 | Table TTL | `table_ttl_ms` = 1 800 000 (30 min, D38) | node.toml | Request- and results-table entries older than this are removed (swept every second); a retry after that is recomputed, not answered from the table. Must be much longer than a client's full retry window (5 × 1 s). |
 
-No heartbeats: nodes send each other nothing except `Replicate` and `ElectBid`.
-A client's retry is the failure detector.
+No periodic heartbeats: normal operation exchanges `Replicate` and `ElectBid`.
+A client's retry is the failure detector. Returning nodes additionally use the
+snapshot protocol below.
+
+## Temporary failure and rejoin messages
+
+- `InjectFailure {duration_ms}`: trusted demo controller asks one node to mute for
+  1..=20,000 ms. It returns `FailureAccepted {node_id, duration_ms}` before normal
+  communication is suppressed, or `FailureRejected {reason}`. The client CLI
+  chooses the currently elected server and requires all nodes ready beforehand.
+- `RecoveryRequest {node_id}`: a returning node requests a snapshot from a
+  configured, ready peer on a dedicated connection.
+- `RecoveryChunk {records}`: at most 64 records per chunk; each includes request
+  ID, attempt/epoch, incident, complexity, and optional completed result.
+- `RecoveryComplete {node_id, epoch, server, electing, records}`: ends that fixed
+  snapshot and declares its record count and role view. Interrupted/incomplete
+  transfers are discarded. Both survivors must respond and agree on the role
+  view outside an active election before the returning node becomes ready.
+
+During `muted`, normal messages are discarded. During `recovering`, the node
+accepts live replicas and status queries but cannot bid or process client work.
+It merges both snapshots, reconstructs the ledger, resets old election timers,
+and only then enables normal participation. Status includes `phase`,
+`faults_injected`, and `last_recovery_ms`. This is live-process outage recovery,
+not durable crash recovery or a majority-committed assignment protocol.
 
 ## Request lifecycle (on-demand mode)
 

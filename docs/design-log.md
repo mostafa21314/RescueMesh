@@ -6,6 +6,39 @@ measurements. Entries marked *(my call — please review)* were decided during
 Part B without the team's input, choosing the option most consistent with the
 agreed design.
 
+## November 2: concurrency documentation and temporary-failure implementation
+
+- **Choice:** retain the on-demand load-aware serving-node election. The new
+  demo controller selects the currently elected server as victim, verifies all
+  nodes ready, injects a bounded outage, and waits for recovery before another
+  round. This keeps the professor-guided architecture and avoids introducing a
+  second coordinator algorithm solely for failure simulation.
+- **Failure model:** live process with communication muted for 1..=20,000 ms.
+  Ready/muted/recovering phases gate client work and elections. Outage generations
+  invalidate old jobs, election timers, and outgoing peer envelopes. Cold process
+  restart/disk durability is not claimed by this implementation.
+- **Recovery:** pull retained request/result snapshots in chunks from both ready
+  survivors over dedicated connections. Require matching non-electing role views,
+  merge results deterministically, rebuild the ledger, then enable participation.
+  A newer epoch observed in live replication forces another recovery round.
+  These cuts are not an atomic cluster snapshot or a Raft commit protocol.
+- **Corrections required for delayed messages/rejoin:** retain the same bid for
+  the whole target epoch (supersedes D36's time window); ignore expired incoming
+  assignments; retain losing responder claims so replacing the winner restores
+  the next valid claimant. Keep request metadata while its result is retained,
+  ensuring snapshots can reconstruct both.
+- **Documentation:** [concurrency-and-failures.md](concurrency-and-failures.md)
+  describes the actual client tasks, connection tasks, worker threads, mutexes,
+  overload behavior, demo commands, and remaining limits. Historical decisions
+  below describe earlier versions; this entry supersedes their temporary-rejoin
+  TODOs, not their cold-restart limitations.
+- **Validation:** all 60 workspace tests passed locally on Windows, including a
+  real-time 20-second serving-node outage. In the initial standalone run all
+  127 requests were answered, 98 workload requests completed during the outage,
+  the first survivor response arrived after about 1.08 s, and rejoin took 10 ms.
+  Results and active ledger snapshots agreed after settling. These are small
+  local regression measurements, not six-machine or statistical stress results.
+
 ## Architecture
 
 ### D1. Three equal peers vs. a fixed primary

@@ -16,7 +16,7 @@ use common::counters::Counters;
 use common::wire::write_frame;
 use common::*;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -29,9 +29,21 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 /// Messages buffered per peer while its link is down; beyond this they are
 /// dropped and counted.
 pub const QUEUE_LIMIT: usize = 4096;
+const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+
+struct Control {
+    enabled: AtomicBool,
+    generation: AtomicU64,
+}
+
+struct Envelope {
+    generation: u64,
+    message: Message,
+}
 
 pub struct PeerLinks {
-    links: BTreeMap<NodeId, mpsc::Sender<Message>>,
+    links: BTreeMap<NodeId, mpsc::Sender<Envelope>>,
+    control: Arc<Control>,
     last_seen: Mutex<HashMap<NodeId, Instant>>,
     drops: AtomicU64,
 }
@@ -40,6 +52,10 @@ impl PeerLinks {
     pub fn spawn(peers: &[PeerConfig], sent: Arc<Counters>) -> (Arc<Self>, Vec<JoinHandle<()>>) {
         let mut links = BTreeMap::new();
         let mut tasks = Vec::new();
+        let control = Arc::new(Control {
+            enabled: AtomicBool::new(true),
+            generation: AtomicU64::new(0),
+        });
         for p in peers {
             let (tx, rx) = mpsc::channel(QUEUE_LIMIT);
             links.insert(p.id, tx);
@@ -48,24 +64,41 @@ impl PeerLinks {
                 p.addr.clone(),
                 rx,
                 sent.clone(),
+                control.clone(),
             )));
         }
         let me = Arc::new(PeerLinks {
             links,
             last_seen: Mutex::new(HashMap::new()),
             drops: AtomicU64::new(0),
+            control,
         });
         (me, tasks)
     }
 
     pub fn send(&self, to: NodeId, msg: Message) {
-        // TODO(fault injection): the mute switch drops outbound peer frames here.
+        if !self.control.enabled.load(Ordering::SeqCst) {
+            return;
+        }
         if let Some(tx) = self.links.get(&to) {
-            if tx.try_send(msg).is_err() {
+            let envelope = Envelope {
+                generation: self.control.generation.load(Ordering::SeqCst),
+                message: msg,
+            };
+            if tx.try_send(envelope).is_err() {
                 self.drops.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(peer = to, "peer queue full or closed, message dropped");
             }
         }
+    }
+
+    pub fn suspend(&self) {
+        self.control.enabled.store(false, Ordering::SeqCst);
+        self.control.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn resume(&self) {
+        self.control.enabled.store(true, Ordering::SeqCst);
     }
 
     pub fn broadcast(&self, msg: Message) {
@@ -97,14 +130,22 @@ impl PeerLinks {
 async fn link_task(
     peer: NodeId,
     addr: String,
-    mut rx: mpsc::Receiver<Message>,
+    mut rx: mpsc::Receiver<Envelope>,
     sent: Arc<Counters>,
+    control: Arc<Control>,
 ) {
     let mut conn: Option<TcpStream> = None;
     let mut backoff = BACKOFF_MIN;
     let mut failures = 0u32;
-    while let Some(msg) = rx.recv().await {
+    while let Some(envelope) = rx.recv().await {
+        let msg = envelope.message;
         loop {
+            if !control.enabled.load(Ordering::SeqCst)
+                || envelope.generation != control.generation.load(Ordering::SeqCst)
+            {
+                conn = None;
+                break;
+            }
             if conn.is_none() {
                 match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
                     Ok(Ok(s)) => {
@@ -132,13 +173,17 @@ async fn link_task(
                 }
             }
             let stream = conn.as_mut().expect("connected above");
-            match write_frame(stream, &msg).await {
-                Ok(n) => {
+            match tokio::time::timeout(WRITE_TIMEOUT, write_frame(stream, &msg)).await {
+                Ok(Ok(n)) => {
                     sent.add(msg.kind(), n);
                     break;
                 }
-                Err(e) => {
-                    tracing::warn!(peer, %e, "peer link write failed, reconnecting");
+                error => {
+                    tracing::debug!(
+                        peer,
+                        ?error,
+                        "peer link write failed or timed out, reconnecting"
+                    );
                     conn = None;
                 }
             }
