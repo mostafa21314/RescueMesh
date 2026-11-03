@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "client"
 path = "src/main.rs"
 
+[[bin]]
+name = "stress"
+path = "src/bin/stress.rs"
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
