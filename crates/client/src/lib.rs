@@ -6,6 +6,9 @@
 //! request_id to all nodes with attempt + 1, up to `max_attempts`. Each
 //! request carries the highest epoch the client has seen in any response.
 
+pub mod stats;
+pub mod stress;
+
 use common::config::ClientConfig;
 use common::counters::Counters;
 use common::rng::{mix, Rng};
@@ -316,6 +319,23 @@ pub async fn query_status(addr: &str, timeout: Duration) -> anyhow::Result<NodeS
                 Some((Message::Status(st), _)) => return Ok(st),
                 Some(_) => continue,
                 None => anyhow::bail!("connection closed before Status"),
+            }
+        }
+    };
+    tokio::time::timeout(timeout, fut).await?
+}
+
+/// Asks one node for a cheap load sample (no results digest); the stress
+/// harness polls this during runs.
+pub async fn query_probe(addr: &str, timeout: Duration) -> anyhow::Result<NodeProbe> {
+    let fut = async {
+        let mut s = TcpStream::connect(addr).await?;
+        write_frame(&mut s, &Message::ProbeRequest).await?;
+        loop {
+            match read_frame(&mut s).await? {
+                Some((Message::Probe(p), _)) => return Ok(p),
+                Some(_) => continue,
+                None => anyhow::bail!("connection closed before Probe"),
             }
         }
     };

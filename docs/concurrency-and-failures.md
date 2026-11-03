@@ -92,8 +92,10 @@ The node stays recovering if both survivors cannot be contacted. This is an
 intentional restriction of the single-failure demonstration.
 
 This simulates communication failure in a live process, not a power loss. State
-is still in memory. Cold restart/persistent storage, arbitrary partitions,
-linearizable claims, and an acknowledged replication log remain separate work.
+is still in memory. A crashed and restarted node now recovers through the same
+step ([recovery.md](recovery.md), bullet 5); persistent storage, arbitrary
+partitions, linearizable claims, and an acknowledged replication log remain
+separate work.
 A recovery snapshot is a point-in-time cut of each survivor, not an atomic
 cluster-wide snapshot; live replication continues and table convergence is
 checked after the workload settles. Retention must cover the experiment.

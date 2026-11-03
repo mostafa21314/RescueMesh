@@ -10,7 +10,8 @@ Phase 1 status:
 | 2. Distributed election for workload assignment, with a load metric | **done (Part B)**: on-demand, retry-triggered election; per-request mode for comparison |
 | 3. Concurrent processing and parallelization write-up | **done**: async client/node I/O, fixed planner threads; see the document below |
 | 4. Temporary server failures up to 20 seconds | **implemented and locally tested**: mute, survivor election, automatic pull recovery before rejoin |
-| 5–6. Broader recovery experiments and stress analysis | temporary-outage recovery implemented; persistent crash recovery and large-scale analysis remain |
+| 5. Server rejoin and state recovery/convergence | **done**: a node back from a temporary outage or a crash and restart pulls snapshots from its ready peers, rebuilds its ledger and election view, and only then bids or serves; measured under load. See [docs/recovery.md](docs/recovery.md) |
+| 6. Stress across increasing client loads, statistically meaningful data | **done**: `stress` harness; method, results and analysis in [docs/stress-testing.md](docs/stress-testing.md) |
 
 ## Layout
 
@@ -18,11 +19,14 @@ Phase 1 status:
 crates/common      data model, request ids, messages, framing, config, PRNG, counters
 crates/cloud-node  the node: campus, Dijkstra, Hungarian, planner, pool, ledger, tables, peers,
                    load score, election
-crates/client      client library + CLI (fan-out to all nodes, retries)
+crates/client      client library + CLI (fan-out to all nodes, retries); `stress` harness
 config/            lab configs (node1-3.toml, client.toml); config/local/ = all on 127.0.0.1
 scripts/           run_local: start or stop 3 nodes locally; lab: set_ips, start_node,
-                   open_ports (Windows), check_cluster; package.sh builds dist/<target>/
-docs/              protocol.md, design-log.md, library-vs-ours.md, deployment.md
+                   open_ports (Windows), check_cluster; package.sh builds dist/<target>/;
+                   stress_local.sh and plot_stress.py: the stress experiments
+results/stress/    stress results: CSVs, summary.md, node logs, plots
+docs/              protocol.md, design-log.md, library-vs-ours.md, deployment.md,
+                   concurrency-and-failures.md, recovery.md, stress-testing.md
 ```
 
 ## Build and test
@@ -50,6 +54,7 @@ Election experiments:
 ```bash
 BURN_NODE=1 BURN_THREADS=4 scripts/run_local.sh   # node 1 also burns 4 CPU threads
 kill $(cat logs/node1.pid)                         # crash a node mid-run
+scripts/restart_node.sh 1 5000                     # or crash it and start it again 5 s later (rejoin)
 grep election logs/node*.log                       # one line per election
 ```
 
@@ -59,6 +64,14 @@ Mode and policy are per-node config: `election_mode = "on_demand" | "per_request
 nodes' CPU load apart), `min_tenure_ms` (a retry can trigger an election only
 after the server has held the role this long; keep it equal to the client's
 `request_timeout_ms`). All three nodes must use the same mode and policy.
+
+Stress experiments (a load sweep, a mute sweep and a crash-and-restart sweep; about 50 min):
+
+```bash
+scripts/stress_local.sh                                      # results/stress/local-<date>/{load,fault,restart}
+python3 scripts/plot_stress.py results/stress/local-<date>   # PNGs (needs matplotlib)
+target/release/stress --help                                 # one sweep: any levels, any cluster
+```
 
 Client flags: `--count` incidents, `--rate` per second (0 = all at once),
 `--complexity` planner cost per request, `--seed` for repeatable incidents, `--out`
@@ -93,3 +106,5 @@ campus locally. Log level: `RUST_LOG=debug` for per-request lines.
 - [docs/design-log.md](docs/design-log.md): each decision, its alternatives, and why
 - [docs/library-vs-ours.md](docs/library-vs-ours.md): what crates provide vs. our code
 - [docs/deployment.md](docs/deployment.md): running on lab PCs and laptops
+- [docs/recovery.md](docs/recovery.md): server rejoin and state recovery, after a mute or a cold restart
+- [docs/stress-testing.md](docs/stress-testing.md): stress harness, metrics, results and analysis

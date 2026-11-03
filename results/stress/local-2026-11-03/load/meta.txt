@@ -1,0 +1,6 @@
+label: local: 3 nodes + all client processes on one Darwin arm64 machine, 10 cores, release build 9eae4e9
+started_unix_ms: 1793730720275
+harness_machine: macos aarch64, 10 logical cores
+nodes: ["127.0.0.1:7001", "127.0.0.1:7002", "127.0.0.1:7003"]
+request_timeout_ms: 1000 max_attempts: 5
+args: Args { config: "config/local/client.toml", clients: [1, 2, 4, 8, 16, 32, 48, 64, 80, 96, 128], reps: 5, requests: 100, rate: 10.0, complexity: 5, fault_ms: None, fault_at_ms: 5000, sample_ms: 250, pause_ms: 1000, seed: 1, out: "results/stress/local-2026-11-03/load", client_bin: None, client_threads: 2, settle_secs: 30, label: "local: 3 nodes + all client processes on one Darwin arm64 machine, 10 cores, release build 9eae4e9", before_run: Some("cat logs/node1.log logs/node2.log logs/node3.log >> 'results/stress/local-2026-11-03/load/nodes.log' 2>/dev/null; scripts/run_local.sh"), fault_cmd: None }

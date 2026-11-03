@@ -6,6 +6,94 @@ measurements. Entries marked *(my call — please review)* were decided during
 Part B without the team's input, choosing the option most consistent with the
 agreed design.
 
+## November 3: cold-restart rejoin (Phase 1, bullet 5)
+
+Details: [recovery.md](recovery.md).
+
+- **Problem:** limitation b below. A restarted node starts empty, knows no
+  server, and can win the next election and serve from empty tables.
+- **Alternatives:** (1) every node recovers at startup: a cluster starting
+  together would wait on each other forever; (2) an operator flag (`--rejoin`)
+  on the restarted node: easy to forget, and wrong flags are silent; (3) a disk
+  log replayed at start: the project keeps state in memory, and the peers hold
+  it anyway; (4) probe the peers at startup and decide.
+- **Choice:** (4). A new `Starting` phase; if any peer is ready with history or
+  recovering, the node recovers through PR #38's snapshot pull before it bids
+  or serves; otherwise it starts empty. A peer that is starting or recovering
+  answers `RecoveryUnavailable` and is skipped, so two nodes restarted together
+  recover one after the other instead of waiting on each other. An unreachable
+  peer still blocks recovery, as PR #38 decided for the single-failure model.
+- **Trade-off:** a node that hears from no peer within 300 ms starts empty, as
+  before; under a partition at startup that is wrong, and is not handled.
+- **Measured:** the restart sweep in [stress-testing.md](stress-testing.md).
+
+## November 3: reset a peer's link when it pulls a snapshot (Phase 1, bullet 5)
+
+- **Problem:** found by the restart sweep. At 48 clients (480 req/s) a 10 s
+  outage leaves about 4000 frames in a survivor's 4096-frame queue to the dead
+  node. The node restarts and pulls its snapshot within ~50 ms, but the
+  survivor's link is still in its backoff (up to 2 s) and then drains the stale
+  backlog first; meanwhile the queue overflows and new frames are dropped
+  (360–390 per run, all in the 1–2 s after the rejoin). Those were `Replicate`s
+  for results made after the snapshot, and the rejoined node never converged
+  (0 of 5 runs; kept in `results/stress/local-2026-11-03/before-link-reset/`).
+- **Alternatives:** (1) a larger queue: moves the threshold, and 2 s of backoff
+  at high load can still overflow it; (2) drop the oldest frame instead of the
+  newest: right for this case, but the newest frames still wait out the
+  backoff; (3) sequence numbers per link and a re-pull on a gap: general, and
+  more protocol; (4) on serving a `RecoveryRequest`, clear that peer's queue and
+  wake its link.
+- **Choice:** (4). The snapshot is read under the state lock, and every
+  `Replicate` and `ElectBid` is queued under the same lock after its state
+  change, so a frame queued before the reset is in the snapshot, and one queued
+  after it is delivered. The link queue became a bounded deque (so it can be
+  cleared) with a second wake-up for resets that cuts the backoff short.
+  Unit test: `peers::tests::reset_drops_the_backlog_and_reconnects_without_waiting_out_the_backoff`.
+- **Limit:** frames to a peer that is down but not recovering are still dropped
+  past 4096; it recovers by snapshot when it returns, so nothing depends on them.
+
+## November 3: stress harness and measurements (Phase 1, bullet 6)
+
+Details, metric definitions and results: [stress-testing.md](stress-testing.md).
+
+- **Simulated users are OS processes.** The harness (`stress`) starts N copies of
+  the unchanged `client` binary per run, each with its own client id, connections,
+  retry state and Tokio runtime (2 worker threads). *Alternative:* N `Client`
+  objects in one process: cheaper, but they share one runtime and one set of
+  sockets, which is not what the lab setup ("many simulated user processes") is.
+- **Open loop.** Each process sends at a fixed rate whatever the responses do, so
+  offered load = N × rate. *Alternative:* closed loop (send after the previous
+  answer): it throttles itself at saturation and hides the overload behaviour
+  (Busy replies, retries, elections) we want to measure.
+- **Run order:** every level once per rep, levels shuffled within each rep (seeded).
+  The tables keep 30 min of results (D38), so state grows over a sweep; a
+  level-by-level order would confound that drift with load.
+- **A restarted cluster for every run** (`--before-run`, locally
+  `scripts/run_local.sh`, then a 20-request warm-up). The first full sweep showed
+  that an overloaded run leaves thousands of abandoned requests pending for the
+  TTL, and later runs at low load collapse because each election takes them over
+  again (stress-testing.md, Overload). With a restart, runs are independent
+  replications; the shuffle remains for machine drift.
+- **Statistics:** 5 runs per level. Per-run p50/p95/p99 and throughput are
+  reported as mean ± 95 % Student-t half-width over the runs (the runs are the
+  independent samples); tails (p99.9) are also pooled over all requests of a
+  level. Throughput is (n − 1) / (last answer − first answer): n / span
+  overstates a short run's rate by n / (n − 1).
+- **`ProbeRequest` / `Probe`.** `Status` computes the results digest by
+  serializing every result under the state lock; polling it every 250 ms would
+  add that pause to the work being measured. The probe returns only cheap fields.
+  `Status` gained the summed election duration, CPU, resident memory and score.
+- **Fault sweep:** a fixed 10 s outage at 8 s into every 25 s run, so loads are
+  comparable; the spec's random up-to-20 s outage is still available as
+  `client --inject-failure`, and `stress --fault-ms` takes any 1..=20 000 ms.
+- **Convergence** is measured after the workload: time until every node is idle
+  and the three digests are equal, polled every 20 ms. Its resolution is one
+  probe round plus one Status round.
+- **Limitation:** the committed results come from one machine (nodes, harness
+  and up to 128 client processes share 10 cores and the loopback interface).
+  They rank configurations and show the shape of the curves; lab numbers must
+  be measured on the six machines (deployment.md, test 5).
+
 ## November 2: concurrency documentation and temporary-failure implementation
 
 - **Choice:** retain the on-demand load-aware serving-node election. The new
@@ -583,7 +671,14 @@ one machine, no network between the nodes; to be repeated in the lab.
   the cluster doesn't settle in time, it says so before printing. It doesn't see
   frames still in a peer link's queue (limitation a, below).
 
-## Known limitations (open, for bullet 5)
+## Known limitations (for bullet 5; status on November 3)
+
+Status: **a** no longer matters for recovery (the returning node pulls what it
+needs, and the peer clears its backlog to it when the snapshot is taken; see
+"reset a peer's link" above); **b** fixed (a
+restarted node is `Starting`/`Recovering` until it has copied its peers' state,
+and doesn't bid); **c** remains (memory only). Details in [recovery.md](recovery.md).
+
 
 a. **The peer link's backlog has no useful limit.** While a peer is down, its link
    keeps every undelivered message (`Replicate`, but also `ElectBid`) and sends
