@@ -181,6 +181,21 @@ requests are in flight one node can be a result ahead; `--status --settle [SECS]
 (default 10 s) first polls every 100 ms until every reachable node shows queue 0
 and running 0 on two polls in a row, then compares.
 
+`Status` also carries `elections_recorded` and `election_time_us` (elections this
+node logged, any outcome, and their summed duration), `cpu_load` (the score's
+CPU EWMA, 0–1), `rss_bytes` (the node's resident memory) and `load_score`. All
+five default to 0 when absent, like `phase` and the other fields added later.
+
+### `ProbeRequest` / `Probe` (diagnostic, client ↔ node)
+
+A cheap subset of `Status` for polling during load: node id, phase, epoch,
+server, queue length, running jobs, pending cost, load score, CPU, resident
+memory and table sizes. It skips the results digest, which serializes every
+retained result while holding the state lock (≈3 ms per node at 15 000 results,
+growing linearly), and the traffic maps. The stress harness polls it every
+250 ms; it takes a full `Status` only before and after each run. A recovering
+node answers it, like `StatusRequest`; a muted node answers nothing.
+
 ## Timeouts, retries, backoff
 
 | What | Value | Where | Rule |
@@ -218,6 +233,16 @@ snapshot protocol below.
   snapshot and declares its record count and role view. Interrupted/incomplete
   transfers are discarded. Both survivors must respond and agree on the role
   view outside an active election before the returning node becomes ready.
+
+- `RecoveryUnavailable {node_id, phase}`: the answer to `RecoveryRequest` from a
+  node that is `starting` or `recovering` itself. The requester skips it; an
+  unreachable peer, by contrast, keeps the requester recovering.
+
+A node starts in phase `starting`: it probes both peers (`ProbeRequest`, 300 ms
+each). If one is `ready` with an epoch or requests, or `recovering`, the cluster
+has been running and the node recovers as above before participating (a cold
+rejoin); otherwise it becomes `ready` with empty tables. While `starting` it
+answers only probes, status and recovery requests. See [recovery](recovery.md).
 
 During `muted`, normal messages are discarded. During `recovering`, the node
 accepts live replicas and status queries but cannot bid or process client work.

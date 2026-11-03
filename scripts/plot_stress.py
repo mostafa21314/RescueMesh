@@ -3,7 +3,7 @@
 
     python3 scripts/plot_stress.py results/stress/NAME
 
-NAME holds a `load` and/or a `fault` sweep (each written by target/release/stress);
+NAME holds `load`, `fault` and/or `restart` sweeps (each written by target/release/stress);
 a single sweep directory works too. PNGs go to NAME/plots/. Needs matplotlib
 (pip install matplotlib); everything else is the standard library.
 """
@@ -127,7 +127,8 @@ def load_plots(sweep, out):
     save(fig, out, "load_runs_scatter.png")
 
 
-def fault_plots(sweep, out):
+def fault_plots(sweep, out, prefix):
+    """Plots for a sweep with an injected failure; files are named PREFIX_*.png."""
     levels = rows(sweep / "levels.csv")
     runs = rows(sweep / "runs.csv")
     clients = [int(r["clients"]) for r in levels]
@@ -137,12 +138,12 @@ def fault_plots(sweep, out):
     errorbar(a, clients, levels, "max_gap_ms", "longest gap without any answer")
     a.set(xlabel="client processes (10 req/s each)", ylabel="ms", title="Failover")
     a.legend(fontsize=8)
-    errorbar(b, clients, levels, "recovery_ms", "rejoin: mute end → ready")
+    errorbar(b, clients, levels, "recovery_ms", "rejoin: outage end → ready")
     b.plot(clients, [num(r["converge_ms_mean"]) for r in levels], "s--",
            label="convergence after the workload")
     b.set(xlabel="client processes", ylabel="ms", title="Recovery and convergence")
     b.legend(fontsize=8)
-    save(fig, out, "fault_summary.png")
+    save(fig, out, f"{prefix}_summary.png")
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     for key, label in (("p99_before", "before"), ("p99_during", "during"), ("p99_after", "after")):
@@ -150,7 +151,7 @@ def fault_plots(sweep, out):
     ax.set(xlabel="client processes", ylabel="p99 latency (ms)", yscale="log",
            title="p99 by window (sent before / during / after the outage)")
     ax.legend()
-    save(fig, out, "fault_windows.png")
+    save(fig, out, f"{prefix}_windows.png")
 
     # Timeline of the first rep of every level: each request's latency at its
     # send time, coloured by serving node, and the nodes' queues.
@@ -181,7 +182,7 @@ def fault_plots(sweep, out):
         if lost:
             ax.scatter([num(p["sent_rel_ms"]) / 1e3 for p in lost], [1] * len(lost),
                        marker="x", color="red", label="unanswered")
-        for key, style, label in (("inject_rel_ms", "r-", "muted"),
+        for key, style, label in (("inject_rel_ms", "r-", "down"),
                                   ("ready_rel_ms", "g-", "ready again")):
             if run[key]:
                 ax.axvline(num(run[key]) / 1e3, color=style[0], lw=1, label=label)
@@ -194,7 +195,7 @@ def fault_plots(sweep, out):
         q.set_ylabel("queued jobs (lines)")
         ax.legend(fontsize=7, loc="upper right", markerscale=3)
     axes[-1, 0].set_xlabel("time since the run started (s)")
-    save(fig, out, "fault_timeline.png")
+    save(fig, out, f"{prefix}_timeline.png")
 
 
 def main():
@@ -203,14 +204,17 @@ def main():
     root = Path(sys.argv[1])
     out = root / "plots"
     out.mkdir(exist_ok=True)
-    sweeps = [d for d in (root / "load", root / "fault") if (d / "runs.csv").exists()]
+    sweeps = [root / d for d in ("load", "fault", "restart") if (root / d / "runs.csv").exists()]
     if not sweeps and (root / "runs.csv").exists():
         sweeps = [root]
     if not sweeps:
         sys.exit(f"no runs.csv under {root}")
     for s in sweeps:
         has_fault = "failover_ms_mean" in rows(s / "levels.csv")[0]
-        (fault_plots if has_fault else load_plots)(s, out)
+        if has_fault:
+            fault_plots(s, out, "fault" if s == root else s.name)
+        else:
+            load_plots(s, out)
 
 
 if __name__ == "__main__":
