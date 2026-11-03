@@ -581,6 +581,9 @@ fn handle(shared: &Arc<Shared>, msg: Message, reply: &Reply) {
                 });
                 return;
             }
+            // Under the same lock as the copy: what was queued for it is in
+            // the snapshot, what is queued from now on reaches it.
+            shared.peers.reset(node_id);
             let records = st.tables.recovery_records();
             let count = records.len();
             for chunk in records.chunks(64) {

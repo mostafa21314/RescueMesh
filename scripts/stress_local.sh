@@ -14,7 +14,8 @@
 #               again 10 s later: a cold restart (scripts/restart_node.sh)
 #
 # Levels and reps: LOAD_CLIENTS, LOAD_REPS, FAULT_CLIENTS, FAULT_REPS (fault and
-# restart); EXTRA_ARGS goes to every sweep (e.g. "--complexity 8"). About 50 min.
+# restart); EXTRA_ARGS goes to every sweep (e.g. "--complexity 8"); SWEEPS picks
+# the sweeps (default "load fault restart"). About 50 min.
 # A quick check:
 #   LOAD_CLIENTS=1,8 LOAD_REPS=1 FAULT_CLIENTS=8 FAULT_REPS=1 scripts/stress_local.sh quick
 # Plots (needs matplotlib): python3 scripts/plot_stress.py results/stress/NAME
@@ -43,14 +44,15 @@ sweep() { # sweep DIR ARGS...
 }
 
 trap 'scripts/run_local.sh stop >/dev/null' EXIT
+sweeps=" ${SWEEPS:-load fault restart} "
 # shellcheck disable=SC2086 # EXTRA_ARGS is a word list
 # Overloaded runs may not drain within 30 s; the next run restarts the cluster.
-sweep load --clients "${LOAD_CLIENTS:-1,2,4,8,16,32,48,64,80,96,128}" --reps "${LOAD_REPS:-5}" \
+[[ $sweeps == *" load "* ]] && sweep load --clients "${LOAD_CLIENTS:-1,2,4,8,16,32,48,64,80,96,128}" --reps "${LOAD_REPS:-5}" \
   --requests 100 --rate 10 --settle-secs 30 ${EXTRA_ARGS:-}
 faults=(--clients "${FAULT_CLIENTS:-4,16,32,48}" --reps "${FAULT_REPS:-5}"
   --requests 250 --rate 10 --fault-ms 10000 --fault-at-ms 8000)
 # shellcheck disable=SC2086
-sweep fault "${faults[@]}" ${EXTRA_ARGS:-}
+[[ $sweeps == *" fault "* ]] && sweep fault "${faults[@]}" ${EXTRA_ARGS:-}
 # shellcheck disable=SC2086
-sweep restart "${faults[@]}" --fault-cmd "scripts/restart_node.sh {node} {ms}" ${EXTRA_ARGS:-}
+[[ $sweeps == *" restart "* ]] && sweep restart "${faults[@]}" --fault-cmd "scripts/restart_node.sh {node} {ms}" ${EXTRA_ARGS:-}
 echo "results in $out"
