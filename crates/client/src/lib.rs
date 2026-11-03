@@ -322,6 +322,34 @@ pub async fn query_status(addr: &str, timeout: Duration) -> anyhow::Result<NodeS
     tokio::time::timeout(timeout, fut).await?
 }
 
+/// Demo control only; ordinary workload clients never need to call this.
+pub async fn inject_failure(
+    addr: &str,
+    duration_ms: u64,
+    timeout: Duration,
+) -> anyhow::Result<NodeId> {
+    anyhow::ensure!(
+        (1..=20_000).contains(&duration_ms),
+        "failure duration must be 1..=20,000 ms"
+    );
+    tokio::time::timeout(timeout, async {
+        let mut stream = TcpStream::connect(addr).await?;
+        write_frame(&mut stream, &Message::InjectFailure { duration_ms }).await?;
+        match read_frame(&mut stream).await? {
+            Some((
+                Message::FailureAccepted {
+                    node_id,
+                    duration_ms: accepted,
+                },
+                _,
+            )) if accepted == duration_ms => Ok(node_id),
+            Some((Message::FailureRejected { reason }, _)) => anyhow::bail!(reason),
+            _ => anyhow::bail!("failure was not acknowledged"),
+        }
+    })
+    .await?
+}
+
 /// A synthetic incident at a random zone. Severity skews low (30/25/20/15/10 %).
 pub fn synth_incident(rng: &mut Rng, zones: u32, reporter: &str) -> Incident {
     let severity = match rng.below(100) {

@@ -70,6 +70,65 @@ pub struct Tables {
 }
 
 impl Tables {
+    /// Sorted, fixed snapshot; later live replicas are merged by the same result rule.
+    pub fn recovery_records(&self) -> Vec<RecoveryRecord> {
+        let mut records: BTreeMap<RequestId, RecoveryRecord> = self
+            .requests
+            .iter()
+            .map(|(&id, e)| {
+                (
+                    id,
+                    RecoveryRecord {
+                        request_id: id,
+                        attempt: e.last_attempt,
+                        epoch: e.last_epoch,
+                        incident: e.incident.clone(),
+                        complexity: e.complexity,
+                        result: None,
+                    },
+                )
+            })
+            .collect();
+        for (&id, (_, r)) in &self.results {
+            // Normally the request entry exists. Keep results even if the request
+            // entry's independently measured TTL expired slightly earlier.
+            if let Some(record) = records.get_mut(&id) {
+                record.result = Some(RecoveryResult {
+                    served_by: r.served_by,
+                    epoch: r.epoch,
+                    degraded: r.degraded,
+                    plan: r.plan.clone(),
+                });
+            }
+        }
+        records.into_values().collect()
+    }
+
+    pub fn merge_recovery(&mut self, records: Vec<RecoveryRecord>, now: Instant) {
+        for r in records {
+            self.record(
+                r.request_id,
+                r.attempt,
+                r.epoch,
+                &r.incident,
+                r.complexity,
+                now,
+            );
+            if let Some(result) = r.result {
+                self.offer(
+                    r.request_id,
+                    Response {
+                        served_by: result.served_by,
+                        epoch: result.epoch,
+                        degraded: result.degraded,
+                        plan: result.plan,
+                    },
+                    &r.incident,
+                    now,
+                );
+            }
+        }
+    }
     /// Records an arriving attempt. Returns the entry's previous state, or
     /// `None` if the request is new to this node.
     pub fn record(
@@ -170,10 +229,11 @@ impl Tables {
 
     /// Drops entries older than `ttl`.
     pub fn sweep(&mut self, now: Instant, ttl: Duration) {
-        self.requests
-            .retain(|_, e| now.duration_since(e.first_seen) < ttl);
         self.results
             .retain(|_, (t, _)| now.duration_since(*t) < ttl);
+        self.requests.retain(|id, e| {
+            now.duration_since(e.first_seen) < ttl || self.results.contains_key(id)
+        });
     }
 
     pub fn has_request(&self, request_id: &RequestId) -> bool {

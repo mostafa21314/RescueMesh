@@ -6,6 +6,34 @@ use crate::model::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodePhase {
+    #[default]
+    Ready,
+    Muted,
+    Recovering,
+}
+
+/// One retained request and its optional completed result, used during rejoin.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecoveryRecord {
+    pub request_id: RequestId,
+    pub attempt: u32,
+    pub epoch: Epoch,
+    pub incident: Incident,
+    pub complexity: u32,
+    pub result: Option<RecoveryResult>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecoveryResult {
+    pub served_by: NodeId,
+    pub epoch: Epoch,
+    pub degraded: bool,
+    pub plan: Plan,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Message {
@@ -57,7 +85,34 @@ pub enum Message {
         attempt: u32,
     },
     /// Serving node → client: the planning queue is full.
-    Busy { request_id: RequestId },
+    Busy {
+        request_id: RequestId,
+    },
+    /// Demo control: temporarily silence this node (1..=20,000 ms).
+    InjectFailure {
+        duration_ms: u64,
+    },
+    FailureAccepted {
+        node_id: NodeId,
+        duration_ms: u64,
+    },
+    FailureRejected {
+        reason: String,
+    },
+    /// Returning node pulls a fixed snapshot from each ready survivor.
+    RecoveryRequest {
+        node_id: NodeId,
+    },
+    RecoveryChunk {
+        records: Vec<RecoveryRecord>,
+    },
+    RecoveryComplete {
+        node_id: NodeId,
+        epoch: Epoch,
+        server: Option<NodeId>,
+        electing: bool,
+        records: usize,
+    },
     /// Diagnostic: client → node. Not part of request processing.
     StatusRequest,
     /// Diagnostic: node → client.
@@ -75,6 +130,12 @@ impl Message {
             Message::ElectBid { .. } => "ElectBid",
             Message::StatusRequest => "StatusRequest",
             Message::Status(_) => "Status",
+            Message::InjectFailure { .. } => "InjectFailure",
+            Message::FailureAccepted { .. } => "FailureAccepted",
+            Message::FailureRejected { .. } => "FailureRejected",
+            Message::RecoveryRequest { .. } => "RecoveryRequest",
+            Message::RecoveryChunk { .. } => "RecoveryChunk",
+            Message::RecoveryComplete { .. } => "RecoveryComplete",
         }
     }
 }
@@ -82,6 +143,12 @@ impl Message {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeStatus {
     pub node_id: NodeId,
+    #[serde(default)]
+    pub phase: NodePhase,
+    #[serde(default)]
+    pub faults_injected: u64,
+    #[serde(default)]
+    pub last_recovery_ms: Option<u64>,
     pub epoch: Epoch,
     pub server: Option<NodeId>,
     pub degraded: bool,
@@ -126,6 +193,9 @@ mod tests {
     fn status_round_trips_through_json() {
         let st = NodeStatus {
             node_id: 1,
+            phase: NodePhase::Ready,
+            faults_injected: 0,
+            last_recovery_ms: None,
             epoch: 0,
             server: Some(1),
             degraded: false,

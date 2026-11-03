@@ -26,10 +26,6 @@ use std::time::{Duration, Instant};
 
 use crate::tables::Previous;
 
-/// A node rejoining an election it bid in re-sends that bid if it is younger
-/// than this many bid timeouts; after that it bids afresh.
-pub const REBID_WINDOW: u32 = 10;
-
 /// How long per-request election keys are remembered after deciding, so a
 /// late bid can't restart a finished election.
 pub const FINISHED_KEEP: Duration = Duration::from_secs(60);
@@ -183,13 +179,26 @@ pub struct Core {
     /// when. Rejoining an election it already bid in (its own timer fired
     /// before a peer's bid arrived) re-sends the same bid, so every node
     /// decides from the same bids.
-    own_bids: BTreeMap<Epoch, (Bid, Instant)>,
+    own_bids: BTreeMap<Epoch, Bid>,
     /// When this node learned that `server` holds the role in `epoch`.
     tenure: Option<(NodeId, Epoch, Instant)>,
     pub counters: Counters,
 }
 
 impl Core {
+    /// Discard pre-outage elections and install the view confirmed by survivors.
+    /// The caller keeps the node gated until its tables and ledger are rebuilt.
+    pub fn recover_view(&mut self, now: Instant, epoch: Epoch, server: Option<NodeId>) {
+        self.epoch = epoch;
+        self.server = server;
+        self.degraded = false;
+        self.alone_since = None;
+        self.active = None;
+        self.per_request.clear();
+        self.finished.clear();
+        self.own_bids.clear();
+        self.tenure = server.map(|s| (s, epoch, now));
+    }
     pub fn new(p: Params) -> Self {
         Core {
             p,
@@ -480,6 +489,7 @@ impl Core {
             self.step_down(out);
         }
         self.epoch = epoch;
+        self.own_bids.retain(|target, _| *target > epoch);
         self.server = server;
         self.tenure = server.map(|s| (s, epoch, now));
         self.degraded = false;
@@ -540,11 +550,7 @@ impl Core {
     ) {
         let me = self.p.me;
         let reuse = match key {
-            Key::Epoch(t) => self
-                .own_bids
-                .get(&t)
-                .filter(|(_, at)| now.duration_since(*at) < self.p.bid_timeout * REBID_WINDOW)
-                .map(|(b, _)| *b),
+            Key::Epoch(t) => self.own_bids.get(&t).copied(),
             Key::Request(..) => None,
         };
         let own = reuse.unwrap_or_else(|| Bid {
@@ -553,7 +559,7 @@ impl Core {
             incumbent,
         });
         if let (Key::Epoch(t), None) = (key, reuse) {
-            self.own_bids.insert(t, (own, now));
+            self.own_bids.insert(t, own);
         }
         let incumbent = own.incumbent;
         let (target_epoch, request_id, attempt) = match key {
@@ -925,12 +931,29 @@ mod tests {
         );
         let acts = c.on_timeout(later + TIMEOUT, Key::Epoch(1));
         assert_eq!(winner(&acts), Some(2));
-        // Much later, a fresh election bids afresh.
+        // Even after a long delay, the same target epoch must keep its bid.
         let mut c = core(2, ElectionMode::OnDemand);
         c.on_submit(t0, rid(1), 1, None, &|| 100);
         c.on_timeout(t0 + TIMEOUT, Key::Epoch(1));
         let acts = c.on_submit(t0 + Duration::from_secs(2), rid(2), 1, None, &|| 700);
-        assert_eq!(sent_bid(&acts), Some((1, 700, None)));
+        assert_eq!(sent_bid(&acts), Some((1, 100, None)));
+    }
+
+    #[test]
+    fn delayed_bid_beyond_the_old_cache_window_cannot_make_survivors_follow_each_other() {
+        let t = Instant::now();
+        let mut a = core(1, ElectionMode::OnDemand);
+        let mut b = core(2, ElectionMode::OnDemand);
+        a.on_submit(t, rid(1), 1, None, &|| 0);
+        a.on_timeout(t + TIMEOUT, Key::Epoch(1));
+        let later = t + Duration::from_millis(1100);
+        b.on_bid(later, 1, bid(1, 0, None), None, 0, &|| 10);
+        b.on_timeout(later + TIMEOUT, Key::Epoch(1));
+        a.on_bid(later + TIMEOUT, 1, bid(2, 10, None), None, 0, &|| 20);
+        a.on_timeout(later + TIMEOUT * 2, Key::Epoch(1));
+        assert_eq!(a.server(), Some(1));
+        assert_eq!(b.server(), Some(1));
+        assert!(a.serving());
     }
 
     #[test]

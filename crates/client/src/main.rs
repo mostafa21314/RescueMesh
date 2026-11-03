@@ -1,7 +1,7 @@
 use clap::Parser;
-use client::{query_status, synth_incident, Client, Outcome};
+use client::{inject_failure, query_status, synth_incident, Client, Outcome};
 use common::config::ClientConfig;
-use common::msg::NodeStatus;
+use common::msg::{NodePhase, NodeStatus};
 use common::rng::Rng;
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -33,6 +33,14 @@ struct Args {
     /// Print each node's status and whether their results tables agree, then exit.
     #[arg(long)]
     status: bool,
+    /// Demo: silence the currently elected server, then wait for its recovery.
+    #[arg(long, conflicts_with = "status")]
+    inject_failure: bool,
+    #[arg(long, default_value_t = 20_000, value_parser = clap::value_parser!(u64).range(1..=20_000))]
+    failure_ms: u64,
+    /// Repeat the demo sequentially; each round waits until all nodes are ready.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+    fault_rounds: u32,
     /// With --status: first wait, up to SECS (default 10), until no node has
     /// queued or running jobs, so in-flight replication doesn't skew the digests.
     #[arg(long, value_name = "SECS", num_args = 0..=1, default_missing_value = "10", requires = "status")]
@@ -48,6 +56,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     let cfg = ClientConfig::load(&args.config)?;
+    if args.inject_failure {
+        return run_faults(&cfg, args.failure_ms, args.fault_rounds).await;
+    }
     if args.status {
         return print_status(&cfg, args.settle.map(Duration::from_secs)).await;
     }
@@ -170,6 +181,60 @@ async fn query_all(cfg: &ClientConfig) -> Vec<anyhow::Result<NodeStatus>> {
     out
 }
 
+async fn run_faults(cfg: &ClientConfig, duration_ms: u64, rounds: u32) -> anyhow::Result<()> {
+    for round in 1..=rounds {
+        let statuses = query_all(cfg)
+            .await
+            .into_iter()
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            statuses.len() == 3 && statuses.iter().all(|s| s.phase == NodePhase::Ready),
+            "all three nodes must be ready before injecting one failure"
+        );
+        let server = statuses[0]
+            .server
+            .ok_or_else(|| anyhow::anyhow!("run a warm-up request first to elect a server"))?;
+        anyhow::ensure!(
+            statuses
+                .iter()
+                .all(|s| s.server == Some(server) && s.epoch == statuses[0].epoch),
+            "wait for the election views to agree"
+        );
+        let index = statuses
+            .iter()
+            .position(|s| s.node_id == server)
+            .ok_or_else(|| anyhow::anyhow!("elected server missing from configuration"))?;
+        let timeout = Duration::from_millis(cfg.request_timeout_ms);
+        inject_failure(&cfg.nodes[index], duration_ms, timeout).await?;
+        println!("round {round}: elected server {server} muted for {duration_ms} ms; workload clients continue unchanged");
+        // Stay outside the known mute window, then poll readiness. Only one demo
+        // controller should run, so faults cannot overlap across rounds.
+        tokio::time::sleep(Duration::from_millis(duration_ms)).await;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Ok(s) = query_status(&cfg.nodes[index], timeout).await {
+                if s.phase == NodePhase::Ready {
+                    println!(
+                        "node {server} recovered: {} ms, epoch {}, server {:?}, {} results",
+                        s.last_recovery_ms.unwrap_or(0),
+                        s.epoch,
+                        s.server,
+                        s.results
+                    );
+                    break;
+                }
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "node {server} remains unavailable/recovering; inspect survivor connectivity"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Ok(())
+}
+
 /// Polls every node until all reachable ones report no queued or running jobs
 /// on two polls in a row (the second covers a job that just finished but whose
 /// `Replicate` isn't sent yet), or until `limit`. Returns the last poll.
@@ -209,6 +274,10 @@ async fn print_status(cfg: &ClientConfig, settle: Option<Duration>) -> anyhow::R
                     s.node_id, s.epoch, s.server, s.requests, s.results, s.results_digest, s.queue_len, s.running,
                     s.pending_cost, s.replicate_conflicts, s.duplicate_replicates, s.local_replans,
                     s.resource_overcommits, s.peer_queue_drops, s.peer_last_seen_ms
+                );
+                println!(
+                    "    phase {:?} faults {} last_recovery_ms {:?}",
+                    s.phase, s.faults_injected, s.last_recovery_ms
                 );
                 println!(
                     "    degraded {} elections decided {} alone {} splits {} step_downs {} suppressed_triggers {} dropped_on_step_down {} late_results {}",

@@ -16,7 +16,7 @@ use common::wire::{read_frame, write_frame};
 use common::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
@@ -27,10 +27,12 @@ use tokio::task::{JoinHandle, JoinSet};
 const SWEEP_EVERY: Duration = Duration::from_secs(1);
 /// Planning attempts on a fresh snapshot before planning under the ledger lock.
 const OPTIMISTIC_PLANS: u32 = 2;
+pub const MAX_FAILURE: Duration = Duration::from_secs(20);
 
 type Reply = mpsc::UnboundedSender<Message>;
 
 struct Job {
+    generation: u64,
     request_id: RequestId,
     incident: Incident,
     complexity: u32,
@@ -41,10 +43,14 @@ struct Job {
 
 struct Done {
     job: Job,
-    plan: Plan,
+    plan: Option<Plan>,
 }
 
 struct State {
+    phase: NodePhase,
+    faults_injected: u64,
+    last_recovery_ms: Option<u64>,
+    recovery_epoch: Epoch,
     tables: Tables,
     core: Core,
     /// The connection each request last arrived on; the node answers there
@@ -69,6 +75,9 @@ struct Stats {
 }
 
 struct Shared {
+    campus: Arc<Campus>,
+    generation: Arc<AtomicU64>,
+    stopped: AtomicBool,
     cfg: NodeConfig,
     ledger: Arc<Mutex<Ledger>>,
     state: Mutex<State>,
@@ -85,6 +94,10 @@ pub struct NodeHandle {
 }
 
 impl NodeHandle {
+    /// Silences application traffic, then actively recovers before serving again.
+    pub fn inject_failure(&self, duration: Duration) -> anyhow::Result<()> {
+        inject_failure(&self.shared, duration)
+    }
     pub fn local_addr(&self) -> SocketAddr {
         self.addr
     }
@@ -99,6 +112,10 @@ impl NodeHandle {
 
     pub fn status(&self) -> NodeStatus {
         status(&self.shared)
+    }
+
+    pub fn ledger_snapshot(&self, now_ms: u64) -> crate::ledger::Snapshot {
+        self.shared.ledger.lock().unwrap().snapshot(now_ms)
     }
 
     /// Diagnostic: this node's view of one request (for test failure output).
@@ -122,6 +139,8 @@ impl NodeHandle {
     /// planner threads after their current job. Blocks; from async code call
     /// it via `spawn_blocking`.
     pub fn shutdown(self) {
+        self.shared.stopped.store(true, Ordering::SeqCst);
+        self.shared.generation.fetch_add(1, Ordering::SeqCst);
         for t in &self.tasks {
             t.abort();
         }
@@ -148,13 +167,15 @@ pub async fn start_with_listener(
     let stats = Stats::default();
     let (peers, mut tasks) = PeerLinks::spawn(&cfg.peers, stats.sent.clone());
     let (done_tx, done_rx) = mpsc::unbounded_channel();
+    let generation = Arc::new(AtomicU64::new(0));
 
     let pool = {
         let (campus, ledger, load) = (campus.clone(), ledger.clone(), load.clone());
         let replans = stats.local_replans.clone();
+        let generation = generation.clone();
         Pool::new(cfg.workers, cfg.queue_capacity, move |job: Job| {
             let started = Instant::now();
-            let plan = plan_and_commit(&campus, &ledger, &replans, &job);
+            let plan = plan_and_commit(&campus, &ledger, &replans, &job, &generation);
             load.record_service(started.elapsed(), planner::expected_cost(job.complexity));
             let _ = done_tx.send(Done { job, plan });
         })
@@ -170,7 +191,14 @@ pub async fn start_with_listener(
         min_tenure: Duration::from_millis(cfg.min_tenure_ms),
     });
     let shared = Arc::new(Shared {
+        campus: campus.clone(),
+        generation,
+        stopped: AtomicBool::new(false),
         state: Mutex::new(State {
+            phase: NodePhase::Ready,
+            faults_injected: 0,
+            last_recovery_ms: None,
+            recovery_epoch: 0,
             tables: Tables::default(),
             core,
             reply_to: HashMap::new(),
@@ -188,8 +216,8 @@ pub async fn start_with_listener(
     // No server is known at startup. The first request triggers the
     // election (trigger "no_server"), rather than boot, when peers are often
     // not up yet and the election would hear only its own bid.
-    // TODO(recovery/sync): a node that (re)starts while peers hold results
-    // must fetch them actively; nothing pushes them.
+    // Temporary outages use the pull-recovery path below. Cold starts still
+    // assume a fresh cluster; persistent crash recovery is a separate concern.
     // TODO(discovery): peers come from the config file for now.
     tasks.push(tokio::spawn(accept_loop(shared.clone(), listener)));
     tasks.push(tokio::spawn(completion_loop(shared.clone(), done_rx)));
@@ -212,6 +240,149 @@ pub async fn start_with_listener(
     })
 }
 
+fn inject_failure(shared: &Arc<Shared>, duration: Duration) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !duration.is_zero() && duration <= MAX_FAILURE,
+        "failure duration must be 1..=20,000 ms"
+    );
+    let mut st = shared.state.lock().unwrap();
+    anyhow::ensure!(
+        st.phase == NodePhase::Ready && !shared.stopped.load(Ordering::SeqCst),
+        "node is not ready"
+    );
+    st.phase = NodePhase::Muted;
+    st.faults_injected += 1;
+    st.last_recovery_ms = None;
+    st.recovery_epoch = st.core.epoch();
+    shared.generation.fetch_add(1, Ordering::SeqCst);
+    shared.peers.suspend();
+    shared.pool.drop_queued();
+    st.inflight.clear();
+    st.reply_to.clear();
+    st.pending_wins.clear();
+    tracing::warn!(
+        node = shared.cfg.node_id,
+        duration_ms = duration.as_millis(),
+        "temporary failure started"
+    );
+    let sh = shared.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(duration).await;
+        if sh.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        sh.state.lock().unwrap().phase = NodePhase::Recovering;
+        recover(sh).await;
+    });
+    Ok(())
+}
+
+async fn recover(shared: Arc<Shared>) {
+    let started = Instant::now();
+    tracing::info!(
+        node = shared.cfg.node_id,
+        "recovery started; election participation disabled"
+    );
+    loop {
+        if shared.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        // Old planners must finish/cancel before replacing their derived ledger.
+        if shared.pool.load().running > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            continue;
+        }
+        let first = &shared.cfg.peers[0];
+        let second = &shared.cfg.peers[1];
+        let (a, b) = tokio::join!(
+            crate::recovery::fetch(&first.addr, shared.cfg.node_id, first.id),
+            crate::recovery::fetch(&second.addr, shared.cfg.node_id, second.id),
+        );
+        if let (Ok(a), Ok(b)) = (a, b) {
+            // A temporary single-node failure leaves two ready survivors. Do not
+            // resume on one arbitrary or still-electing survivor's stale view.
+            if a.epoch == b.epoch
+                && a.server == b.server
+                && !a.electing
+                && !b.electing
+                && a.server.is_none_or(|id| {
+                    id == shared.cfg.node_id || shared.cfg.peers.iter().any(|p| p.id == id)
+                })
+            {
+                let mut st = shared.state.lock().unwrap();
+                if shared.stopped.load(Ordering::SeqCst) {
+                    return;
+                }
+                let now = Instant::now();
+                // A newer live replica can overtake either snapshot transfer.
+                // Never install an older role view over that observed epoch.
+                if a.epoch < st.recovery_epoch {
+                    continue;
+                }
+                let versions = |records: &[RecoveryRecord]| {
+                    records
+                        .iter()
+                        .filter_map(|r| {
+                            r.result
+                                .as_ref()
+                                .map(|result| (r.request_id, (result.epoch, result.served_by)))
+                        })
+                        .collect::<HashMap<_, _>>()
+                };
+                let a_versions = versions(&a.records);
+                let b_versions = versions(&b.records);
+                st.tables.merge_recovery(a.records, now);
+                st.tables.merge_recovery(b.records, now);
+                let records = st.tables.recovery_records();
+                let mut ledger = Ledger::new(&shared.campus);
+                for record in &records {
+                    if let Some(result) = &record.result {
+                        ledger.apply(record.request_id, &result.plan, unix_ms());
+                    }
+                }
+                *shared.ledger.lock().unwrap() = ledger;
+                st.core.recover_view(now, a.epoch, a.server);
+                st.inflight.clear();
+                st.phase = NodePhase::Ready;
+                st.last_recovery_ms = Some(started.elapsed().as_millis() as u64);
+                shared.peers.resume();
+                // Also publish retained results that may have completed just
+                // before the outage without reaching either survivor.
+                for record in records {
+                    if let Some(r) = record.result {
+                        let message = Message::Replicate {
+                            epoch: r.epoch,
+                            origin: r.served_by,
+                            request_id: record.request_id,
+                            plan: r.plan,
+                            incident: record.incident,
+                            degraded: r.degraded,
+                        };
+                        for (peer, versions) in [(first.id, &a_versions), (second.id, &b_versions)]
+                        {
+                            if versions.get(&record.request_id) != Some(&(r.epoch, r.served_by)) {
+                                shared.peers.send(peer, message.clone());
+                            }
+                        }
+                    }
+                }
+                if st.core.serving() {
+                    run_actions(&shared, &mut st, vec![Action::BecameServer]);
+                }
+                tracing::info!(
+                    node = shared.cfg.node_id,
+                    recovery_ms = st.last_recovery_ms,
+                    results = st.tables.len().1,
+                    epoch = st.core.epoch(),
+                    "recovery complete; node ready"
+                );
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Plans on a snapshot and commits if nothing it chose was taken meanwhile;
 /// after `OPTIMISTIC_PLANS` collisions, plans while holding the ledger lock.
 /// Either way commits happen one at a time, so two workers never assign the
@@ -221,23 +392,33 @@ fn plan_and_commit(
     ledger: &Mutex<Ledger>,
     replans: &AtomicU64,
     job: &Job,
-) -> Plan {
+    generation: &AtomicU64,
+) -> Option<Plan> {
     for _ in 0..OPTIMISTIC_PLANS {
         let now = unix_ms();
         let snap = ledger.lock().unwrap().snapshot(now);
         let plan = planner::plan(campus, &snap, &job.incident, job.complexity, now);
         let mut l = ledger.lock().unwrap();
+        if generation.load(Ordering::SeqCst) != job.generation {
+            return None;
+        }
         if l.can_commit(job.request_id, &plan, now) {
             l.apply(job.request_id, &plan, now);
-            return plan;
+            return Some(plan);
         }
         replans.fetch_add(1, Ordering::Relaxed);
     }
     let now = unix_ms();
     let mut l = ledger.lock().unwrap();
+    if generation.load(Ordering::SeqCst) != job.generation {
+        return None;
+    }
     let plan = planner::plan(campus, &l.snapshot(now), &job.incident, job.complexity, now);
+    if generation.load(Ordering::SeqCst) != job.generation {
+        return None;
+    }
     l.apply(job.request_id, &plan, now);
-    plan
+    Some(plan)
 }
 
 /// This node's load score, computed fresh.
@@ -256,7 +437,7 @@ async fn accept_loop(shared: Arc<Shared>, listener: TcpListener) {
         tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
-                    // TODO(fault injection): the mute switch refuses connections here.
+                    if shared.state.lock().unwrap().phase == NodePhase::Muted { continue; }
                     let _ = stream.set_nodelay(true);
                     conns.spawn(serve_conn(shared.clone(), stream));
                 }
@@ -272,6 +453,11 @@ async fn serve_conn(shared: Arc<Shared>, stream: TcpStream) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
     let writer = async {
         while let Some(m) = rx.recv().await {
+            if shared.state.lock().unwrap().phase == NodePhase::Muted
+                && !matches!(m, Message::FailureAccepted { .. })
+            {
+                continue;
+            }
             match write_frame(&mut wr, &m).await {
                 Ok(n) => shared.stats.sent.add(m.kind(), n),
                 Err(_) => break,
@@ -282,7 +468,6 @@ async fn serve_conn(shared: Arc<Shared>, stream: TcpStream) {
         loop {
             match read_frame(&mut rd).await {
                 Ok(Some((msg, n))) => {
-                    // TODO(fault injection): the mute switch drops inbound frames here.
                     shared.stats.received.add(msg.kind(), n);
                     handle(&shared, msg, &tx);
                 }
@@ -301,7 +486,48 @@ async fn serve_conn(shared: Arc<Shared>, stream: TcpStream) {
 }
 
 fn handle(shared: &Arc<Shared>, msg: Message, reply: &Reply) {
+    let phase = shared.state.lock().unwrap().phase;
+    if phase == NodePhase::Muted {
+        return;
+    }
+    if phase == NodePhase::Recovering
+        && !matches!(msg, Message::Replicate { .. } | Message::StatusRequest)
+    {
+        return;
+    }
     match msg {
+        Message::InjectFailure { duration_ms } => {
+            let response = match inject_failure(shared, Duration::from_millis(duration_ms)) {
+                Ok(()) => Message::FailureAccepted {
+                    node_id: shared.cfg.node_id,
+                    duration_ms,
+                },
+                Err(error) => Message::FailureRejected {
+                    reason: error.to_string(),
+                },
+            };
+            let _ = reply.send(response);
+        }
+        Message::RecoveryRequest { node_id } => {
+            let st = shared.state.lock().unwrap();
+            if st.phase != NodePhase::Ready || !shared.cfg.peers.iter().any(|p| p.id == node_id) {
+                return;
+            }
+            let records = st.tables.recovery_records();
+            let count = records.len();
+            for chunk in records.chunks(64) {
+                let _ = reply.send(Message::RecoveryChunk {
+                    records: chunk.to_vec(),
+                });
+            }
+            let _ = reply.send(Message::RecoveryComplete {
+                node_id: shared.cfg.node_id,
+                epoch: st.core.epoch(),
+                server: st.core.server(),
+                electing: st.core.electing(),
+                records: count,
+            });
+        }
         Message::SubmitIncident {
             request_id,
             attempt,
@@ -336,6 +562,9 @@ fn handle(shared: &Arc<Shared>, msg: Message, reply: &Reply) {
             shared.peers.heard_from(node_id);
             let mut guard = shared.state.lock().unwrap();
             let st = &mut *guard;
+            if st.phase != NodePhase::Ready {
+                return;
+            }
             let bid = Bid {
                 node_id,
                 score: s,
@@ -370,6 +599,9 @@ fn on_submit(
     let now = Instant::now();
     let mut guard = shared.state.lock().unwrap();
     let st = &mut *guard;
+    if st.phase != NodePhase::Ready {
+        return;
+    }
     let mut acts = st.core.observe_client_epoch(now, client_epoch);
     let prev = st.tables.record(
         request_id,
@@ -415,6 +647,7 @@ fn submit(shared: &Shared, st: &mut State, request_id: RequestId, force: bool) -
         return false;
     };
     let job = Job {
+        generation: shared.generation.load(Ordering::SeqCst),
         request_id,
         incident: e.incident.clone(),
         complexity: e.complexity,
@@ -441,10 +674,17 @@ fn run_actions(shared: &Arc<Shared>, st: &mut State, actions: Vec<Action>) {
             Action::Broadcast(m) => shared.peers.broadcast(m),
             Action::Timer(key, after) => {
                 let sh = shared.clone();
+                let generation = shared.generation.load(Ordering::SeqCst);
                 tokio::spawn(async move {
                     tokio::time::sleep(after).await;
                     let mut guard = sh.state.lock().unwrap();
                     let st = &mut *guard;
+                    if st.phase != NodePhase::Ready
+                        || sh.stopped.load(Ordering::SeqCst)
+                        || sh.generation.load(Ordering::SeqCst) != generation
+                    {
+                        return;
+                    }
                     let acts = st.core.on_timeout(Instant::now(), key);
                     run_actions(&sh, st, acts);
                 });
@@ -560,6 +800,14 @@ async fn completion_loop(shared: Arc<Shared>, mut done_rx: mpsc::UnboundedReceiv
         incident.status = IncidentStatus::Planned;
         let mut guard = shared.state.lock().unwrap();
         let st = &mut *guard;
+        if st.phase != NodePhase::Ready
+            || job.generation != shared.generation.load(Ordering::SeqCst)
+        {
+            continue;
+        }
+        let Some(plan) = plan else {
+            continue;
+        };
         st.inflight.remove(&request_id);
 
         // A plan finished after this node stopped serving its epoch is late.
@@ -587,7 +835,7 @@ async fn completion_loop(shared: Arc<Shared>, mut done_rx: mpsc::UnboundedReceiv
                 let kept = st.tables.result(&request_id).expect("kept").clone();
                 {
                     let mut l = shared.ledger.lock().unwrap();
-                    l.release(request_id, &response.plan);
+                    l.release(request_id, &response.plan, unix_ms());
                     l.apply(request_id, &kept.plan, unix_ms());
                 }
                 if let Some(r) = st.reply_to.remove(&request_id) {
@@ -600,7 +848,7 @@ async fn completion_loop(shared: Arc<Shared>, mut done_rx: mpsc::UnboundedReceiv
             offer => {
                 if let Offer::Replaced(old) = offer {
                     let mut l = shared.ledger.lock().unwrap();
-                    l.release(request_id, &old.plan);
+                    l.release(request_id, &old.plan, unix_ms());
                     l.apply(request_id, &response.plan, unix_ms());
                 }
                 if let Some(r) = st.reply_to.remove(&request_id) {
@@ -635,8 +883,17 @@ fn on_replicate(
     let now = Instant::now();
     let mut guard = shared.state.lock().unwrap();
     let st = &mut *guard;
-    let acts = st.core.on_replicate(now, epoch, origin);
-    run_actions(shared, st, acts);
+    if st.phase == NodePhase::Muted {
+        return;
+    }
+    if !shared.cfg.peers.iter().any(|p| p.id == origin) {
+        return;
+    }
+    st.recovery_epoch = st.recovery_epoch.max(epoch);
+    if st.phase == NodePhase::Ready {
+        let acts = st.core.on_replicate(now, epoch, origin);
+        run_actions(shared, st, acts);
+    }
 
     let response = Response {
         served_by: origin,
@@ -662,7 +919,7 @@ fn on_replicate(
             .apply(request_id, &response.plan, unix_ms()),
         Offer::Replaced(old) => {
             let mut l = shared.ledger.lock().unwrap();
-            l.release(request_id, &old.plan);
+            l.release(request_id, &old.plan, unix_ms());
             l.apply(request_id, &response.plan, unix_ms())
         }
     };
@@ -711,6 +968,9 @@ fn status(shared: &Shared) -> NodeStatus {
     let c = st.core.counters;
     NodeStatus {
         node_id: shared.cfg.node_id,
+        phase: st.phase,
+        faults_injected: st.faults_injected,
+        last_recovery_ms: st.last_recovery_ms,
         epoch: st.core.epoch(),
         server: st.core.server(),
         degraded: st.core.degraded(),

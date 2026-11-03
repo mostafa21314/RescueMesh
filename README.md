@@ -8,7 +8,9 @@ Phase 1 status:
 |---|---|
 | 1. Three-node cloud + Incident Processing and Coordination Service | **done (Part A)** |
 | 2. Distributed election for workload assignment, with a load metric | **done (Part B)**: on-demand, retry-triggered election; per-request mode for comparison |
-| 3–6. Concurrency write-up, fault injection, recovery, stress tests | later |
+| 3. Concurrent processing and parallelization write-up | **done**: async client/node I/O, fixed planner threads; see the document below |
+| 4. Temporary server failures up to 20 seconds | **implemented and locally tested**: mute, survivor election, automatic pull recovery before rejoin |
+| 5–6. Broader recovery experiments and stress analysis | temporary-outage recovery implemented; persistent crash recovery and large-scale analysis remain |
 
 ## Layout
 
@@ -86,6 +88,7 @@ campus locally. Log level: `RUST_LOG=debug` for per-request lines.
 
 ## Docs
 
+- [docs/concurrency-and-failures.md](docs/concurrency-and-failures.md): parallelization models, election choice, 20-second failure demo, recovery and limitations
 - [docs/protocol.md](docs/protocol.md): messages, timeouts, retry rules
 - [docs/design-log.md](docs/design-log.md): each decision, its alternatives, and why
 - [docs/library-vs-ours.md](docs/library-vs-ours.md): what crates provide vs. our code
