@@ -13,7 +13,7 @@
 //! loaded one still scores higher.
 
 use common::config::{CpuSource, Policy, Weights};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -78,22 +78,35 @@ struct Ewmas {
     ms_per_unit: Option<f64>,
 }
 
-/// CPU sampler thread plus the planning-time EWMA.
+/// CPU sampler thread plus the planning-time EWMA. The sampler also reads
+/// this process's resident memory, for `Status`.
 pub struct LoadMonitor {
     ewmas: Arc<Mutex<Ewmas>>,
+    rss: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
 }
 
 impl LoadMonitor {
     pub fn start(source: CpuSource) -> Self {
         let ewmas = Arc::new(Mutex::new(Ewmas::default()));
+        let rss = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
-        let (e, s) = (ewmas.clone(), stop.clone());
+        let (e, r, s) = (ewmas.clone(), rss.clone(), stop.clone());
         std::thread::Builder::new()
             .name("cpu-sampler".into())
-            .spawn(move || sample_cpu(source, &e, &s))
+            .spawn(move || sample_cpu(source, &e, &r, &s))
             .expect("spawn cpu sampler");
-        LoadMonitor { ewmas, stop }
+        LoadMonitor { ewmas, rss, stop }
+    }
+
+    /// CPU use in [0, 1] (EWMA), as the score uses it.
+    pub fn cpu(&self) -> f64 {
+        self.ewmas.lock().unwrap().cpu.unwrap_or(0.0)
+    }
+
+    /// Resident memory of this process, bytes, as of the last sample.
+    pub fn rss_bytes(&self) -> u64 {
+        self.rss.load(Ordering::Relaxed)
     }
 
     /// Records one finished plan.
@@ -118,7 +131,7 @@ impl LoadMonitor {
     }
 }
 
-fn sample_cpu(source: CpuSource, ewmas: &Mutex<Ewmas>, stop: &AtomicBool) {
+fn sample_cpu(source: CpuSource, ewmas: &Mutex<Ewmas>, rss: &AtomicU64, stop: &AtomicBool) {
     let mut sys = sysinfo::System::new();
     let pid = sysinfo::get_current_pid().ok();
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
@@ -129,17 +142,19 @@ fn sample_cpu(source: CpuSource, ewmas: &Mutex<Ewmas>, stop: &AtomicBool) {
     }
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(CPU_SAMPLE_EVERY);
+        let (memory, process_cpu) = match pid {
+            Some(pid) if sys.refresh_process(pid) => sys.process(pid).map_or((0, 0.0), |p| {
+                (p.memory(), p.cpu_usage() as f64 / 100.0 / cores)
+            }),
+            _ => (0, 0.0),
+        };
+        rss.store(memory, Ordering::Relaxed);
         let busy = match source {
             CpuSource::Machine => {
                 sys.refresh_cpu();
                 sys.global_cpu_info().cpu_usage() as f64 / 100.0
             }
-            CpuSource::Process => match pid {
-                Some(pid) if sys.refresh_process(pid) => sys
-                    .process(pid)
-                    .map_or(0.0, |p| p.cpu_usage() as f64 / 100.0 / cores),
-                _ => 0.0,
-            },
+            CpuSource::Process => process_cpu,
         };
         let mut e = ewmas.lock().unwrap();
         e.cpu = Some(ewma(e.cpu, busy.clamp(0.0, 1.0)));

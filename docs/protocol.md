@@ -181,6 +181,21 @@ requests are in flight one node can be a result ahead; `--status --settle [SECS]
 (default 10 s) first polls every 100 ms until every reachable node shows queue 0
 and running 0 on two polls in a row, then compares.
 
+`Status` also carries `elections_recorded` and `election_time_us` (elections this
+node logged, any outcome, and their summed duration), `cpu_load` (the score's
+CPU EWMA, 0–1), `rss_bytes` (the node's resident memory) and `load_score`. All
+five default to 0 when absent, like `phase` and the other fields added later.
+
+### `ProbeRequest` / `Probe` (diagnostic, client ↔ node)
+
+A cheap subset of `Status` for polling during load: node id, phase, epoch,
+server, queue length, running jobs, pending cost, load score, CPU, resident
+memory and table sizes. It skips the results digest, which serializes every
+retained result while holding the state lock (≈3 ms per node at 15 000 results,
+growing linearly), and the traffic maps. The stress harness polls it every
+250 ms; it takes a full `Status` only before and after each run. A recovering
+node answers it, like `StatusRequest`; a muted node answers nothing.
+
 ## Timeouts, retries, backoff
 
 | What | Value | Where | Rule |
@@ -223,24 +238,30 @@ snapshot protocol below.
   snapshot and declares its record count and role view (read after the
   records, so it is at least as new as they are). Interrupted/incomplete
   transfers are discarded.
-- `RecoveryUnavailable {node_id, phase, has_state}`: the peer is not Ready, so
-  it has no snapshot to give. Sent at once, so the requester does not wait out
-  the 10 s transfer limit. `has_state = false`: the peer itself just started
-  empty, and is left out of the ready rule.
+- `RecoveryUnavailable {node_id, phase, has_state}`: the answer to
+  `RecoveryRequest` from a node that is `starting` or `recovering` itself. Sent
+  at once, so the requester does not wait out the 10 s transfer limit; the
+  requester skips it. `has_state = false`: the peer itself started empty.
 
 When the returning node trusts what it pulled is the `ready_rule`:
 `both_agree` (both survivors answered with the same epoch and server, neither
 electing) or `majority` (one non-electing survivor answered; the other is
-waited for up to `majority_wait_ms`). See [recovery.md](recovery.md) for the
-choices and their measured costs.
+waited for up to `majority_wait_ms`). Under `both_agree` an unreachable peer
+keeps the requester recovering; under `majority` one ready survivor is enough.
+See [recovery.md](recovery.md) for the choices and their measured costs.
+
+With `recovery.on_start` (default), a node starts in phase `starting`: it probes both peers (`ProbeRequest`, 300 ms
+each). If one is `ready` with an epoch or requests, or `recovering`, the cluster
+has been running and the node recovers as above before participating (a cold
+rejoin); otherwise it becomes `ready` with empty tables. While `starting` it
+answers only probes, status and recovery requests. See [recovery](recovery.md).
 
 During `muted`, normal messages are discarded. During `recovering`, the node
 accepts live replicas, status queries and recovery requests (answering
 `RecoveryUnavailable`) but cannot bid or process client work. It merges the
 snapshots, reconstructs the ledger, resets old election timers, republishes
-results a survivor lacked, and only then enables normal participation. With
-`recovery.on_start`, a node that starts (or restarts after a crash) begins in
-`recovering` too. `Status` includes `phase`, `faults_injected`,
+results a survivor lacked, and only then enables normal participation.
+`Status` includes `phase`, `faults_injected`,
 `last_recovery_ms`, `last_recovery` (the breakdown of the last recovery),
 `snapshots_served` and `snapshot_lock_max_us`. State is in memory only: a node
 recovers from its peers, never from disk.

@@ -10,17 +10,20 @@
 //! failed is resent after reconnecting, and receivers apply messages
 //! idempotently. A frame accepted by the kernel just before the peer dies is
 //! lost; catching the peer up when it returns is the recovery protocol's job.
+//! When a peer pulls a recovery snapshot from us, everything still queued for
+//! it is in that snapshot, so the queue is cleared and the link reconnects at
+//! once ([`PeerLinks::reset`]).
 
 use common::config::PeerConfig;
 use common::counters::Counters;
 use common::wire::write_frame;
 use common::*;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 pub const BACKOFF_MIN: Duration = Duration::from_millis(100);
@@ -38,11 +41,21 @@ struct Control {
 
 struct Envelope {
     generation: u64,
+    /// The link's reset count when queued; older envelopes are not sent.
+    resets: u64,
     message: Message,
 }
 
+/// One peer's outbound queue, shared with its link task.
+struct Link {
+    queue: Mutex<VecDeque<Envelope>>,
+    queued: Notify,
+    resets: AtomicU64,
+    reset: Notify,
+}
+
 pub struct PeerLinks {
-    links: BTreeMap<NodeId, mpsc::Sender<Envelope>>,
+    links: BTreeMap<NodeId, Arc<Link>>,
     control: Arc<Control>,
     last_seen: Mutex<HashMap<NodeId, Instant>>,
     drops: AtomicU64,
@@ -57,12 +70,17 @@ impl PeerLinks {
             generation: AtomicU64::new(0),
         });
         for p in peers {
-            let (tx, rx) = mpsc::channel(QUEUE_LIMIT);
-            links.insert(p.id, tx);
+            let link = Arc::new(Link {
+                queue: Mutex::new(VecDeque::new()),
+                queued: Notify::new(),
+                resets: AtomicU64::new(0),
+                reset: Notify::new(),
+            });
+            links.insert(p.id, link.clone());
             tasks.push(tokio::spawn(link_task(
                 p.id,
                 p.addr.clone(),
-                rx,
+                link,
                 sent.clone(),
                 control.clone(),
             )));
@@ -80,15 +98,37 @@ impl PeerLinks {
         if !self.control.enabled.load(Ordering::SeqCst) {
             return;
         }
-        if let Some(tx) = self.links.get(&to) {
-            let envelope = Envelope {
-                generation: self.control.generation.load(Ordering::SeqCst),
-                message: msg,
-            };
-            if tx.try_send(envelope).is_err() {
+        if let Some(link) = self.links.get(&to) {
+            let mut queue = link.queue.lock().unwrap();
+            if queue.len() >= QUEUE_LIMIT {
+                drop(queue);
                 self.drops.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(peer = to, "peer queue full or closed, message dropped");
+                tracing::warn!(peer = to, "peer queue full, message dropped");
+                return;
             }
+            queue.push_back(Envelope {
+                generation: self.control.generation.load(Ordering::SeqCst),
+                resets: link.resets.load(Ordering::SeqCst),
+                message: msg,
+            });
+            drop(queue);
+            link.queued.notify_one();
+        }
+    }
+
+    /// `to` is taking a recovery snapshot from us. Call it under the state
+    /// lock that the snapshot is read under: every frame queued for `to` so
+    /// far is then covered by the snapshot, so it is dropped (with the one
+    /// being retried), and the link stops backing off and reconnects now.
+    /// Without this a peer that was down long enough to fill its queue missed
+    /// frames sent after its snapshot, while the backlog drained.
+    pub fn reset(&self, to: NodeId) {
+        if let Some(link) = self.links.get(&to) {
+            let mut queue = link.queue.lock().unwrap();
+            link.resets.fetch_add(1, Ordering::SeqCst);
+            queue.clear();
+            drop(queue);
+            link.reset.notify_one();
         }
     }
 
@@ -130,20 +170,29 @@ impl PeerLinks {
 async fn link_task(
     peer: NodeId,
     addr: String,
-    mut rx: mpsc::Receiver<Envelope>,
+    link: Arc<Link>,
     sent: Arc<Counters>,
     control: Arc<Control>,
 ) {
     let mut conn: Option<TcpStream> = None;
     let mut backoff = BACKOFF_MIN;
     let mut failures = 0u32;
-    while let Some(envelope) = rx.recv().await {
+    loop {
+        let next = link.queue.lock().unwrap().pop_front();
+        let Some(envelope) = next else {
+            link.queued.notified().await;
+            continue;
+        };
         let msg = envelope.message;
         loop {
             if !control.enabled.load(Ordering::SeqCst)
                 || envelope.generation != control.generation.load(Ordering::SeqCst)
             {
                 conn = None;
+                break;
+            }
+            if envelope.resets != link.resets.load(Ordering::SeqCst) {
+                backoff = BACKOFF_MIN;
                 break;
             }
             if conn.is_none() {
@@ -166,8 +215,12 @@ async fn link_task(
                         } else {
                             tracing::debug!(peer, %addr, %why, ?backoff, "peer still unreachable");
                         }
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(BACKOFF_MAX);
+                        tokio::select! {
+                            _ = tokio::time::sleep(backoff) => {
+                                backoff = (backoff * 2).min(BACKOFF_MAX);
+                            }
+                            _ = link.reset.notified() => backoff = BACKOFF_MIN,
+                        }
                         continue;
                     }
                 }
@@ -187,6 +240,53 @@ async fn link_task(
                     conn = None;
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::wire::read_frame;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn reset_drops_the_backlog_and_reconnects_without_waiting_out_the_backoff() {
+        // A peer address that refuses connections until we bind it again.
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .to_string();
+        let (links, tasks) = PeerLinks::spawn(
+            &[PeerConfig {
+                id: 2,
+                addr: addr.clone(),
+            }],
+            Arc::new(Counters::default()),
+        );
+        for _ in 0..QUEUE_LIMIT + 10 {
+            links.send(2, Message::StatusRequest);
+        }
+        assert!(links.drops() > 0, "a full queue drops new frames");
+
+        // Backoff has grown to 1.6 s by now; the peer comes back.
+        tokio::time::sleep(Duration::from_millis(1_600)).await;
+        let listener = TcpListener::bind(&addr).await.unwrap();
+        let before = links.drops();
+        links.reset(2);
+        links.send(2, Message::ProbeRequest);
+        assert_eq!(links.drops(), before, "the reset made room");
+
+        let (mut stream, _) = tokio::time::timeout(Duration::from_millis(500), listener.accept())
+            .await
+            .expect("reconnected before the backoff ran out")
+            .unwrap();
+        let (first, _) = read_frame(&mut stream).await.unwrap().unwrap();
+        assert!(matches!(first, Message::ProbeRequest), "{first:?}");
+        for t in tasks {
+            t.abort();
         }
     }
 }

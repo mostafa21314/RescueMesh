@@ -53,7 +53,7 @@ The elected server is muted for 3 s; 0.5 s later one survivor is killed. The ret
 | ready rule | n | recovered | recovery ms (recovered runs) | snapshots used | rounds | failed requests | tables agree (live nodes) |
 |---|---|---|---|---|---|---|---|
 | both_agree | 5 | 0/5 | – | – | – | 0 | 5/5 |
-| majority | 5 | 5/5 | 1080.4 ± 72.6 | 1.0 ± 0.0 | 10.6 ± 0.7 | 0 | 5/5 |
+| majority | 5 | 5/5 | 1110.6 ± 23.0 | 1.0 ± 0.0 | 11.0 ± 0.0 | 0 | 5/5 |
 
 ## Process crash and restart (R5)
 
@@ -61,6 +61,6 @@ The elected server's process is killed (memory lost) and restarted 5 s later; 10
 
 | on_start | n | recovery ms | results on restarted node | results on survivors | requests served by restarted node | replicate conflicts | elections after fault | tables agree |
 |---|---|---|---|---|---|---|---|---|
-| False | 5 | – | 1100 ± 0 | 3401 ± 0 | 586 ± 1 | 328 ± 8 | 2.0 ± 0.0 | 0/5 |
-| True | 5 | 13.2 ± 2.0 | 3401 ± 0 | 3401 ± 0 | 0 ± 0 | 0 ± 0 | 1.0 ± 0.0 | 5/5 |
+| False | 5 | – | 1100 ± 0 | 3401 ± 0 | 587 ± 1 | 331 ± 9 | 2.0 ± 0.0 | 0/5 |
+| True | 5 | 12.6 ± 0.7 | 3401 ± 0 | 3401 ± 0 | 0 ± 0 | 0 ± 0 | 1.0 ± 0.0 | 5/5 |
 

@@ -26,7 +26,7 @@ stage() {
   local target=$1 from=$2 ext=$3 out="dist/$1"
   rm -rf "$out"
   mkdir -p "$out"
-  cp "$from/cloud-node$ext" "$from/client$ext" "$out/"
+  cp "$from/cloud-node$ext" "$from/client$ext" "$from/stress$ext" "$out/"
   cp -R config scripts "$out/"
   cp docs/deployment.md "$out/DEPLOYMENT.md"
   {

@@ -30,6 +30,8 @@ const OPTIMISTIC_PLANS: u32 = 2;
 pub const MAX_FAILURE: Duration = Duration::from_secs(20);
 
 type Reply = mpsc::UnboundedSender<Message>;
+/// Result versions (epoch, served_by) per request in one recovery snapshot.
+type Versions = HashMap<RequestId, (Epoch, NodeId)>;
 
 struct Job {
     generation: u64,
@@ -78,6 +80,8 @@ struct Stats {
     dropped_on_step_down: AtomicU64,
     snapshots_served: AtomicU64,
     snapshot_lock_max_us: AtomicU64,
+    elections_recorded: AtomicU64,
+    election_time_us: AtomicU64,
 }
 
 struct Shared {
@@ -202,7 +206,7 @@ pub async fn start_with_listener(
         stopped: AtomicBool::new(false),
         state: Mutex::new(State {
             phase: if cfg.recovery.on_start {
-                NodePhase::Recovering
+                NodePhase::Starting
             } else {
                 NodePhase::Ready
             },
@@ -228,15 +232,43 @@ pub async fn start_with_listener(
     // No server is known at startup. The first request triggers the
     // election (trigger "no_server"), rather than boot, when peers are often
     // not up yet and the election would hear only its own bid.
-    // Temporary outages use the pull-recovery path below. With
-    // `recovery.on_start`, a (re)started process uses it too before it serves;
-    // without it, a restarted node starts Ready and empty (docs/recovery.md, R5).
+    // With `recovery.on_start` (default) the node first decides whether it is
+    // rejoining a running cluster (below); without it, a restarted node starts
+    // Ready and empty, the original behaviour (docs/recovery.md, R5).
     // TODO(discovery): peers come from the config file for now.
     tasks.push(tokio::spawn(accept_loop(shared.clone(), listener)));
     tasks.push(tokio::spawn(completion_loop(shared.clone(), done_rx)));
     tasks.push(tokio::spawn(sweep_loop(shared.clone())));
     if shared.cfg.recovery.on_start {
-        tasks.push(tokio::spawn(recover(shared.clone(), Cause::Start)));
+        // Cold start. While `Starting` the node answers probes but takes no part.
+        // If a peer shows the cluster has been running (a restart after a crash),
+        // this node recovers like a returning muted node before it bids or
+        // serves; otherwise it starts empty with the rest of the cluster. A peer
+        // that does not answer within STARTUP_PROBE counts as not running.
+        let mut probes = JoinSet::new();
+        for p in &shared.cfg.peers {
+            let addr = p.addr.clone();
+            probes.spawn(async move { crate::recovery::probe(&addr).await.ok() });
+        }
+        let mut history = Vec::new();
+        while let Some(answer) = probes.join_next().await {
+            if let Ok(Some(p)) = answer {
+                if crate::recovery::has_history(&p) {
+                    history.push(p.node_id);
+                }
+            }
+        }
+        if history.is_empty() {
+            shared.state.lock().unwrap().phase = NodePhase::Ready;
+        } else {
+            shared.state.lock().unwrap().phase = NodePhase::Recovering;
+            tracing::info!(
+                node = shared.cfg.node_id,
+                running_peers = ?history,
+                "peers hold state: recovering before participating (cold rejoin)"
+            );
+            tasks.push(tokio::spawn(recover(shared.clone(), Cause::Start)));
+        }
     }
     tracing::info!(
         node = shared.cfg.node_id,
@@ -421,7 +453,6 @@ async fn recover(shared: Arc<Shared>, cause: Cause) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     report.drain_ms = started.elapsed().as_millis() as u64;
-    let boot_deadline = started + Duration::from_millis(rp.boot_wait_ms);
     loop {
         if shared.stopped.load(Ordering::SeqCst) {
             return;
@@ -441,25 +472,16 @@ async fn recover(shared: Arc<Shared>, cause: Cause) {
         let round = transfer_round(&shared, since_ms).await;
         report.fetch_ms = fetch_started.elapsed().as_millis() as u64;
 
-        let view = accepted_view(&shared, &round);
-        // Process start with no Ready peer: either the whole cluster is
-        // starting (every peer answered, none has state) or no survivor is
-        // reachable for boot_wait_ms. Nobody holds state we could fetch.
-        let bootstrap = cause == Cause::Start
-            && round.snapshots.is_empty()
-            && ((round.unavailable_empty == shared.cfg.peers.len())
-                || Instant::now() >= boot_deadline);
-        if view.is_none() && !bootstrap {
+        let Some((epoch, server)) = accepted_view(&shared, &round) else {
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
-        }
+        };
 
         let install_started = Instant::now();
         let mut st = shared.state.lock().unwrap();
         if shared.stopped.load(Ordering::SeqCst) {
             return;
         }
-        let (epoch, server) = view.unwrap_or((st.core.epoch(), None));
         // A newer live replica can overtake either snapshot transfer.
         // Never install an older role view over that observed epoch.
         if epoch < st.recovery_epoch {
@@ -480,7 +502,7 @@ async fn recover(shared: Arc<Shared>, cause: Cause) {
             report.snapshots_used += 1;
             report.records_received += snap.records.len() as u64;
             report.bytes_received += snap.bytes;
-            let versions: HashMap<RequestId, (Epoch, NodeId)> = snap
+            let versions: Versions = snap
                 .records
                 .iter()
                 .filter_map(|r| r.result.as_ref().map(|x| (r.request_id, (x.epoch, x.served_by))))
@@ -524,7 +546,6 @@ async fn recover(shared: Arc<Shared>, cause: Cause) {
         if st.core.serving() {
             run_actions(&shared, &mut st, vec![Action::BecameServer]);
         }
-        report.bootstrap = view.is_none();
         report.install_ms = install_started.elapsed().as_millis() as u64;
         report.total_ms = started.elapsed().as_millis() as u64;
         st.last_recovery_ms = Some(report.total_ms);
@@ -540,7 +561,6 @@ async fn recover(shared: Arc<Shared>, cause: Cause) {
             bytes = report.bytes_received,
             new_results = report.new_results,
             republished = report.republished,
-            bootstrap = report.bootstrap,
             results = st.tables.len().1,
             epoch = st.core.epoch(),
             "recovery complete; node ready"
@@ -551,7 +571,7 @@ async fn recover(shared: Arc<Shared>, cause: Cause) {
 }
 
 /// Answers a returning peer's RecoveryRequest on its connection.
-fn serve_snapshot(shared: &Shared, since_ms: Option<u64>, reply: &Reply) {
+fn serve_snapshot(shared: &Shared, node_id: NodeId, since_ms: Option<u64>, reply: &Reply) {
     // Each hold is timed from acquiring the lock to releasing it.
     let lock = || {
         let st = shared.state.lock().unwrap();
@@ -570,6 +590,11 @@ fn serve_snapshot(shared: &Shared, since_ms: Option<u64>, reply: &Reply) {
         });
         return;
     }
+    // Under the same lock hold as the copy (or, chunked, as the key list):
+    // every frame queued for the peer so far is covered by the snapshot, so
+    // the peer's link drops it and reconnects at once; frames queued from now
+    // on reach it (Marwan's link reset, design log November 3).
+    shared.peers.reset(node_id);
     let count = match shared.cfg.recovery.snapshot {
         SnapshotBuild::Locked => {
             // Build and queue the whole snapshot in one hold of the lock.
@@ -730,10 +755,13 @@ fn handle(shared: &Arc<Shared>, msg: Message, reply: &Reply) {
     if phase == NodePhase::Muted {
         return;
     }
-    if phase == NodePhase::Recovering
+    if matches!(phase, NodePhase::Recovering | NodePhase::Starting)
         && !matches!(
             msg,
-            Message::Replicate { .. } | Message::StatusRequest | Message::RecoveryRequest { .. }
+            Message::Replicate { .. }
+                | Message::StatusRequest
+                | Message::ProbeRequest
+                | Message::RecoveryRequest { .. }
         )
     {
         return;
@@ -753,7 +781,7 @@ fn handle(shared: &Arc<Shared>, msg: Message, reply: &Reply) {
         }
         Message::RecoveryRequest { node_id, since_ms } => {
             if shared.cfg.peers.iter().any(|p| p.id == node_id) {
-                serve_snapshot(shared, since_ms, reply);
+                serve_snapshot(shared, node_id, since_ms, reply);
             }
         }
         Message::SubmitIncident {
@@ -810,6 +838,9 @@ fn handle(shared: &Arc<Shared>, msg: Message, reply: &Reply) {
         }
         Message::StatusRequest => {
             let _ = reply.send(Message::Status(status(shared)));
+        }
+        Message::ProbeRequest => {
+            let _ = reply.send(Message::Probe(probe(shared)));
         }
         other => tracing::debug!(kind = other.kind(), "ignoring message not meant for a node"),
     }
@@ -964,7 +995,17 @@ fn run_actions(shared: &Arc<Shared>, st: &mut State, actions: Vec<Action>) {
                     }
                 }
             }
-            Action::Log(rec) => log_election(shared.cfg.node_id, &rec),
+            Action::Log(rec) => {
+                shared
+                    .stats
+                    .elections_recorded
+                    .fetch_add(1, Ordering::Relaxed);
+                shared
+                    .stats
+                    .election_time_us
+                    .fetch_add(rec.duration.as_micros() as u64, Ordering::Relaxed);
+                log_election(shared.cfg.node_id, &rec);
+            }
             Action::Split {
                 epoch,
                 other,
@@ -976,12 +1017,15 @@ fn run_actions(shared: &Arc<Shared>, st: &mut State, actions: Vec<Action>) {
                 server,
                 "two servers in one epoch (split winners): lower node_id keeps the role"
             ),
+            // Debug, like the other per-request lines: under overload this
+            // fired ~300 000 times per node in one stress sweep. The count is
+            // in Status (`suppressed_triggers`).
             Action::Suppressed {
                 request_id,
                 epoch,
                 server,
                 held_for,
-            } => tracing::info!(
+            } => tracing::debug!(
                 node = shared.cfg.node_id,
                 %request_id,
                 epoch,
@@ -1191,6 +1235,7 @@ async fn sweep_loop(shared: Arc<Shared>) {
 
 fn status(shared: &Shared) -> NodeStatus {
     let load = shared.pool.load();
+    let load_score = score(shared);
     let st = shared.state.lock().unwrap();
     let (requests, results) = st.tables.len();
     let c = st.core.counters;
@@ -1226,5 +1271,33 @@ fn status(shared: &Shared) -> NodeStatus {
         peer_last_seen_ms: shared.peers.last_seen_ms(),
         sent: shared.stats.sent.snapshot(),
         received: shared.stats.received.snapshot(),
+        elections_recorded: shared.stats.elections_recorded.load(Ordering::Relaxed),
+        election_time_us: shared.stats.election_time_us.load(Ordering::Relaxed),
+        cpu_load: shared.load.cpu(),
+        rss_bytes: shared.load.rss_bytes(),
+        load_score,
+    }
+}
+
+/// `status` without the results digest or traffic maps: cheap enough to poll
+/// during a stress run.
+fn probe(shared: &Shared) -> NodeProbe {
+    let load = shared.pool.load();
+    let load_score = score(shared);
+    let st = shared.state.lock().unwrap();
+    let (requests, results) = st.tables.len();
+    NodeProbe {
+        node_id: shared.cfg.node_id,
+        phase: st.phase,
+        epoch: st.core.epoch(),
+        server: st.core.server(),
+        queue_len: load.queued,
+        running: load.running,
+        pending_cost: load.pending_cost,
+        load_score,
+        cpu_load: shared.load.cpu(),
+        rss_bytes: shared.load.rss_bytes(),
+        requests,
+        results,
     }
 }

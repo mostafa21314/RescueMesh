@@ -15,6 +15,7 @@ and conflict resolution are our code.
 | `tracing`, `tracing-subscriber` | Structured logs, `RUST_LOG` filtering | |
 | `anyhow`, `thiserror` | Error plumbing | |
 | `sysinfo` | Reading CPU usage (whole machine or this process) for the load score's CPU term | Sampling schedule, EWMA, normalization (ours) |
+| `matplotlib` (Python, outside the Rust build) | Drawing the stress plots (`scripts/plot_stress.py`) | Any statistic: the harness computes them in Rust |
 | `tokio-util` | Allowed, not used: its length-delimited codec needs `futures` stream/sink extension traits, which aren't on the allowed list, and the 4-byte length prefix takes 30 lines (`common::wire`) | |
 
 ## Ours
@@ -36,3 +37,4 @@ and conflict resolution are our code.
 | Load score: CPU sampler thread, EWMAs, normalization, policies, `--burn-threads` | `cloud-node::load` |
 | Election: triggers, bids, 2-of-3 decision, incumbent exclusion, epochs and step-down, takeover, split-winner resolution, degraded mode, per-request mode | `cloud-node::election` (sans-IO), wired in `cloud-node::node` |
 | One-result-per-request rule and ledger release for superseded results | `cloud-node::tables`, `cloud-node::ledger` |
+| Stress harness: process sweep, sampler, fault timing, metrics, percentiles, Student-t confidence intervals, Jain's index | `client::stress`, `client::stats`, `client` bin `stress` |

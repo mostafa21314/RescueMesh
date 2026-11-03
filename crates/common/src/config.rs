@@ -184,17 +184,15 @@ pub struct RecoveryParams {
     pub transfer: Transfer,
     pub snapshot: SnapshotBuild,
     pub ready_rule: ReadyRule,
-    /// Recover from the peers when the process starts, not only after a mute
-    /// (docs/recovery.md, R5). Off: a restarted node starts Ready and empty.
+    /// At process start, probe the peers and, if the cluster has been running,
+    /// recover from them before taking part (docs/recovery.md, R5). Off: a
+    /// restarted node starts Ready and empty.
     pub on_start: bool,
     /// Delta transfer: extra history sent before the outage started, to cover
     /// replicas that were still in flight when it began.
     pub delta_margin_ms: u64,
     /// Majority rule: how long to wait for the second survivor after the first.
     pub majority_wait_ms: u64,
-    /// Process start: if no peer is Ready for this long, start Ready and
-    /// empty (the whole cluster is starting, or no survivor is reachable).
-    pub boot_wait_ms: u64,
 }
 
 impl Default for RecoveryParams {
@@ -206,7 +204,6 @@ impl Default for RecoveryParams {
             on_start: true,
             delta_margin_ms: 2000,
             majority_wait_ms: 500,
-            boot_wait_ms: 2000,
         }
     }
 }

@@ -13,6 +13,9 @@ pub enum NodePhase {
     Ready,
     Muted,
     Recovering,
+    /// Just started, asking its peers whether the cluster already holds state
+    /// (then it recovers before participating) or is starting too.
+    Starting,
 }
 
 /// One retained request and its optional completed result, used during rejoin.
@@ -57,8 +60,6 @@ pub struct RecoveryReport {
     pub new_results: u64,
     /// Results republished to a survivor that lacked them.
     pub republished: u64,
-    /// Started Ready and empty because no peer was Ready (process start only).
-    pub bootstrap: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -146,17 +147,25 @@ pub enum Message {
         electing: bool,
         records: usize,
     },
-    /// Survivor → returning node: not Ready, so it has no trustworthy
-    /// snapshot. `has_state` is false for a process that just started empty.
+    /// Answer to `RecoveryRequest` from a node that is starting or recovering
+    /// itself: it has no authoritative state to give, so the requester skips
+    /// it. `has_state` is false for a process that just started empty.
     RecoveryUnavailable {
         node_id: NodeId,
         phase: NodePhase,
+        #[serde(default)]
         has_state: bool,
     },
     /// Diagnostic: client → node. Not part of request processing.
     StatusRequest,
     /// Diagnostic: node → client.
     Status(NodeStatus),
+    /// Diagnostic: client → node. A cheap load sample for the stress
+    /// harness's sampler: unlike `StatusRequest` it skips the results digest,
+    /// which serializes the whole results table under the state lock.
+    ProbeRequest,
+    /// Diagnostic: node → client.
+    Probe(NodeProbe),
 }
 
 impl Message {
@@ -170,6 +179,8 @@ impl Message {
             Message::ElectBid { .. } => "ElectBid",
             Message::StatusRequest => "StatusRequest",
             Message::Status(_) => "Status",
+            Message::ProbeRequest => "ProbeRequest",
+            Message::Probe(_) => "Probe",
             Message::InjectFailure { .. } => "InjectFailure",
             Message::FailureAccepted { .. } => "FailureAccepted",
             Message::FailureRejected { .. } => "FailureRejected",
@@ -233,6 +244,36 @@ pub struct NodeStatus {
     /// Message type → (count, bytes), as sent and received by this node.
     pub sent: BTreeMap<String, (u64, u64)>,
     pub received: BTreeMap<String, (u64, u64)>,
+    /// Elections this node logged (any outcome) and their summed duration.
+    #[serde(default)]
+    pub elections_recorded: u64,
+    #[serde(default)]
+    pub election_time_us: u64,
+    /// CPU use in [0, 1] as the load score sees it (EWMA), this node's
+    /// resident memory, and its current load score (milli-units).
+    #[serde(default)]
+    pub cpu_load: f64,
+    #[serde(default)]
+    pub rss_bytes: u64,
+    #[serde(default)]
+    pub load_score: u32,
+}
+
+/// Answer to `ProbeRequest`: the parts of `NodeStatus` that are cheap to read.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NodeProbe {
+    pub node_id: NodeId,
+    pub phase: NodePhase,
+    pub epoch: Epoch,
+    pub server: Option<NodeId>,
+    pub queue_len: usize,
+    pub running: usize,
+    pub pending_cost: u64,
+    pub load_score: u32,
+    pub cpu_load: f64,
+    pub rss_bytes: u64,
+    pub requests: usize,
+    pub results: usize,
 }
 
 #[cfg(test)]
@@ -273,6 +314,11 @@ mod tests {
             peer_last_seen_ms: vec![(2, Some(5)), (3, None)],
             sent: BTreeMap::from([("Replicate".to_string(), (6, 600))]),
             received: BTreeMap::new(),
+            elections_recorded: 1,
+            election_time_us: 101_000,
+            cpu_load: 0.25,
+            rss_bytes: 1 << 20,
+            load_score: 120,
         };
         let msg = Message::Status(st);
         let back: Message = serde_json::from_slice(&serde_json::to_vec(&msg).unwrap()).unwrap();

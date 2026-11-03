@@ -323,8 +323,9 @@ scores and latencies aren't independent. Runs on two machines are rehearsals.
 Run the client from a laptop (or a lab PC). Keep the node windows visible, since
 the election lines are in their logs. Before each test, **restart all three
 nodes** (Ctrl+C, then `start_node` again) so each starts from empty tables.
-Restarting only one node isn't supported yet: a restarted node has lost its
-tables and can win an election while stale (design log, "Known limitations").
+Restarting a single node of a running cluster is a rejoin, not a fresh start: it
+copies the other two nodes' state before it takes part
+([recovery.md](recovery.md)).
 
 Commands below are for macOS/Linux; on Windows use `.\client.exe` and
 `config\client.toml`.
@@ -416,6 +417,48 @@ Expected:
   or more attempts. The rest take 1 attempt. `served_by {3: 20}`. The CSV's
   `degraded` column is `true`. The epoch doesn't change while degraded.
 - `check_cluster`: nodes 1 and 2 `refused`; node 3 `degraded true`.
+
+### 5. Stress sweeps
+
+Restart all three nodes, then from one client machine (the harness starts the
+client processes there):
+
+```bash
+stress --config config/client.toml --clients 1,2,4,8,16,32,48,64 --reps 5 \
+  --requests 100 --rate 10 --out lab-load --label "lab: nodes on A/B, clients on <machine>"
+```
+
+Past the knee (about 64 processes locally) a run can collapse into an election
+cycle, and the requests it abandons stay in the nodes' tables for 30 minutes and
+slow every later run ([stress-testing.md](stress-testing.md#overload)). Run the
+overloaded levels (80, 96, 128) last, or restart the nodes before each run:
+`--before-run` takes any command, e.g. one that waits for you,
+`--before-run 'read -p "restart the nodes, then press Enter " x < /dev/tty'`.
+
+Restart all three nodes again, then the fault sweep (the elected server muted
+for 10 s in every run):
+
+```bash
+stress --config config/client.toml --clients 4,16,32,48 --reps 5 --requests 250 --rate 10 \
+  --fault-ms 10000 --fault-at-ms 8000 --out lab-fault --label "lab: ..."
+```
+
+The local restart sweep (`--fault-cmd`, a kill and cold restart of the server)
+needs the harness to restart a node on another machine; in the lab, test 6 does
+it by hand.
+
+Each prints one line per run and writes `summary.md` and CSVs into its `--out`
+folder. Method, metrics and the local results:
+[stress-testing.md](stress-testing.md).
+
+### 6. Restart one node (cold rejoin)
+
+While a `client --count 600 --rate 30` run is going, stop one node (Ctrl+C) and
+start it again with `start_node` 5–10 s later. Expected in its log:
+`peers hold state: recovering before participating (cold rejoin)`, then
+`recovery complete; node ready ... sources=[..]`. `check_cluster` afterwards:
+phase `Ready` everywhere and the three digests equal. See
+[recovery.md](recovery.md).
 
 ## Troubleshooting
 

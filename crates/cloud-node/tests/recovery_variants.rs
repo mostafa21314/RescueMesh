@@ -153,17 +153,13 @@ async fn majority_rule_recovers_with_one_survivor_down_both_agree_waits() {
 async fn restarted_process_recovers_from_peers_before_serving() {
     limit(async {
         let on_start = |cfg: &mut NodeConfig| cfg.recovery.on_start = true;
-        // The whole cluster starts together: nobody has state, so each node
-        // bootstraps as soon as both peers say so.
+        // The whole cluster starts together: the startup probe finds no peer
+        // with history, so every node starts Ready without recovering.
         let (mut nodes, addrs) = start_cluster_with(on_start).await;
         for n in &nodes {
             ready(n, Duration::from_secs(5)).await;
+            assert!(n.status().last_recovery.is_none());
         }
-        // At least the first one bootstraps; later ones may instead copy the
-        // (empty) state of a node that already did.
-        assert!(nodes
-            .iter()
-            .any(|n| n.status().last_recovery.unwrap().bootstrap));
         let client = Client::new(client_cfg(&addrs, 500, 8));
         let mut rng = Rng::new(21);
         let server = client
@@ -186,7 +182,6 @@ async fn restarted_process_recovers_from_peers_before_serving() {
         ready(&back, Duration::from_secs(5)).await;
         let r = back.status().last_recovery.unwrap();
         assert_eq!(r.cause, "start");
-        assert!(!r.bootstrap);
         assert_eq!(r.new_results, 25);
         // It adopted the current role view instead of forcing an election.
         assert_eq!(back.status().epoch, epoch);

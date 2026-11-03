@@ -5,11 +5,13 @@ back, makes its state consistent with its peers, and only then takes part again.
 It covers what state must be recovered and how, the protocol, every decision
 taken with the alternatives we tried, and the measurements that justify them.
 
-The first version of recovery after a temporary failure was merged in PR 38
-(`feature/temporary-failure-recovery`). This document builds on it: each of its
-choices became a switch in the `[recovery]` config section, alternatives were
-implemented next to it, and the experiments in [Results](#results) compare them
-on the same workloads. The defaults chosen from the measurements are in
+Who built what: recovery after a temporary failure (mute, pull snapshots, merge,
+rebuild the ledger) came with PR #38 (`feature/temporary-failure-recovery`).
+Recovery after a crash and restart (the startup probe and `Starting` phase) and
+the survivor's link reset came with PR #39 (`phase1/recovery-and-stress`). The
+study in this document (`phase1/recovery-study`) made each recovery choice a
+switch in the `[recovery]` config section, implemented an alternative next to
+each, and compared them on the same workloads ([Results](#results)). The defaults chosen from the measurements are in
 [Final choices](#final-choices): delta transfer, chunked snapshots, the
 majority ready rule, and recovery on process start.
 
@@ -35,7 +37,11 @@ and recovery"):
 | Fault | How it is produced | What the node keeps |
 |---|---|---|
 | **Temporary failure (mute)**: the spec's "ignore communication" | `InjectFailure {duration_ms}` (1–20,000 ms). The node refuses connections, drops every inbound frame and stops its peer links. | Everything in memory, but stale: it missed every message sent during the outage. |
-| **Crash and restart** | The process is killed (`SIGKILL`) and started again. | Nothing. Tables and ledger are in memory only. |
+| **Crash and restart** | The process is killed (`SIGKILL`, Ctrl+C, power) and started again (`scripts/restart_node.sh N MS` locally). | Nothing. Tables and ledger are in memory only. |
+
+Path back: mute → `Muted` → `Recovering` → `Ready`; restart → `Starting` →
+`Recovering` → `Ready` (or `Starting` → `Ready` when the whole cluster is
+starting).
 
 Assumed: one node fails at a time (the spec's scenario); messages are not
 forged; clocks may differ between machines (nothing below compares timestamps
@@ -52,6 +58,7 @@ across machines).
 | **Election state** | open elections, own bids, tenure | **Reset** | Elections that ran while the node was away are over; old timers are invalidated by the outage generation. |
 | **Planner queue and in-flight jobs** | work the node had accepted | **Discarded** | The survivors' new server took those requests over (they are in its request table); finishing them here would only produce late duplicates. |
 | **Reply channels** | which client connection waits for which request | **Discarded** | The clients have retried on their other connections. |
+| **Survivors' outbound frames to the node** | `Replicate`s and bids queued while it was away (up to 4,096 per link) | **Discarded** when the snapshot is taken | Everything queued before the snapshot is in it; the survivor clears that link and reconnects at once (PR #39), so frames sent after the snapshot are not stuck behind, or dropped behind, a stale backlog. |
 
 Nothing is **replayed**: there is no operation log. This is the central design
 point. Results merge by a deterministic rule (higher epoch, then lower
@@ -69,12 +76,13 @@ correct; an ordered log would be needed only if the merge were not commutative.
 stateDiagram-v2
     direction LR
     [*] --> Ready: start (on_start = false)
-    [*] --> Recovering: start (on_start = true)
+    [*] --> Starting: start (on_start = true)
+    Starting --> Ready: no peer has history<br/>(whole cluster starting)
+    Starting --> Recovering: a peer is Ready with history,<br/>or Recovering (a restart)
     Ready --> Muted: InjectFailure(d)
     Muted --> Recovering: d elapsed
     Recovering --> Recovering: round rejected<br/>(retry after 100 ms)
     Recovering --> Ready: snapshots accepted by ready_rule,<br/>merged, ledger rebuilt
-    Recovering --> Ready: process start and no peer has state<br/>(bootstrap)
 
     note right of Muted
         refuses connections, drops all frames,
@@ -134,8 +142,10 @@ sequenceDiagram
 3. **Pull.** It opens a dedicated connection to each peer and sends
    `RecoveryRequest`. A Ready peer answers with its records in chunks of 64 and a
    trailer carrying the record count and its role view (epoch, server, whether
-   it is electing). A peer that is not Ready answers `RecoveryUnavailable` at
-   once. Each transfer has a 10 s limit; a short or interrupted transfer is
+   it is electing). While it takes the snapshot (under its state lock) the peer
+   also clears its outbound queue to this node and wakes that link (PR #39). A
+   peer that is not Ready answers `RecoveryUnavailable` at once and is skipped.
+   Each transfer has a 10 s limit; a short or interrupted transfer is
    discarded.
 4. **Accept or retry.** The round is accepted if it meets the `ready_rule`
    (section 4, R4); otherwise the node waits 100 ms and pulls again. If a live
@@ -150,6 +160,22 @@ sequenceDiagram
    silent, whose replica never left.
 7. **Ready.** Peer links resume. If the adopted role view names this node as the
    server, it takes over not-completed requests like any new server.
+
+### The startup decision (crash and restart, PR #39)
+
+With `on_start` (the default) a process starts in `Starting`: it answers
+`ProbeRequest`, `StatusRequest` and `RecoveryRequest` (with
+`RecoveryUnavailable`) and nothing else, so it cannot bid or take client work.
+It probes both peers (300 ms each, in parallel):
+
+- a peer is `Ready` and has seen an election or a request, or a peer is itself
+  `Recovering` → the cluster has been running: go to `Recovering` and recover
+  as above, always with a **full** transfer (its memory is empty);
+- otherwise (peers unreachable, starting, or ready but empty) → the whole
+  cluster is starting: go to `Ready` with empty tables.
+
+So starting all nodes gives a fresh cluster, while restarting one node of a
+running cluster gives a rejoin.
 
 ### Requests in flight at the time of the failure (spec point 1)
 
@@ -256,27 +282,29 @@ the `[recovery]` key that switches it is given.
   quorum as elections, D19); the second is waited for up to
   `majority_wait_ms` (500 ms) and merged if it arrives; the highest epoch seen
   wins.
-- **Choice:** see [Final choices](#final-choices).
+- **Choice:** see [Final choices](#final-choices). (a) was PR #38's rule, and
+  PR #39 kept it for restarts ("an unreachable peer still blocks recovery");
+  the measurements below are why the default changed to (b). Both rules skip a
+  peer that answers `RecoveryUnavailable` (it is starting or recovering
+  itself), so two nodes restarted together recover one after the other.
 - **Trade-off:** (a) never resumes on one survivor's view, but cannot finish if
   a second node is down or unreachable: the node stays Recovering, serving
   nothing, until both are back. (b) finishes with one survivor; a result that
   only the missing survivor holds is not lost but arrives later, when that
   survivor recovers and republishes it (step 6), and the result rule keeps
   every node's choice the same. Both rules exclude a survivor that is electing.
-- **Bug found while testing:** with `on_start`, when all three processes start
-  together the first one to bootstrap becomes Ready; each of the other two then
-  sees one Ready peer and one "starting, empty" peer, and under (a) each waits
-  for the other's agreement forever. Fix: a peer that answers
-  `RecoveryUnavailable {has_state: false}` holds nothing to agree on and is left
-  out of the count (test `restarted_process_recovers_from_peers_before_serving`).
 
 ### R5. A restarted process: start Ready and empty vs. recover first (`on_start`)
-- **Alternatives:** (a) a (re)started process is Ready at once with empty tables
-  (PR 38: "cold restart is not claimed"); (b) it starts Recovering, pulls a full
-  snapshot, and only then serves; if no peer is Ready (the whole cluster is
-  starting, or nobody is reachable for `boot_wait_ms` = 2 s), it bootstraps
-  Ready and empty, because nobody holds state to fetch.
-- **Choice:** see [Final choices](#final-choices).
+- **Alternatives** (PR #39's design log entry, plus this study's first
+  attempt): (a) a (re)started process is Ready at once with empty tables (PR
+  #38); (b) every node recovers at startup: a cluster starting together waits
+  on each other (this study's first version hit exactly that deadlock under
+  both_agree, and needed a 2 s fallback timer); (c) an operator flag on the
+  restarted node: easy to forget; (d) a disk log replayed at start: the project
+  keeps state in memory, and the peers hold it anyway; (e) probe the peers at
+  startup and recover only if the cluster has been running.
+- **Choice:** (e), PR #39's startup probe ([above](#the-startup-decision-crash-and-restart-pr-39)).
+  `on_start = false` keeps (a) available so the two can be measured.
 - **Why (a) is harmful (measured, section Results):** the restarted node knows
   no server and epoch 0. The first request it sees carries the client's newer
   epoch, which it adopts with the server unknown (D30), triggering an election
@@ -285,8 +313,10 @@ the `[recovery]` key that switches it is given.
   ledger, handing out responders the others already assigned (replicate
   conflicts), and its results table never regains what was served before the
   crash, so the tables never agree again.
+- **Trade-off of (e):** a node that hears from no peer within 300 ms starts
+  empty; under a partition at startup that is wrong, and is not handled.
 - **Demo relevance:** the spec's failure is a mute, but someone closing a node
-  window during the demo is a crash; (b) makes that recover too.
+  window during the demo is a crash; (e) makes that recover too.
 
 ### R6. Rebuild the ledger rather than copy it
 - **Alternatives:** ship the ledger in the snapshot; rebuild it from the merged
@@ -308,13 +338,16 @@ the `[recovery]` key that switches it is given.
 ### R8. Answer "not ready" instead of staying silent
 - **Before:** a peer that was not Ready ignored a `RecoveryRequest`, so the
   requester waited out the full 10 s transfer limit before retrying.
-- **Now:** it answers `RecoveryUnavailable {phase, has_state}` at once. This also
-  provides the `has_state` signal R4 and R5 need.
+- **Now:** it answers `RecoveryUnavailable {phase, has_state}` at once (PR #39
+  added the same reply independently; the merged message carries both
+  fields). Under both_agree, a peer that is starting empty is not waited for.
 
 ### R9. Keep the results digest incrementally (measurement hygiene)
 - **Before:** every `Status` query serialized the whole results table to compute
   its digest, under the state lock (≈ tens of ms at 20,000 entries), so polling
-  a node during an experiment slowed the very node being measured.
+  a node during an experiment slowed the very node being measured. (PR #39
+  solved the same problem for its stress sampler with a separate, cheap
+  `ProbeRequest`; both are kept.)
 - **Now:** the digest (a wrapping sum of per-entry hashes) is updated on every
   store, replace and sweep. Unit test
   `incremental_digest_matches_a_full_recount`.
@@ -473,13 +506,18 @@ accept, record or answer any request.
 
 ### R4: a second failure during recovery
 
+(R4 and R5 were re-measured on the code after merging PR #39, whose startup
+probe replaced this study's first start-up path; the numbers barely moved:
+restart recovery 13.2 ± 2.0 → 12.6 ± 0.7 ms, majority 1,080 ± 73 →
+1,111 ± 23 ms, every pass/fail outcome identical.)
+
 The elected server is muted for 3 s and one survivor is killed 0.5 s later, so
 when the first node returns only one survivor is up.
 
 | ready rule | recovered within 15 s | recovery ms | snapshots used |
 |---|---|---|---|
 | both_agree | **0 / 5** | – | – |
-| majority | **5 / 5** | 1,080 ± 73 | 1 |
+| majority | **5 / 5** | 1,111 ± 23 | 1 |
 
 - **both_agree never recovers** with a survivor down: the returning node stays
   Recovering (serving nothing) until both peers are back. The cluster runs on
@@ -498,16 +536,16 @@ The elected server's process is killed (memory lost) and restarted after 5 s;
 
 | on_start | results on restarted node | requests it served after restart | replicate conflicts | elections after fault | tables agree |
 |---|---|---|---|---|---|
-| false (original) | 1,100 of 3,401 | **586** | **328** | 2 | **0 / 5** |
+| false (original) | 1,100 of 3,401 | **587** | **331** | 2 | **0 / 5** |
 | true | 3,401 of 3,401 | 0 | 0 | 1 | 5 / 5 |
 
 - **Without recovery on start the restarted node does real damage.** It
   adopted the clients' epoch with no server, forced a second election, won it
-  (its empty queue gives the lowest load score), and served 586 requests from an
+  (its empty queue gives the lowest load score), and served 587 requests from an
   empty ledger. Its plans assigned responders the others had already assigned:
-  **328 replicate conflicts** per run. Its results table never got back what was
+  **331 replicate conflicts** per run. Its results table never got back what was
   served before the crash (1,100 of 3,401), so **the tables never agreed again.**
-- **With `on_start` it pulled the full table in 13 ± 2 ms**, adopted the current
+- **With `on_start` it pulled the full table in 12.6 ± 0.7 ms**, adopted the current
   server without an election, served nothing until then, and every run ended
   consistent.
 
@@ -519,10 +557,9 @@ The elected server's process is killed (memory lost) and restarted after 5 s;
 | `transfer` | **delta** | 49× less data and 9× faster at 60,000 entries; cost follows what was missed, not the table size (R2) | relies on memory surviving the outage (a restart still pulls everything) and on the 2 s margin |
 | `snapshot` | **chunked** | longest survivor lock hold 7–8× shorter, recovery time unchanged (R3) | a snapshot is assembled across several lock holds, which the result rule makes safe |
 | `ready_rule` | **majority** | recovers 5/5 with a second node down, where both_agree recovers 0/5 (R4); same 2-of-3 quorum as elections (D19) | a result held only by the missing survivor arrives when that survivor recovers and republishes it, not at once |
-| `on_start` | **true** | removes the 586 empty-state answers, 328 conflicts and the extra election after a crash; tables converge (R5) | a node that starts while **no** peer is reachable waits `boot_wait_ms` (2 s) before serving alone |
+| `on_start` | **true** | removes the 587 empty-state answers, 331 conflicts and the extra election after a crash; tables converge (R5) | every start waits for a 300 ms probe; a node that hears from no peer in that time starts empty (wrong only under a partition at startup) |
 | `delta_margin_ms` | 2000 | replication is sent within milliseconds of a result; 2 s is ≥ 2 orders of magnitude of headroom | slightly more data per delta (≈ 2 s × rate) |
 | `majority_wait_ms` | 500 | both snapshots normally arrive within milliseconds of each other | — |
-| `boot_wait_ms` | 2000 | long enough for peers started together to answer | see `on_start` |
 
 `full` / `locked` / `both_agree` / `on_start = false` reproduce the original
 protocol, so every comparison above can be re-run:
@@ -537,10 +574,32 @@ protocol, so every comparison above can be re-run:
   repeated on the six-machine setup.
 - **One failure at a time** (the spec's scenario). Two simultaneous failures are
   handled only as far as R4 describes; a network partition is not modelled.
-- **Memory only.** A node that crashes while both peers are also down loses
-  everything it held that they do not; there is no disk persistence.
+- **Memory only.** A node that crashes loses results it computed but had not
+  yet replicated (design-log limitation c): its client got the answer, the
+  cluster did not; a retry is recomputed and may get a different plan.
+  Restarting all three nodes loses everything (that is a fresh cluster).
+- **A recovering node does no client work.** Clients keep using the other two
+  through the same fan-out; it adds no capacity until Ready.
 - **Delta margin.** Delta transfer assumes replicas in flight at the moment of
   the outage arrive within `delta_margin_ms` (2 s). A peer link backlog older
   than that would be missed by delta (full transfer would still get it).
 - **Snapshot is a per-survivor cut**, not an atomic cluster snapshot; results
   finished during the transfer arrive by live replication afterwards.
+
+## Tests
+
+| Test | What it shows |
+|---|---|
+| `tests/temporary_failure.rs` (PR #38) | 20 s outage of the serving node under load; repeated follower outages; staying recovering when a survivor is gone (both_agree) |
+| `tests/cold_restart.rs::restarted_server_rebuilds_state_from_peers_before_participating` (PR #39) | the server is restarted after the survivors served 20 more requests: it never bids while recovering, ends with the survivors' epoch, server, results and ledger, then serves and converges |
+| `tests/cold_restart.rs::two_restarted_nodes_wait_for_a_ready_peer_and_skip_each_other` (PR #39, both_agree) | node 1 restarted while node 3 is down waits; node 3 recovers from node 2, skipping node 1 (`RecoveryUnavailable`); then node 1 recovers |
+| `tests/cold_restart.rs::majority_rule_restarts_from_the_one_ready_peer` | the same situation under majority: node 1 recovers from node 2 alone |
+| `tests/recovery_variants.rs::delta_transfer_and_chunked_snapshots_reach_the_same_state_with_less_data` | delta + chunked end with the same tables and ledgers as the survivors, from fewer records |
+| `tests/recovery_variants.rs::majority_rule_recovers_with_one_survivor_down_both_agree_waits` | the R4 trade-off after a mute |
+| `tests/recovery_variants.rs::restarted_process_recovers_from_peers_before_serving` | a crashed follower recovers all 25 results it missed and adopts the current epoch instead of forcing an election |
+| `tests/recovery_variants.rs::without_on_start_a_restarted_process_serves_empty` | the original behaviour, for comparison |
+| `peers::tests::reset_drops_the_backlog_and_reconnects_without_waiting_out_the_backoff` (PR #39) | the survivor's link reset |
+| `tables::tests::incremental_digest_matches_a_full_recount`, `recovery_keys_since_selects_entries_changed_after_it` | the digest and the delta selection |
+
+Recovery under increasing client load (up to 128 client processes, both kinds
+of outage) is measured by the stress harness: [stress-testing.md](stress-testing.md#failures-under-load).
