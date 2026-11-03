@@ -93,7 +93,12 @@ async fn twenty_second_server_outage_keeps_clients_running_and_recovers_before_r
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn returning_node_waits_for_both_survivors_and_failure_controls_are_bounded() {
     limit(async {
-        let (mut nodes, addrs) = start_cluster().await;
+        // The both_agree rule specifically (the default, majority, would
+        // resume with one survivor: recovery_variants.rs).
+        let (mut nodes, addrs) = start_cluster_with(|cfg| {
+            cfg.recovery.ready_rule = common::config::ReadyRule::BothAgree
+        })
+        .await;
         let client = Client::new(client_cfg(&addrs, 1000, 6));
         let mut rng = Rng::new(4);
         assert!(client

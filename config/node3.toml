@@ -22,3 +22,13 @@ workers = 4                     # planner threads
 seed = 42                       # synthetic campus; must match on every node
 queue_capacity = 64             # queued jobs before replying Busy
 table_ttl_ms = 1800000          # request/results table entry lifetime (30 min, D38)
+
+# Recovery after a temporary failure or a restart (docs/recovery.md, "Final choices").
+# full / locked / both_agree / on_start = false is the original protocol.
+[recovery]
+transfer = "delta"              # full | delta: delta pulls only what changed while away
+snapshot = "chunked"            # locked | chunked: chunked holds the state lock per 64 records
+ready_rule = "majority"         # both_agree | majority: majority resumes with one survivor
+on_start = true                 # at start, probe the peers; if the cluster is running, recover before serving
+delta_margin_ms = 2000
+majority_wait_ms = 500

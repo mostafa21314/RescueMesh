@@ -671,6 +671,51 @@ one machine, no network between the nodes; to be repeated in the lab.
   the cluster doesn't settle in time, it says so before printing. It doesn't see
   frames still in a peer link's queue (limitation a, below).
 
+## Recovery (bullet 5)
+
+The full write-up, with diagrams, the state inventory and the measurements, is
+[recovery.md](recovery.md). The entries below are the decisions in short; each
+names the `[recovery]` config key that switches it, so every alternative can be
+re-measured with `scripts/recovery_bench.py`.
+
+### D39. Pull a snapshot from the survivors (vs. push, vs. replaying the peer backlog)
+See recovery.md R1. The returning node is the only one that knows it was away;
+with no heartbeats (D15) the survivors cannot tell when to push. The peer-link
+backlog (limitation a) is bounded by frame count and replays stale bids.
+
+### D40. Copy results and requests, rebuild the ledger, replay nothing
+See recovery.md §2 and R6. The result rule (D27) and the ledger's conflict rule
+(D12) are order-independent, so an unordered set of entries is enough; an
+ordered operation log is unnecessary.
+
+### D41. Full vs. delta transfer (`recovery.transfer`)
+See recovery.md R2 and Results. Delta selects entries changed in the last *d* ms,
+*d* sent as a duration (no cross-machine clock comparison), plus a 2 s margin.
+
+### D42. Snapshot built in one lock hold vs. chunked (`recovery.snapshot`)
+See recovery.md R3 and Results. The serving survivor's state lock blocks its
+request handling for as long as it is held.
+
+### D43. Ready rule: both survivors agree vs. majority (`recovery.ready_rule`)
+See recovery.md R4 and Results. **Changes** PR #38's rule, kept by the November
+3 cold-restart entry above ("an unreachable peer still blocks recovery"): with
+one survivor down, both_agree never recovered (0/5 runs), majority did (5/5).
+Both rules still skip a peer that answers `RecoveryUnavailable`.
+
+### D44. A restarted process recovers before serving (`recovery.on_start`)
+The mechanism is the November 3 cold-restart entry above (startup probe,
+`Starting` phase). `on_start` makes it switchable so its effect could be
+measured: without it a restarted server answered 587 requests from empty
+tables, caused 331 replicate conflicts and never converged; with it, 0, 0 and
+always (recovery.md R5). A first version of this switch (start `Recovering`,
+bootstrap after a 2 s wait if no peer is Ready) had a start-up deadlock under
+both_agree and was replaced by the probe when the branches were merged.
+
+### D45. "Not ready" is answered, not ignored; the digest is incremental
+See recovery.md R8, R9. A requester no longer waits out the 10 s transfer limit
+on a peer that is not Ready; status queries no longer serialize the whole
+results table under the state lock.
+
 ## Known limitations (for bullet 5; status on November 3)
 
 Status: **a** no longer matters for recovery (the returning node pulls what it

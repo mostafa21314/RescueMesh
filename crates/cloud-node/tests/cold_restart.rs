@@ -6,7 +6,7 @@ mod support;
 
 use client::{synth_incident, Client};
 use cloud_node::{start_with_listener, NodeHandle};
-use common::config::PeerConfig;
+use common::config::{PeerConfig, ReadyRule};
 use common::rng::Rng;
 use common::{unix_ms, NodePhase};
 use std::time::{Duration, Instant};
@@ -15,6 +15,10 @@ use tokio::net::TcpListener;
 
 /// Starts node `id` again on its old address with a fresh process state.
 async fn restart(id: u32, addrs: &[String]) -> NodeHandle {
+    restart_with(id, addrs, ReadyRule::default()).await
+}
+
+async fn restart_with(id: u32, addrs: &[String], rule: ReadyRule) -> NodeHandle {
     let addr = &addrs[id as usize - 1];
     let peers = (1..=3u32)
         .filter(|j| *j != id)
@@ -34,9 +38,9 @@ async fn restart(id: u32, addrs: &[String]) -> NodeHandle {
             Err(e) => panic!("rebind {addr}: {e}"),
         }
     };
-    start_with_listener(node_cfg(id, addr, peers), listener)
-        .await
-        .unwrap()
+    let mut cfg = node_cfg(id, addr, peers);
+    cfg.recovery.ready_rule = rule;
+    start_with_listener(cfg, listener).await.unwrap()
 }
 
 async fn ready(node: &NodeHandle, within: Duration) {
@@ -126,8 +130,12 @@ async fn restarted_server_rebuilds_state_from_peers_before_participating() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_restarted_nodes_wait_for_a_ready_peer_and_skip_each_other() {
+    // both_agree: as first written. The default, majority, resumes from the
+    // one ready survivor instead (docs/recovery.md, R4):
+    // `majority_rule_restarts_from_the_one_ready_peer` below.
     limit(async {
-        let (mut nodes, addrs) = start_cluster().await;
+        let rule = ReadyRule::BothAgree;
+        let (mut nodes, addrs) = start_cluster_with(|cfg| cfg.recovery.ready_rule = rule).await;
         let client = Client::new(client_cfg(&addrs, 1_000, 6));
         let mut rng = Rng::new(22);
         submit_all(&client, &mut rng, 30).await;
@@ -147,14 +155,14 @@ async fn two_restarted_nodes_wait_for_a_ready_peer_and_skip_each_other() {
 
         // Node 1 comes back while node 3 is unreachable: one failure at a
         // time is the model, so it waits rather than trust node 2 alone.
-        let one = restart(1, &addrs).await;
+        let one = restart_with(1, &addrs, rule).await;
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(one.status().phase, NodePhase::Recovering);
         assert_eq!(one.status().results, 0, "nothing installed yet");
 
         // Node 3 comes back: node 1 answers "not ready" (it is recovering
         // itself), so node 3 recovers from node 2; then node 1 can too.
-        let three = restart(3, &addrs).await;
+        let three = restart_with(3, &addrs, rule).await;
         ready(&three, Duration::from_secs(10)).await;
         ready(&one, Duration::from_secs(10)).await;
         let want = survivor.results_snapshot();
@@ -168,6 +176,42 @@ async fn two_restarted_nodes_wait_for_a_ready_peer_and_skip_each_other() {
         for n in [one, three] {
             shutdown(n).await;
         }
+        shutdown(nodes.remove(0)).await;
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn majority_rule_restarts_from_the_one_ready_peer() {
+    limit(async {
+        let (mut nodes, addrs) = start_cluster().await;
+        let client = Client::new(client_cfg(&addrs, 1_000, 6));
+        let mut rng = Rng::new(23);
+        submit_all(&client, &mut rng, 30).await;
+        wait_converged(
+            &nodes.iter().collect::<Vec<_>>(),
+            30,
+            Duration::from_secs(10),
+        )
+        .await;
+
+        // Stop nodes 1 and 3; node 2 keeps the state.
+        let third = nodes.remove(2);
+        let first = nodes.remove(0);
+        shutdown(third).await;
+        shutdown(first).await;
+        let survivor = &nodes[0];
+
+        // Node 1 comes back while node 3 is still down: itself + node 2 is
+        // 2 of 3, so it recovers from node 2 without waiting for node 3.
+        let one = restart_with(1, &addrs, ReadyRule::Majority).await;
+        ready(&one, Duration::from_secs(5)).await;
+        assert_eq!(one.results_snapshot(), survivor.results_snapshot());
+        let r = one.status().last_recovery.unwrap();
+        assert_eq!((r.cause.as_str(), r.snapshots_used), ("start", 1));
+        let s = survivor.status();
+        assert_eq!((one.status().epoch, one.status().server), (s.epoch, s.server));
+        shutdown(one).await;
         shutdown(nodes.remove(0)).await;
     })
     .await;

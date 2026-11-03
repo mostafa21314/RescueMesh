@@ -57,6 +57,12 @@ asynchronous replication with deterministic reconciliation, not Raft consensus.
 
 ## Temporary failure and recovery
 
+> The recovery steps below describe the protocol as first merged. Each of its
+> choices is now a `[recovery]` config switch, alternatives exist next to it
+> (delta transfer, chunked snapshots, a majority ready rule, recovery after a
+> process restart), and [recovery.md](recovery.md) compares them by
+> measurement and gives the defaults.
+
 The demo controller uses the current election outcome to choose the serving node
 as the failure victim. It requires all three configured nodes to be ready and to
 agree on that server and epoch. Only one controller should run. For multiple

@@ -10,7 +10,7 @@ Phase 1 status:
 | 2. Distributed election for workload assignment, with a load metric | **done (Part B)**: on-demand, retry-triggered election; per-request mode for comparison |
 | 3. Concurrent processing and parallelization write-up | **done**: async client/node I/O, fixed planner threads; see the document below |
 | 4. Temporary server failures up to 20 seconds | **implemented and locally tested**: mute, survivor election, automatic pull recovery before rejoin |
-| 5. Server rejoin and state recovery/convergence | **done**: a node back from a temporary outage or a crash and restart pulls snapshots from its ready peers, rebuilds its ledger and election view, and only then bids or serves; measured under load. See [docs/recovery.md](docs/recovery.md) |
+| 5. Server rejoin and state recovery/convergence | **done and measured**: a node back from a temporary outage or a crash and restart pulls snapshots from its ready peers before taking part; four recovery choices (delta transfer, chunked snapshots, majority ready rule, recovery on start) compared over 170 runs ([docs/recovery.md](docs/recovery.md)) |
 | 6. Stress across increasing client loads, statistically meaningful data | **done**: `stress` harness; method, results and analysis in [docs/stress-testing.md](docs/stress-testing.md) |
 
 ## Layout
@@ -23,10 +23,12 @@ crates/client      client library + CLI (fan-out to all nodes, retries); `stress
 config/            lab configs (node1-3.toml, client.toml); config/local/ = all on 127.0.0.1
 scripts/           run_local: start or stop 3 nodes locally; lab: set_ips, start_node,
                    open_ports (Windows), check_cluster; package.sh builds dist/<target>/;
-                   stress_local.sh and plot_stress.py: the stress experiments
+                   stress_local.sh and plot_stress.py: the stress experiments;
+                   recovery_bench.py, recovery_report.py, lab_agent.py: the recovery experiments
 results/stress/    stress results: CSVs, summary.md, node logs, plots
+experiments/recovery/  recovery experiment results (summary rows, summary.md)
 docs/              protocol.md, design-log.md, library-vs-ours.md, deployment.md,
-                   concurrency-and-failures.md, recovery.md, stress-testing.md
+                   concurrency-and-failures.md, recovery.md, stress-testing.md, lab-experiments.md
 ```
 
 ## Build and test
@@ -102,6 +104,8 @@ campus locally. Log level: `RUST_LOG=debug` for per-request lines.
 ## Docs
 
 - [docs/concurrency-and-failures.md](docs/concurrency-and-failures.md): parallelization models, election choice, 20-second failure demo, recovery and limitations
+- [docs/recovery.md](docs/recovery.md): server recovery: state inventory, protocol diagrams, decisions with alternatives, measured comparison of the variants
+- [docs/lab-experiments.md](docs/lab-experiments.md): running the recovery experiments on the six lab PCs
 - [docs/protocol.md](docs/protocol.md): messages, timeouts, retry rules
 - [docs/design-log.md](docs/design-log.md): each decision, its alternatives, and why
 - [docs/library-vs-ours.md](docs/library-vs-ours.md): what crates provide vs. our code

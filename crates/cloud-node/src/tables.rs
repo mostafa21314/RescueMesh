@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Debug)]
 pub struct RequestEntry {
     pub first_seen: Instant,
+    /// Last time this entry or its result changed: what a delta recovery
+    /// transfer selects on.
+    pub changed: Instant,
     pub last_attempt: u32,
     /// Node epoch when the highest attempt so far arrived.
     pub last_epoch: Epoch,
@@ -67,44 +70,66 @@ pub struct Previous {
 pub struct Tables {
     requests: HashMap<RequestId, RequestEntry>,
     results: HashMap<RequestId, (Instant, Response)>,
+    /// `results_digest`, kept up to date on every change so a status query
+    /// doesn't re-serialize the whole table under the state lock.
+    digest: u64,
+}
+
+fn entry_hash(k: &RequestId, r: &Response) -> u64 {
+    fnv1a(&serde_json::to_vec(&(k, r)).expect("serialize result"))
+}
+
+/// What `merge_recovery` changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Merged {
+    /// Results this node did not hold.
+    pub stored: u64,
+    /// Results that replaced a held one under the result rule.
+    pub replaced: u64,
 }
 
 impl Tables {
-    /// Sorted, fixed snapshot; later live replicas are merged by the same result rule.
-    pub fn recovery_records(&self) -> Vec<RecoveryRecord> {
-        let mut records: BTreeMap<RequestId, RecoveryRecord> = self
+    /// Keys a recovery snapshot covers, sorted: every request entry, or with
+    /// `since`, only those changed at or after it.
+    pub fn recovery_keys(&self, since: Option<Instant>) -> Vec<RequestId> {
+        let mut keys: Vec<RequestId> = self
             .requests
             .iter()
-            .map(|(&id, e)| {
-                (
-                    id,
-                    RecoveryRecord {
-                        request_id: id,
-                        attempt: e.last_attempt,
-                        epoch: e.last_epoch,
-                        incident: e.incident.clone(),
-                        complexity: e.complexity,
-                        result: None,
-                    },
-                )
-            })
+            .filter(|(_, e)| since.is_none_or(|t| e.changed >= t))
+            .map(|(id, _)| *id)
             .collect();
-        for (&id, (_, r)) in &self.results {
-            // Normally the request entry exists. Keep results even if the request
-            // entry's independently measured TTL expired slightly earlier.
-            if let Some(record) = records.get_mut(&id) {
-                record.result = Some(RecoveryResult {
-                    served_by: r.served_by,
-                    epoch: r.epoch,
-                    degraded: r.degraded,
-                    plan: r.plan.clone(),
-                });
-            }
-        }
-        records.into_values().collect()
+        keys.sort();
+        keys
     }
 
-    pub fn merge_recovery(&mut self, records: Vec<RecoveryRecord>, now: Instant) {
+    /// One request entry with its result, as sent in a recovery snapshot.
+    pub fn recovery_record(&self, id: &RequestId) -> Option<RecoveryRecord> {
+        let e = self.requests.get(id)?;
+        Some(RecoveryRecord {
+            request_id: *id,
+            attempt: e.last_attempt,
+            epoch: e.last_epoch,
+            incident: e.incident.clone(),
+            complexity: e.complexity,
+            result: self.results.get(id).map(|(_, r)| RecoveryResult {
+                served_by: r.served_by,
+                epoch: r.epoch,
+                degraded: r.degraded,
+                plan: r.plan.clone(),
+            }),
+        })
+    }
+
+    /// Sorted, fixed snapshot; later live replicas are merged by the same result rule.
+    pub fn recovery_records(&self, since: Option<Instant>) -> Vec<RecoveryRecord> {
+        self.recovery_keys(since)
+            .iter()
+            .filter_map(|id| self.recovery_record(id))
+            .collect()
+    }
+
+    pub fn merge_recovery(&mut self, records: Vec<RecoveryRecord>, now: Instant) -> Merged {
+        let mut merged = Merged::default();
         for r in records {
             self.record(
                 r.request_id,
@@ -115,20 +140,22 @@ impl Tables {
                 now,
             );
             if let Some(result) = r.result {
-                self.offer(
-                    r.request_id,
-                    Response {
-                        served_by: result.served_by,
-                        epoch: result.epoch,
-                        degraded: result.degraded,
-                        plan: result.plan,
-                    },
-                    &r.incident,
-                    now,
-                );
+                let response = Response {
+                    served_by: result.served_by,
+                    epoch: result.epoch,
+                    degraded: result.degraded,
+                    plan: result.plan,
+                };
+                match self.offer(r.request_id, response, &r.incident, now) {
+                    Offer::Stored => merged.stored += 1,
+                    Offer::Replaced(_) => merged.replaced += 1,
+                    Offer::Kept => {}
+                }
             }
         }
+        merged
     }
+
     /// Records an arriving attempt. Returns the entry's previous state, or
     /// `None` if the request is new to this node.
     pub fn record(
@@ -150,6 +177,7 @@ impl Tables {
                 if attempt > e.last_attempt {
                     e.last_attempt = attempt;
                     e.last_epoch = epoch;
+                    e.changed = now;
                 }
                 Some(prev)
             }
@@ -158,6 +186,7 @@ impl Tables {
                     request_id,
                     RequestEntry {
                         first_seen: now,
+                        changed: now,
                         last_attempt: attempt,
                         last_epoch: epoch,
                         completed: self.results.contains_key(&request_id),
@@ -184,23 +213,32 @@ impl Tables {
         incident: &Incident,
         now: Instant,
     ) -> Offer {
-        self.requests
+        let entry = self
+            .requests
             .entry(request_id)
             .or_insert_with(|| RequestEntry {
                 first_seen: now,
+                changed: now,
                 last_attempt: 0,
                 last_epoch: response.epoch,
                 completed: true,
                 incident: incident.clone(),
                 complexity: 0,
-            })
-            .completed = true;
+            });
+        entry.completed = true;
         match self.results.get_mut(&request_id) {
             None => {
+                entry.changed = now;
+                self.digest = self.digest.wrapping_add(entry_hash(&request_id, &response));
                 self.results.insert(request_id, (now, response));
                 Offer::Stored
             }
             Some((_, old)) if preferred(&response, old) => {
+                entry.changed = now;
+                self.digest = self
+                    .digest
+                    .wrapping_sub(entry_hash(&request_id, old))
+                    .wrapping_add(entry_hash(&request_id, &response));
                 Offer::Replaced(std::mem::replace(old, response))
             }
             Some(_) => Offer::Kept,
@@ -229,8 +267,15 @@ impl Tables {
 
     /// Drops entries older than `ttl`.
     pub fn sweep(&mut self, now: Instant, ttl: Duration) {
-        self.results
-            .retain(|_, (t, _)| now.duration_since(*t) < ttl);
+        let mut digest = self.digest;
+        self.results.retain(|k, (t, r)| {
+            let keep = now.duration_since(*t) < ttl;
+            if !keep {
+                digest = digest.wrapping_sub(entry_hash(k, r));
+            }
+            keep
+        });
+        self.digest = digest;
         self.requests.retain(|id, e| {
             now.duration_since(e.first_seen) < ttl || self.results.contains_key(id)
         });
@@ -253,10 +298,7 @@ impl Tables {
 
     /// Order-independent fingerprint: wrapping sum of per-entry hashes.
     pub fn results_digest(&self) -> u64 {
-        self.results.iter().fold(0u64, |acc, (k, (_, r))| {
-            let bytes = serde_json::to_vec(&(k, r)).expect("serialize result");
-            acc.wrapping_add(fnv1a(&bytes))
-        })
+        self.digest
     }
 }
 
@@ -364,6 +406,58 @@ mod tests {
         t.record(r(2), 1, 0, &incident(), 1, t0 + Duration::from_millis(3));
         t.offer(r(1), response(1, 1), &incident(), t0);
         assert_eq!(t.pending_oldest_first(), vec![r(9), r(5), r(2)]);
+    }
+
+    #[test]
+    fn incremental_digest_matches_a_full_recount() {
+        let recount = |t: &Tables| {
+            t.results
+                .iter()
+                .fold(0u64, |acc, (k, (_, r))| acc.wrapping_add(entry_hash(k, r)))
+        };
+        let r = |seq| RequestId {
+            client_id: Uuid::nil(),
+            seq,
+        };
+        let t0 = Instant::now();
+        let mut t = Tables::default();
+        t.offer(r(1), response(1, 1), &incident(), t0);
+        t.offer(r(2), response(2, 1), &incident(), t0 + Duration::from_secs(5));
+        t.offer(r(1), response(1, 1), &incident(), t0); // kept
+        t.offer(r(1), response(3, 2), &incident(), t0); // replaced
+        assert_eq!(t.results_digest(), recount(&t));
+        t.sweep(t0 + Duration::from_secs(3), Duration::from_secs(2));
+        assert_eq!(t.len().1, 1);
+        assert_eq!(t.results_digest(), recount(&t));
+    }
+
+    #[test]
+    fn recovery_keys_since_selects_entries_changed_after_it() {
+        let r = |seq| RequestId {
+            client_id: Uuid::nil(),
+            seq,
+        };
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(10);
+        let mut t = Tables::default();
+        t.record(r(1), 1, 0, &incident(), 1, t0);
+        t.record(r(2), 1, 0, &incident(), 1, t0);
+        t.record(r(3), 1, 0, &incident(), 1, later);
+        // An old request completed late, and an old one retried late, count.
+        t.offer(r(1), response(1, 1), &incident(), later);
+        t.record(r(2), 2, 1, &incident(), 1, later);
+        assert_eq!(t.recovery_keys(None), vec![r(1), r(2), r(3)]);
+        assert_eq!(
+            t.recovery_keys(Some(t0 + Duration::from_secs(5))),
+            vec![r(1), r(2), r(3)]
+        );
+        t.record(r(5), 1, 0, &incident(), 1, t0);
+        assert_eq!(
+            t.recovery_keys(Some(t0 + Duration::from_secs(5))),
+            vec![r(1), r(2), r(3)]
+        );
+        let rec = t.recovery_record(&r(1)).unwrap();
+        assert_eq!(rec.result.unwrap().served_by, 1);
     }
 
     #[test]

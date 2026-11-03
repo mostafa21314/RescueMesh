@@ -6,3 +6,9 @@ logs/
 dist/
 bin1/
 !results/**/*.csv
+
+# Recovery experiments: keep the summary rows, not the raw per-request logs.
+!experiments/recovery/*.csv
+experiments/recovery/raw/
+experiments/recovery/sweep*.log
+lab.json

@@ -34,6 +34,7 @@ pub fn node_cfg(node_id: u32, listen: &str, peers: Vec<PeerConfig>) -> NodeConfi
         queue_capacity: 1024,
         table_ttl_ms: 300_000,
         campus: CampusParams::default(),
+        recovery: RecoveryParams::default(),
     }
 }
 

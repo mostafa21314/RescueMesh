@@ -9,9 +9,8 @@ use crate::load::LoadMonitor;
 use crate::peers::PeerLinks;
 use crate::planner;
 use crate::pool::Pool;
-use crate::recovery::{Fetched, Snapshot};
 use crate::tables::{Offer, Response, Tables};
-use common::config::{ElectionMode, NodeConfig};
+use common::config::{ElectionMode, NodeConfig, ReadyRule, SnapshotBuild, Transfer};
 use common::counters::Counters;
 use common::wire::{read_frame, write_frame};
 use common::*;
@@ -53,6 +52,10 @@ struct State {
     phase: NodePhase,
     faults_injected: u64,
     last_recovery_ms: Option<u64>,
+    last_recovery: Option<RecoveryReport>,
+    /// When the current or last outage started; a delta transfer asks for
+    /// what changed since then.
+    muted_at: Option<Instant>,
     recovery_epoch: Epoch,
     tables: Tables,
     core: Core,
@@ -75,6 +78,8 @@ struct Stats {
     resource_overcommits: AtomicU64,
     late_results: AtomicU64,
     dropped_on_step_down: AtomicU64,
+    snapshots_served: AtomicU64,
+    snapshot_lock_max_us: AtomicU64,
     elections_recorded: AtomicU64,
     election_time_us: AtomicU64,
 }
@@ -200,9 +205,15 @@ pub async fn start_with_listener(
         generation,
         stopped: AtomicBool::new(false),
         state: Mutex::new(State {
-            phase: NodePhase::Starting,
+            phase: if cfg.recovery.on_start {
+                NodePhase::Starting
+            } else {
+                NodePhase::Ready
+            },
             faults_injected: 0,
             last_recovery_ms: None,
+            last_recovery: None,
+            muted_at: None,
             recovery_epoch: 0,
             tables: Tables::default(),
             core,
@@ -221,39 +232,43 @@ pub async fn start_with_listener(
     // No server is known at startup. The first request triggers the
     // election (trigger "no_server"), rather than boot, when peers are often
     // not up yet and the election would hear only its own bid.
+    // With `recovery.on_start` (default) the node first decides whether it is
+    // rejoining a running cluster (below); without it, a restarted node starts
+    // Ready and empty, the original behaviour (docs/recovery.md, R5).
     // TODO(discovery): peers come from the config file for now.
     tasks.push(tokio::spawn(accept_loop(shared.clone(), listener)));
     tasks.push(tokio::spawn(completion_loop(shared.clone(), done_rx)));
     tasks.push(tokio::spawn(sweep_loop(shared.clone())));
-
-    // Cold start. While `Starting` the node answers probes but takes no part.
-    // If a peer shows the cluster has been running (a restart after a crash),
-    // this node recovers like a returning muted node before it bids or
-    // serves; otherwise it starts empty with the rest of the cluster. A peer
-    // that does not answer within STARTUP_PROBE counts as not running.
-    let mut probes = JoinSet::new();
-    for p in &shared.cfg.peers {
-        let addr = p.addr.clone();
-        probes.spawn(async move { crate::recovery::probe(&addr).await.ok() });
-    }
-    let mut history = Vec::new();
-    while let Some(answer) = probes.join_next().await {
-        if let Ok(Some(p)) = answer {
-            if crate::recovery::has_history(&p) {
-                history.push(p.node_id);
+    if shared.cfg.recovery.on_start {
+        // Cold start. While `Starting` the node answers probes but takes no part.
+        // If a peer shows the cluster has been running (a restart after a crash),
+        // this node recovers like a returning muted node before it bids or
+        // serves; otherwise it starts empty with the rest of the cluster. A peer
+        // that does not answer within STARTUP_PROBE counts as not running.
+        let mut probes = JoinSet::new();
+        for p in &shared.cfg.peers {
+            let addr = p.addr.clone();
+            probes.spawn(async move { crate::recovery::probe(&addr).await.ok() });
+        }
+        let mut history = Vec::new();
+        while let Some(answer) = probes.join_next().await {
+            if let Ok(Some(p)) = answer {
+                if crate::recovery::has_history(&p) {
+                    history.push(p.node_id);
+                }
             }
         }
-    }
-    if history.is_empty() {
-        shared.state.lock().unwrap().phase = NodePhase::Ready;
-    } else {
-        shared.state.lock().unwrap().phase = NodePhase::Recovering;
-        tracing::info!(
-            node = shared.cfg.node_id,
-            running_peers = ?history,
-            "peers hold state: recovering before participating (cold rejoin)"
-        );
-        tasks.push(tokio::spawn(recover(shared.clone())));
+        if history.is_empty() {
+            shared.state.lock().unwrap().phase = NodePhase::Ready;
+        } else {
+            shared.state.lock().unwrap().phase = NodePhase::Recovering;
+            tracing::info!(
+                node = shared.cfg.node_id,
+                running_peers = ?history,
+                "peers hold state: recovering before participating (cold rejoin)"
+            );
+            tasks.push(tokio::spawn(recover(shared.clone(), Cause::Start)));
+        }
     }
     tracing::info!(
         node = shared.cfg.node_id,
@@ -286,6 +301,7 @@ fn inject_failure(shared: &Arc<Shared>, duration: Duration) -> anyhow::Result<()
     st.phase = NodePhase::Muted;
     st.faults_injected += 1;
     st.last_recovery_ms = None;
+    st.muted_at = Some(Instant::now());
     st.recovery_epoch = st.core.epoch();
     shared.generation.fetch_add(1, Ordering::SeqCst);
     shared.peers.suspend();
@@ -305,137 +321,331 @@ fn inject_failure(shared: &Arc<Shared>, duration: Duration) -> anyhow::Result<()
             return;
         }
         sh.state.lock().unwrap().phase = NodePhase::Recovering;
-        recover(sh).await;
+        recover(sh, Cause::Mute).await;
     });
     Ok(())
 }
 
-async fn recover(shared: Arc<Shared>) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cause {
+    /// Rejoining after a temporary failure: state is in memory, but stale.
+    Mute,
+    /// The process just started: state is empty.
+    Start,
+}
+
+impl Cause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Cause::Mute => "mute",
+            Cause::Start => "start",
+        }
+    }
+}
+
+/// What one round of transfers brought back.
+#[derive(Default)]
+struct Round {
+    snapshots: Vec<crate::recovery::Snapshot>,
+    /// Peers that answered but are not Ready, with and without state.
+    unavailable_with_state: usize,
+    unavailable_empty: usize,
+}
+
+/// Pulls snapshots from the peers. Both rules ask both survivors at once;
+/// `Majority` stops waiting `majority_wait_ms` after the first usable one.
+async fn transfer_round(shared: &Arc<Shared>, since_ms: Option<u64>) -> Round {
+    let rp = shared.cfg.recovery;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    for p in &shared.cfg.peers {
+        let (tx, addr, id, me) = (tx.clone(), p.addr.clone(), p.id, shared.cfg.node_id);
+        tokio::spawn(async move {
+            let _ = tx.send(crate::recovery::fetch(&addr, me, id, since_ms).await);
+        });
+    }
+    drop(tx);
+    let mut round = Round::default();
+    let mut deadline: Option<tokio::time::Instant> = None;
+    loop {
+        let next = match deadline {
+            Some(d) => match tokio::time::timeout_at(d, rx.recv()).await {
+                Ok(n) => n,
+                Err(_) => break, // majority: stopped waiting for the second
+            },
+            None => rx.recv().await,
+        };
+        let Some(fetched) = next else { break };
+        match fetched {
+            Ok(crate::recovery::Fetched::Snapshot(snap)) => {
+                if rp.ready_rule == ReadyRule::Majority && !snap.electing && deadline.is_none() {
+                    deadline = Some(
+                        tokio::time::Instant::now() + Duration::from_millis(rp.majority_wait_ms),
+                    );
+                }
+                round.snapshots.push(snap);
+            }
+            Ok(crate::recovery::Fetched::Unavailable { has_state: true }) => {
+                round.unavailable_with_state += 1
+            }
+            Ok(crate::recovery::Fetched::Unavailable { has_state: false }) => {
+                round.unavailable_empty += 1
+            }
+            Err(e) => tracing::debug!(%e, "recovery transfer failed"),
+        }
+    }
+    round
+}
+
+/// The role view (epoch, server) to adopt from a round, or `None` if the
+/// round does not meet the ready rule.
+fn accepted_view(shared: &Shared, round: &Round) -> Option<(Epoch, Option<NodeId>)> {
+    let valid = |s: &crate::recovery::Snapshot| {
+        !s.electing
+            && s.server.is_none_or(|id| {
+                id == shared.cfg.node_id || shared.cfg.peers.iter().any(|p| p.id == id)
+            })
+    };
+    match shared.cfg.recovery.ready_rule {
+        // A temporary single-node failure leaves two ready survivors. Do not
+        // resume on one arbitrary or still-electing survivor's stale view.
+        // A peer that answered "starting, empty" holds nothing to agree on,
+        // so it is left out; otherwise two nodes starting next to one Ready
+        // node would each wait for the other forever.
+        ReadyRule::BothAgree => {
+            let needed = shared.cfg.peers.len() - round.unavailable_empty;
+            let first = round.snapshots.first()?;
+            (needed > 0
+                && round.snapshots.len() == needed
+                && round.snapshots.iter().all(|s| {
+                    valid(s) && s.epoch == first.epoch && s.server == first.server
+                }))
+            .then_some((first.epoch, first.server))
+        }
+        // Itself plus one survivor is 2 of 3. Of the usable views, the
+        // highest epoch is the most recent role decision.
+        ReadyRule::Majority => round
+            .snapshots
+            .iter()
+            .filter(|s| valid(s))
+            .max_by_key(|s| (s.epoch, std::cmp::Reverse(s.server)))
+            .map(|s| (s.epoch, s.server)),
+    }
+}
+
+async fn recover(shared: Arc<Shared>, cause: Cause) {
+    let rp = shared.cfg.recovery;
     let started = Instant::now();
+    let mut report = RecoveryReport {
+        cause: cause.as_str().into(),
+        ..Default::default()
+    };
     tracing::info!(
         node = shared.cfg.node_id,
+        cause = cause.as_str(),
+        ?rp,
         "recovery started; election participation disabled"
     );
+    // Old planners must finish/cancel before replacing their derived ledger.
+    while shared.pool.load().running > 0 {
+        if shared.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    report.drain_ms = started.elapsed().as_millis() as u64;
     loop {
         if shared.stopped.load(Ordering::SeqCst) {
             return;
         }
-        // Old planners must finish/cancel before replacing their derived ledger.
-        if shared.pool.load().running > 0 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        // Delta: what changed since the outage began, plus a margin for replicas
+        // that were in flight when it began. A process start has nothing to
+        // build on, so it always takes everything.
+        let muted_at = shared.state.lock().unwrap().muted_at;
+        let since_ms = match (rp.transfer, cause, muted_at) {
+            (Transfer::Delta, Cause::Mute, Some(t)) => {
+                Some(t.elapsed().as_millis() as u64 + rp.delta_margin_ms)
+            }
+            _ => None,
+        };
+        report.rounds += 1;
+        let fetch_started = Instant::now();
+        let round = transfer_round(&shared, since_ms).await;
+        report.fetch_ms = fetch_started.elapsed().as_millis() as u64;
+
+        let Some((epoch, server)) = accepted_view(&shared, &round) else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+
+        let install_started = Instant::now();
+        let mut st = shared.state.lock().unwrap();
+        if shared.stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        // A newer live replica can overtake either snapshot transfer.
+        // Never install an older role view over that observed epoch.
+        if epoch < st.recovery_epoch {
+            drop(st);
             continue;
         }
-        let first = &shared.cfg.peers[0];
-        let second = &shared.cfg.peers[1];
-        let (a, b) = tokio::join!(
-            crate::recovery::fetch(&first.addr, shared.cfg.node_id, first.id),
-            crate::recovery::fetch(&second.addr, shared.cfg.node_id, second.id),
-        );
-        // Every peer must answer: with a snapshot, or "not ready" if it is
-        // starting or recovering itself (it holds nothing authoritative). An
-        // unreachable peer keeps this node recovering: the single-failure
-        // model expects two ready survivors and does not resume on one
-        // arbitrary survivor's possibly stale view.
-        if let (Ok(a), Ok(b)) = (a, b) {
-            let sources: Vec<(NodeId, Snapshot)> = [(first.id, a), (second.id, b)]
-                .into_iter()
-                .filter_map(|(id, f)| match f {
-                    Fetched::Snapshot(snap) => Some((id, snap)),
-                    Fetched::NotReady => None,
-                })
+        let now = Instant::now();
+        // What we might hold that a survivor lacks: everything we hold (full),
+        // or what changed shortly before the outage (delta). Taken before the
+        // merge, which marks merged entries as changed now.
+        let candidates =
+            st.tables
+                .recovery_keys(since_ms.map(|ms| {
+                    now.checked_sub(Duration::from_millis(ms)).unwrap_or(started)
+                }));
+        let mut peer_versions = Vec::new();
+        for snap in round.snapshots {
+            report.snapshots_used += 1;
+            report.records_received += snap.records.len() as u64;
+            report.bytes_received += snap.bytes;
+            let versions: Versions = snap
+                .records
+                .iter()
+                .filter_map(|r| r.result.as_ref().map(|x| (r.request_id, (x.epoch, x.served_by))))
                 .collect();
-            if let Some((epoch, server)) = agreed_view(&shared.cfg, &sources) {
-                let mut st = shared.state.lock().unwrap();
-                if shared.stopped.load(Ordering::SeqCst) {
-                    return;
-                }
-                // A newer live replica can overtake a snapshot transfer.
-                // Never install an older role view over that observed epoch.
-                if epoch >= st.recovery_epoch {
-                    let now = Instant::now();
-                    let versions: Vec<(NodeId, Versions)> = sources
-                        .iter()
-                        .map(|(id, snap)| {
-                            let v = snap
-                                .records
-                                .iter()
-                                .filter_map(|r| {
-                                    r.result
-                                        .as_ref()
-                                        .map(|res| (r.request_id, (res.epoch, res.served_by)))
-                                })
-                                .collect();
-                            (*id, v)
-                        })
-                        .collect();
-                    for (_, snap) in sources {
-                        st.tables.merge_recovery(snap.records, now);
-                    }
-                    let records = st.tables.recovery_records();
-                    let mut ledger = Ledger::new(&shared.campus);
-                    for record in &records {
-                        if let Some(result) = &record.result {
-                            ledger.apply(record.request_id, &result.plan, unix_ms());
-                        }
-                    }
-                    *shared.ledger.lock().unwrap() = ledger;
-                    st.core.recover_view(now, epoch, server);
-                    st.inflight.clear();
-                    st.phase = NodePhase::Ready;
-                    st.last_recovery_ms = Some(started.elapsed().as_millis() as u64);
-                    shared.peers.resume();
-                    // Also publish retained results a source lacks: ones this
-                    // node completed just before an outage without replicating.
-                    for record in records {
-                        if let Some(r) = record.result {
-                            let message = Message::Replicate {
-                                epoch: r.epoch,
-                                origin: r.served_by,
-                                request_id: record.request_id,
-                                plan: r.plan,
-                                incident: record.incident,
-                                degraded: r.degraded,
-                            };
-                            for (peer, v) in &versions {
-                                if v.get(&record.request_id) != Some(&(r.epoch, r.served_by)) {
-                                    shared.peers.send(*peer, message.clone());
-                                }
-                            }
-                        }
-                    }
-                    if st.core.serving() {
-                        run_actions(&shared, &mut st, vec![Action::BecameServer]);
-                    }
-                    tracing::info!(
-                        node = shared.cfg.node_id,
-                        recovery_ms = st.last_recovery_ms,
-                        results = st.tables.len().1,
-                        epoch = st.core.epoch(),
-                        sources = ?versions.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-                        "recovery complete; node ready"
-                    );
-                    return;
+            peer_versions.push((snap.peer, versions));
+            report.new_results += st.tables.merge_recovery(snap.records, now).stored;
+        }
+        let mut ledger = Ledger::new(&shared.campus);
+        for record in st.tables.recovery_records(None) {
+            if let Some(result) = &record.result {
+                ledger.apply(record.request_id, &result.plan, unix_ms());
+            }
+        }
+        *shared.ledger.lock().unwrap() = ledger;
+        st.core.recover_view(now, epoch, server);
+        st.inflight.clear();
+        st.phase = NodePhase::Ready;
+        shared.peers.resume();
+        // Also publish retained results that may have completed just before
+        // the outage without reaching a survivor.
+        for id in candidates {
+            let Some(record) = st.tables.recovery_record(&id) else {
+                continue;
+            };
+            let Some(r) = record.result else { continue };
+            let message = Message::Replicate {
+                epoch: r.epoch,
+                origin: r.served_by,
+                request_id: id,
+                plan: r.plan,
+                incident: record.incident,
+                degraded: r.degraded,
+            };
+            for (peer, versions) in &peer_versions {
+                if versions.get(&id) != Some(&(r.epoch, r.served_by)) {
+                    shared.peers.send(*peer, message.clone());
+                    report.republished += 1;
                 }
             }
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        if st.core.serving() {
+            run_actions(&shared, &mut st, vec![Action::BecameServer]);
+        }
+        report.install_ms = install_started.elapsed().as_millis() as u64;
+        report.total_ms = started.elapsed().as_millis() as u64;
+        st.last_recovery_ms = Some(report.total_ms);
+        tracing::info!(
+            node = shared.cfg.node_id,
+            cause = cause.as_str(),
+            total_ms = report.total_ms,
+            drain_ms = report.drain_ms,
+            fetch_ms = report.fetch_ms,
+            install_ms = report.install_ms,
+            rounds = report.rounds,
+            records = report.records_received,
+            bytes = report.bytes_received,
+            new_results = report.new_results,
+            republished = report.republished,
+            results = st.tables.len().1,
+            epoch = st.core.epoch(),
+            "recovery complete; node ready"
+        );
+        st.last_recovery = Some(report);
+        return;
     }
 }
 
-/// The role view every snapshot agrees on, taken outside an election and
-/// naming a configured node; `None` (retry) without a snapshot or agreement.
-fn agreed_view(
-    cfg: &NodeConfig,
-    sources: &[(NodeId, Snapshot)],
-) -> Option<(Epoch, Option<NodeId>)> {
-    let (_, first) = sources.first()?;
-    let agree = sources
-        .iter()
-        .all(|(_, s)| s.epoch == first.epoch && s.server == first.server && !s.electing);
-    let known = first
-        .server
-        .is_none_or(|id| id == cfg.node_id || cfg.peers.iter().any(|p| p.id == id));
-    (agree && known).then_some((first.epoch, first.server))
+/// Answers a returning peer's RecoveryRequest on its connection.
+fn serve_snapshot(shared: &Shared, node_id: NodeId, since_ms: Option<u64>, reply: &Reply) {
+    // Each hold is timed from acquiring the lock to releasing it.
+    let lock = || {
+        let st = shared.state.lock().unwrap();
+        (st, Instant::now())
+    };
+    let mut max_hold = 0u64;
+    let note = |t: Instant, max: &mut u64| *max = (*max).max(t.elapsed().as_micros() as u64);
+    let since = |now: Instant| since_ms.and_then(|ms| now.checked_sub(Duration::from_millis(ms)));
+
+    let (st, t) = lock();
+    if st.phase != NodePhase::Ready {
+        let _ = reply.send(Message::RecoveryUnavailable {
+            node_id: shared.cfg.node_id,
+            phase: st.phase,
+            has_state: st.tables.len() != (0, 0),
+        });
+        return;
+    }
+    // Under the same lock hold as the copy (or, chunked, as the key list):
+    // every frame queued for the peer so far is covered by the snapshot, so
+    // the peer's link drops it and reconnects at once; frames queued from now
+    // on reach it (Marwan's link reset, design log November 3).
+    shared.peers.reset(node_id);
+    let count = match shared.cfg.recovery.snapshot {
+        SnapshotBuild::Locked => {
+            // Build and queue the whole snapshot in one hold of the lock.
+            let records = st.tables.recovery_records(since(Instant::now()));
+            let count = records.len();
+            for chunk in records.chunks(64) {
+                let _ = reply.send(Message::RecoveryChunk {
+                    records: chunk.to_vec(),
+                });
+            }
+            note(t, &mut max_hold);
+            drop(st);
+            count
+        }
+        SnapshotBuild::Chunked => {
+            // Only the key list under the first hold; then 64 records per
+            // hold, so request handling interleaves with the transfer. Entries
+            // swept in between are skipped; entries changed in between are
+            // sent as they are now, which the result rule makes safe.
+            let keys = st.tables.recovery_keys(since(Instant::now()));
+            note(t, &mut max_hold);
+            drop(st);
+            let mut count = 0;
+            for chunk in keys.chunks(64) {
+                let (st, t) = lock();
+                let records: Vec<RecoveryRecord> =
+                    chunk.iter().filter_map(|id| st.tables.recovery_record(id)).collect();
+                note(t, &mut max_hold);
+                drop(st);
+                count += records.len();
+                let _ = reply.send(Message::RecoveryChunk { records });
+            }
+            count
+        }
+    };
+    // The role view is read last, so it is at least as new as the records.
+    let (st, t) = lock();
+    let _ = reply.send(Message::RecoveryComplete {
+        node_id: shared.cfg.node_id,
+        epoch: st.core.epoch(),
+        server: st.core.server(),
+        electing: st.core.electing(),
+        records: count,
+    });
+    note(t, &mut max_hold);
+    drop(st);
+    shared.stats.snapshots_served.fetch_add(1, Ordering::Relaxed);
+    shared
+        .stats
+        .snapshot_lock_max_us
+        .fetch_max(max_hold, Ordering::Relaxed);
 }
 
 /// Plans on a snapshot and commits if nothing it chose was taken meanwhile;
@@ -569,35 +779,10 @@ fn handle(shared: &Arc<Shared>, msg: Message, reply: &Reply) {
             };
             let _ = reply.send(response);
         }
-        Message::RecoveryRequest { node_id } => {
-            let st = shared.state.lock().unwrap();
-            if !shared.cfg.peers.iter().any(|p| p.id == node_id) {
-                return;
+        Message::RecoveryRequest { node_id, since_ms } => {
+            if shared.cfg.peers.iter().any(|p| p.id == node_id) {
+                serve_snapshot(shared, node_id, since_ms, reply);
             }
-            if st.phase != NodePhase::Ready {
-                let _ = reply.send(Message::RecoveryUnavailable {
-                    node_id: shared.cfg.node_id,
-                    phase: st.phase,
-                });
-                return;
-            }
-            // Under the same lock as the copy: what was queued for it is in
-            // the snapshot, what is queued from now on reaches it.
-            shared.peers.reset(node_id);
-            let records = st.tables.recovery_records();
-            let count = records.len();
-            for chunk in records.chunks(64) {
-                let _ = reply.send(Message::RecoveryChunk {
-                    records: chunk.to_vec(),
-                });
-            }
-            let _ = reply.send(Message::RecoveryComplete {
-                node_id: shared.cfg.node_id,
-                epoch: st.core.epoch(),
-                server: st.core.server(),
-                electing: st.core.electing(),
-                records: count,
-            });
         }
         Message::SubmitIncident {
             request_id,
@@ -1059,6 +1244,9 @@ fn status(shared: &Shared) -> NodeStatus {
         phase: st.phase,
         faults_injected: st.faults_injected,
         last_recovery_ms: st.last_recovery_ms,
+        last_recovery: st.last_recovery.clone(),
+        snapshots_served: shared.stats.snapshots_served.load(Ordering::Relaxed),
+        snapshot_lock_max_us: shared.stats.snapshot_lock_max_us.load(Ordering::Relaxed),
         epoch: st.core.epoch(),
         server: st.core.server(),
         degraded: st.core.degraded(),
