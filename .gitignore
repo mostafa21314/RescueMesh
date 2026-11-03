@@ -10,3 +10,4 @@ bin1/
 !experiments/recovery/*.csv
 experiments/recovery/raw/
 experiments/recovery/sweep*.log
+lab.json

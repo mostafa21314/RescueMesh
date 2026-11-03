@@ -91,6 +91,7 @@ campus locally. Log level: `RUST_LOG=debug` for per-request lines.
 
 - [docs/concurrency-and-failures.md](docs/concurrency-and-failures.md): parallelization models, election choice, 20-second failure demo, recovery and limitations
 - [docs/recovery.md](docs/recovery.md): server recovery: state inventory, protocol diagrams, decisions with alternatives, measured comparison of the variants
+- [docs/lab-experiments.md](docs/lab-experiments.md): running the recovery experiments on the six lab PCs
 - [docs/protocol.md](docs/protocol.md): messages, timeouts, retry rules
 - [docs/design-log.md](docs/design-log.md): each decision, its alternatives, and why
 - [docs/library-vs-ours.md](docs/library-vs-ours.md): what crates provide vs. our code

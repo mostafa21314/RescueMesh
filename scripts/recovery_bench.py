@@ -18,6 +18,11 @@ the end.
 Summary rows go to experiments/recovery/<experiment>.csv (appended, so an
 interrupted sweep can be resumed with --resume); per-request client logs go to
 experiments/recovery/raw/. Run `cargo build --release` first.
+
+Lab mode: `--lab lab.json` runs the same experiments on real machines. Each
+lab PC runs scripts/lab_agent.py; the nodes are started, killed and restarted
+through their agents, and the workload is split over the client PCs' agents.
+Results go to experiments/recovery/lab/. See docs/lab-experiments.md.
 """
 
 import argparse
@@ -32,6 +37,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -44,9 +50,10 @@ MAX_ATTEMPTS = 8  # 8 attempts > 20 s outage + recovery at 1 s per attempt
 
 # ---------------------------------------------------------------- wire
 
-def call(port, msg, timeout=2.0):
-    """One request/response over the node's framing: 4-byte length + JSON."""
-    with socket.create_connection(("127.0.0.1", port), timeout=timeout) as s:
+def call(addr, msg, timeout=2.0):
+    """One request/response over the node's framing: 4-byte length + JSON.
+    `addr` is (host, port)."""
+    with socket.create_connection(addr, timeout=timeout) as s:
         body = json.dumps(msg).encode()
         s.sendall(struct.pack(">I", len(body)) + body)
         n = struct.unpack(">I", _read(s, 4))[0]
@@ -63,23 +70,22 @@ def _read(s, n):
     return buf
 
 
-def status(port, timeout=2.0):
+def status(addr, timeout=2.0):
     try:
-        return call(port, {"type": "StatusRequest"}, timeout)
+        return call(addr, {"type": "StatusRequest"}, timeout)
     except (OSError, ConnectionError, ValueError, struct.error):
         return None
 
 
 # ---------------------------------------------------------------- cluster
 
-def node_toml(i, recovery):
-    ports = [BASE_PORT + k for k in range(3)]
+def node_toml(i, recovery, addrs, listen_host="127.0.0.1"):
     peers = ", ".join(
-        f'{{ id = {k + 1}, addr = "127.0.0.1:{ports[k]}" }}' for k in range(3) if k != i
+        f'{{ id = {k + 1}, addr = "{addrs[k][0]}:{addrs[k][1]}" }}' for k in range(3) if k != i
     )
     rec = "\n".join(f"{k} = {json.dumps(v)}" for k, v in recovery.items())
     return f"""node_id = {i + 1}
-listen = "127.0.0.1:{ports[i]}"
+listen = "{listen_host}:{addrs[i][1]}"
 peers = [{peers}]
 election_mode = "on_demand"
 policy = "Composite"
@@ -97,18 +103,23 @@ table_ttl_ms = 1800000
 """
 
 
+def client_toml(addrs):
+    return ("nodes = [%s]\nrequest_timeout_ms = %d\nmax_attempts = %d\n"
+            % (", ".join(f'"{h}:{p}"' for h, p in addrs), REQUEST_TIMEOUT_MS, MAX_ATTEMPTS))
+
+
 class Cluster:
+    """Three nodes and the client as processes on this machine."""
+
     def __init__(self, recovery, workdir):
         self.dir = Path(workdir)
-        self.ports = [BASE_PORT + k for k in range(3)]
+        self.addrs = [("127.0.0.1", BASE_PORT + k) for k in range(3)]
+        self.ports = [p for _, p in self.addrs]
         self.procs = [None] * 3
         self.logs = []
         for i in range(3):
-            (self.dir / f"node{i + 1}.toml").write_text(node_toml(i, recovery))
-        (self.dir / "client.toml").write_text(
-            "nodes = [%s]\nrequest_timeout_ms = %d\nmax_attempts = %d\n"
-            % (", ".join(f'"127.0.0.1:{p}"' for p in self.ports), REQUEST_TIMEOUT_MS, MAX_ATTEMPTS)
-        )
+            (self.dir / f"node{i + 1}.toml").write_text(node_toml(i, recovery, self.addrs))
+        (self.dir / "client.toml").write_text(client_toml(self.addrs))
 
     def start(self, i):
         log = open(self.dir / f"node{i + 1}.log", "a")
@@ -117,7 +128,7 @@ class Cluster:
             [str(BIN / "cloud-node"), "--config", str(self.dir / f"node{i + 1}.toml")],
             stdout=log, stderr=subprocess.STDOUT, env={**os.environ, "RUST_LOG": "info"},
         )
-        wait_for(lambda: status(self.ports[i], 0.5) is not None, 10, f"node {i + 1} start")
+        wait_for(lambda: status(self.addrs[i], 0.5) is not None, 10, f"node {i + 1} start")
 
     def kill(self, i):
         self.procs[i].send_signal(signal.SIGKILL)
@@ -136,7 +147,7 @@ class Cluster:
             wait_for(lambda: _port_free(port), 10, f"port {port} free")
 
     def statuses(self):
-        return [status(p) for p in self.ports]
+        return [status(a) for a in self.addrs]
 
     def client(self, count, rate, complexity, out, seed):
         return subprocess.Popen(
@@ -146,6 +157,96 @@ class Cluster:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env={**os.environ, "RUST_LOG": "error"},
         )
+
+
+def agent(addr, path, body=None, timeout=60):
+    """One call to a lab agent (scripts/lab_agent.py)."""
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(f"http://{addr}{path}", data=data,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def clock_offset(addr):
+    """Agent clock minus this machine's clock, in ms (midpoint of a round trip)."""
+    best = None
+    for _ in range(5):
+        t0 = time.time() * 1000
+        ms = agent(addr, "/time", timeout=5)["ms"]
+        t1 = time.time() * 1000
+        if best is None or t1 - t0 < best[0]:
+            best = (t1 - t0, ms - (t0 + t1) / 2)
+    return best[1]
+
+
+class LabCluster:
+    """Three nodes on lab PCs, driven through their agents; the workload is split
+    over the client PCs' agents. Same interface as Cluster."""
+
+    def __init__(self, recovery, workdir, lab):
+        self.dir = Path(workdir)
+        self.addrs = [(n["host"], n["port"]) for n in lab["nodes"]]
+        self.agents = [n.get("agent", f"{n['host']}:7400") for n in lab["nodes"]]
+        self.client_agents = lab["clients"]
+        self.configs = [node_toml(i, recovery, self.addrs, listen_host="0.0.0.0") for i in range(3)]
+
+    def start(self, i):
+        agent(self.agents[i], "/node/start", {"config": self.configs[i], "node_port": self.addrs[i][1]})
+        wait_for(lambda: status(self.addrs[i], 0.5) is not None, 15, f"node {i + 1} start")
+
+    def kill(self, i):
+        agent(self.agents[i], "/node/kill", {})
+
+    def stop(self):
+        for i in range(3):
+            try:
+                self.kill(i)
+            except OSError as e:
+                print(f"warning: could not stop node {i + 1}: {e}", flush=True)
+
+    def statuses(self):
+        return [status(a) for a in self.addrs]
+
+    def client(self, count, rate, complexity, out, seed):
+        return LabClients(self, count, rate, complexity, out, seed)
+
+
+class LabClients:
+    """One workload split evenly over the client PCs; `wait()` merges their CSVs
+    into `out`, with every timestamp moved onto this machine's clock."""
+
+    def __init__(self, c, count, rate, complexity, out, seed):
+        self.out = Path(out)
+        n = len(c.client_agents)
+        self.parts = []
+        for k, a in enumerate(c.client_agents):
+            share = count // n + (1 if k < count % n else 0)
+            if share == 0:
+                continue
+            offset = clock_offset(a)
+            job = agent(a, "/client/start", {
+                "config": client_toml(c.addrs), "count": share, "rate": rate / n,
+                "complexity": complexity, "seed": seed * 10 + k})["job"]
+            self.parts.append((a, job, offset))
+
+    def wait(self):
+        header, rows = None, []
+        for a, job, offset in self.parts:
+            text = agent(a, "/client/wait", {"job": job}, timeout=None)["csv"]
+            lines = text.splitlines()
+            if not lines:
+                continue
+            header = lines[0]
+            cols = header.split(",")
+            for line in lines[1:]:
+                v = line.split(",")
+                for name in ("sent_at_ms", "response_at_ms"):
+                    j = cols.index(name)
+                    if v[j]:
+                        v[j] = str(int(int(v[j]) - offset))
+                rows.append(",".join(v))
+        self.out.write_text("\n".join([header or ""] + rows) + "\n")
 
 
 def _port_free(port):
@@ -193,7 +294,7 @@ def run(exp, rep, *, recovery, rate, outage_ms, table, mode="mute",
     tag = run_tag(exp, rep, recovery=recovery, rate=rate, outage_ms=outage_ms, table=table, mode=mode)
     RAW.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmp:
-        c = Cluster(rec, tmp)
+        c = LabCluster(rec, tmp, LAB) if LAB else Cluster(rec, tmp)
         try:
             for i in range(3):
                 c.start(i)
@@ -221,7 +322,7 @@ def run(exp, rep, *, recovery, rate, outage_ms, table, mode="mute",
 
             t_fault = now_ms()
             if mode == "mute":
-                ack = call(c.ports[victim], {"type": "InjectFailure", "duration_ms": outage_ms})
+                ack = call(c.addrs[victim], {"type": "InjectFailure", "duration_ms": outage_ms})
                 assert ack["type"] == "FailureAccepted", ack
             else:
                 c.kill(victim)
@@ -238,7 +339,7 @@ def run(exp, rep, *, recovery, rate, outage_ms, table, mode="mute",
             # Ready, or not within the limit (e.g. both_agree with a survivor down).
             recovered = True
             try:
-                wait_for(lambda: (s := status(c.ports[victim], 0.5)) is not None
+                wait_for(lambda: (s := status(c.addrs[victim], 0.5)) is not None
                          and s["phase"] == "ready", ready_limit_s, "victim ready")
             except TimeoutError:
                 recovered = False
@@ -368,6 +469,7 @@ def restart(reps):
 
 
 EXPERIMENTS = {"transfer": transfer, "load": load, "ready_rule": ready_rule, "restart": restart}
+LAB = None  # the parsed lab.json in lab mode
 
 
 def main():
@@ -375,7 +477,18 @@ def main():
     ap.add_argument("experiment", choices=[*EXPERIMENTS, "all"])
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--resume", action="store_true", help="skip runs already in the CSV")
+    ap.add_argument("--lab", type=Path, help="lab.json: run on lab PCs through their agents")
     args = ap.parse_args()
+    global LAB, OUT, RAW
+    if args.lab:
+        LAB = json.loads(args.lab.read_text())
+        OUT = OUT / "lab"
+        RAW = OUT / "raw"
+        for a in [n.get("agent", f"{n['host']}:7400") for n in LAB["nodes"]] + LAB["clients"]:
+            try:
+                print(f"agent {a}: clock offset {clock_offset(a):+.0f} ms", flush=True)
+            except OSError as e:
+                sys.exit(f"agent {a} unreachable: {e}")
     names = list(EXPERIMENTS) if args.experiment == "all" else [args.experiment]
     OUT.mkdir(parents=True, exist_ok=True)
     for name in names:

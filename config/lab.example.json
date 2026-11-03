@@ -1,0 +1,8 @@
+{
+  "nodes": [
+    {"host": "IP_PC1", "port": 7001, "agent": "IP_PC1:7400"},
+    {"host": "IP_PC2", "port": 7002, "agent": "IP_PC2:7400"},
+    {"host": "IP_PC3", "port": 7003, "agent": "IP_PC3:7400"}
+  ],
+  "clients": ["IP_PC4:7400", "IP_PC5:7400", "IP_PC6:7400"]
+}

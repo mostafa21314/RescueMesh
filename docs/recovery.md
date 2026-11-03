@@ -361,6 +361,9 @@ python3 scripts/recovery_bench.py all --reps 5     # ≈ 1.5 h on a laptop
 python3 scripts/recovery_report.py                 # tables + figures
 ```
 
+On the six lab PCs: [lab-experiments.md](lab-experiments.md) (same
+experiments, `--lab lab.json`, results in `experiments/recovery/lab/`).
+
 Raw per-request client logs: `experiments/recovery/raw/` (one CSV per run,
 columns as in the client's `--out` file). Summary rows:
 `experiments/recovery/{transfer,load,ready_rule,restart}.csv`.
