@@ -134,6 +134,81 @@ pub struct NodeConfig {
     pub table_ttl_ms: u64,
     #[serde(default)]
     pub campus: CampusParams,
+    #[serde(default)]
+    pub recovery: RecoveryParams,
+}
+
+/// What a returning node pulls from each survivor (docs/recovery.md, R2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Transfer {
+    /// Every retained request and result.
+    Full,
+    /// Only entries the survivor changed while this node was away (plus
+    /// `delta_margin_ms`); a process that just started still pulls everything.
+    #[default]
+    Delta,
+}
+
+/// How a survivor builds the snapshot it serves (docs/recovery.md, R3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotBuild {
+    /// Copy and queue every record in one hold of the state lock.
+    Locked,
+    /// List the keys under the lock, then copy 64 records per lock hold.
+    #[default]
+    Chunked,
+}
+
+/// When the returning node trusts what it pulled (docs/recovery.md, R4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadyRule {
+    /// Both survivors answered, report the same epoch and server, and
+    /// neither is electing.
+    BothAgree,
+    /// One non-electing survivor answered (itself + 1 = 2 of 3); the other
+    /// is waited for up to `majority_wait_ms`.
+    #[default]
+    Majority,
+}
+
+/// Recovery choices, switchable so they can be compared by experiment.
+/// The defaults are the measured best (docs/recovery.md, "Final choices");
+/// `full` / `locked` / `both_agree` / `on_start = false` is the protocol as
+/// first merged (PR 38).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecoveryParams {
+    pub transfer: Transfer,
+    pub snapshot: SnapshotBuild,
+    pub ready_rule: ReadyRule,
+    /// Recover from the peers when the process starts, not only after a mute
+    /// (docs/recovery.md, R5). Off: a restarted node starts Ready and empty.
+    pub on_start: bool,
+    /// Delta transfer: extra history sent before the outage started, to cover
+    /// replicas that were still in flight when it began.
+    pub delta_margin_ms: u64,
+    /// Majority rule: how long to wait for the second survivor after the first.
+    pub majority_wait_ms: u64,
+    /// Process start: if no peer is Ready for this long, start Ready and
+    /// empty (the whole cluster is starting, or no survivor is reachable).
+    pub boot_wait_ms: u64,
+}
+
+impl Default for RecoveryParams {
+    fn default() -> Self {
+        RecoveryParams {
+            transfer: Transfer::Delta,
+            snapshot: SnapshotBuild::Chunked,
+            ready_rule: ReadyRule::Majority,
+            on_start: true,
+            delta_margin_ms: 2000,
+            majority_wait_ms: 500,
+            boot_wait_ms: 2000,
+        }
+    }
 }
 
 fn default_min_tenure_ms() -> u64 {

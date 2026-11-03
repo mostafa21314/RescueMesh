@@ -203,7 +203,12 @@ async fn a_lone_node_serves_degraded_only_after_three_seconds() {
             },
         ];
         init_logs();
-        let node = cloud_node::start_with_listener(node_cfg(1, &addr, peers), listener)
+        // Degraded mode from the first request on: with recovery.on_start, a
+        // node whose peers are all unreachable would first wait boot_wait_ms
+        // (docs/recovery.md, R5) before its 3 s alone begin.
+        let mut cfg = node_cfg(1, &addr, peers);
+        cfg.recovery.on_start = false;
+        let node = cloud_node::start_with_listener(cfg, listener)
             .await
             .unwrap();
 

@@ -10,7 +10,8 @@ Phase 1 status:
 | 2. Distributed election for workload assignment, with a load metric | **done (Part B)**: on-demand, retry-triggered election; per-request mode for comparison |
 | 3. Concurrent processing and parallelization write-up | **done**: async client/node I/O, fixed planner threads; see the document below |
 | 4. Temporary server failures up to 20 seconds | **implemented and locally tested**: mute, survivor election, automatic pull recovery before rejoin |
-| 5–6. Broader recovery experiments and stress analysis | temporary-outage recovery implemented; persistent crash recovery and large-scale analysis remain |
+| 5. Server rejoin and state recovery | **implemented and measured**: pull recovery after a mute and after a process restart; 4 alternatives compared over 170 runs ([docs/recovery.md](docs/recovery.md)) |
+| 6. Stress analysis across client loads | recovery/failover measured at 50–200 req/s; full client-scaling sweep remains |
 
 ## Layout
 
@@ -22,7 +23,7 @@ crates/client      client library + CLI (fan-out to all nodes, retries)
 config/            lab configs (node1-3.toml, client.toml); config/local/ = all on 127.0.0.1
 scripts/           run_local: start or stop 3 nodes locally; lab: set_ips, start_node,
                    open_ports (Windows), check_cluster; package.sh builds dist/<target>/
-docs/              protocol.md, design-log.md, library-vs-ours.md, deployment.md
+docs/              recovery.md, protocol.md, design-log.md, library-vs-ours.md, deployment.md
 ```
 
 ## Build and test
@@ -89,6 +90,7 @@ campus locally. Log level: `RUST_LOG=debug` for per-request lines.
 ## Docs
 
 - [docs/concurrency-and-failures.md](docs/concurrency-and-failures.md): parallelization models, election choice, 20-second failure demo, recovery and limitations
+- [docs/recovery.md](docs/recovery.md): server recovery: state inventory, protocol diagrams, decisions with alternatives, measured comparison of the variants
 - [docs/protocol.md](docs/protocol.md): messages, timeouts, retry rules
 - [docs/design-log.md](docs/design-log.md): each decision, its alternatives, and why
 - [docs/library-vs-ours.md](docs/library-vs-ours.md): what crates provide vs. our code

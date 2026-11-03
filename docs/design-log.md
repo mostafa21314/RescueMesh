@@ -583,7 +583,51 @@ one machine, no network between the nodes; to be repeated in the lab.
   the cluster doesn't settle in time, it says so before printing. It doesn't see
   frames still in a peer link's queue (limitation a, below).
 
+## Recovery (bullet 5)
+
+The full write-up, with diagrams, the state inventory and the measurements, is
+[recovery.md](recovery.md). The entries below are the decisions in short; each
+names the `[recovery]` config key that switches it, so every alternative can be
+re-measured with `scripts/recovery_bench.py`.
+
+### D39. Pull a snapshot from the survivors (vs. push, vs. replaying the peer backlog)
+See recovery.md R1. The returning node is the only one that knows it was away;
+with no heartbeats (D15) the survivors cannot tell when to push. The peer-link
+backlog (limitation a) is bounded by frame count and replays stale bids.
+
+### D40. Copy results and requests, rebuild the ledger, replay nothing
+See recovery.md §2 and R6. The result rule (D27) and the ledger's conflict rule
+(D12) are order-independent, so an unordered set of entries is enough; an
+ordered operation log is unnecessary.
+
+### D41. Full vs. delta transfer (`recovery.transfer`)
+See recovery.md R2 and Results. Delta selects entries changed in the last *d* ms,
+*d* sent as a duration (no cross-machine clock comparison), plus a 2 s margin.
+
+### D42. Snapshot built in one lock hold vs. chunked (`recovery.snapshot`)
+See recovery.md R3 and Results. The serving survivor's state lock blocks its
+request handling for as long as it is held.
+
+### D43. Ready rule: both survivors agree vs. majority (`recovery.ready_rule`)
+See recovery.md R4 and Results. Includes the fix for a start-up deadlock: a
+peer that is itself starting empty is left out of the agreement.
+
+### D44. A restarted process recovers before serving (`recovery.on_start`)
+See recovery.md R5 and Results. Resolves limitations b and c below for a node
+whose peers are up.
+
+### D45. "Not ready" is answered, not ignored; the digest is incremental
+See recovery.md R8, R9. A requester no longer waits out the 10 s transfer limit
+on a peer that is not Ready; status queries no longer serialize the whole
+results table under the state lock.
+
 ## Known limitations (open, for bullet 5)
+
+Status after D39–D45: **a** no longer matters for correctness (recovery pulls
+what the node missed; the backlog is discarded on mute by PR 38's outage
+generation). **b** and **c** are resolved by `recovery.on_start` when at least
+one peer is up; with both peers down, c remains (no disk persistence).
+
 
 a. **The peer link's backlog has no useful limit.** While a peer is down, its link
    keeps every undelivered message (`Replicate`, but also `ElectBid`) and sends

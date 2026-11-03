@@ -34,6 +34,33 @@ pub struct RecoveryResult {
     pub plan: Plan,
 }
 
+/// What one recovery did and how long each part took.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecoveryReport {
+    /// "mute" (rejoin after a temporary failure) or "start" (process start).
+    pub cause: String,
+    /// From the end of the outage (or process start) to Ready.
+    pub total_ms: u64,
+    /// Waiting for this node's own planners to finish.
+    pub drain_ms: u64,
+    /// The last, successful round of snapshot transfers.
+    pub fetch_ms: u64,
+    /// Merging the snapshots, rebuilding the ledger, republishing.
+    pub install_ms: u64,
+    /// Transfer rounds, including failed or rejected ones.
+    pub rounds: u32,
+    /// Snapshots used, records and payload bytes received in them.
+    pub snapshots_used: u32,
+    pub records_received: u64,
+    pub bytes_received: u64,
+    /// Results this node did not hold before the merge.
+    pub new_results: u64,
+    /// Results republished to a survivor that lacked them.
+    pub republished: u64,
+    /// Started Ready and empty because no peer was Ready (process start only).
+    pub bootstrap: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Message {
@@ -100,8 +127,14 @@ pub enum Message {
         reason: String,
     },
     /// Returning node pulls a fixed snapshot from each ready survivor.
+    ///
+    /// `since_ms`: send only entries changed in the last `since_ms` ms, as
+    /// measured on the survivor's own clock (a duration, so clock skew between
+    /// machines doesn't matter). `None`: send everything (full transfer).
     RecoveryRequest {
         node_id: NodeId,
+        #[serde(default)]
+        since_ms: Option<u64>,
     },
     RecoveryChunk {
         records: Vec<RecoveryRecord>,
@@ -112,6 +145,13 @@ pub enum Message {
         server: Option<NodeId>,
         electing: bool,
         records: usize,
+    },
+    /// Survivor → returning node: not Ready, so it has no trustworthy
+    /// snapshot. `has_state` is false for a process that just started empty.
+    RecoveryUnavailable {
+        node_id: NodeId,
+        phase: NodePhase,
+        has_state: bool,
     },
     /// Diagnostic: client → node. Not part of request processing.
     StatusRequest,
@@ -136,6 +176,7 @@ impl Message {
             Message::RecoveryRequest { .. } => "RecoveryRequest",
             Message::RecoveryChunk { .. } => "RecoveryChunk",
             Message::RecoveryComplete { .. } => "RecoveryComplete",
+            Message::RecoveryUnavailable { .. } => "RecoveryUnavailable",
         }
     }
 }
@@ -149,6 +190,15 @@ pub struct NodeStatus {
     pub faults_injected: u64,
     #[serde(default)]
     pub last_recovery_ms: Option<u64>,
+    /// Breakdown of this node's most recent recovery.
+    #[serde(default)]
+    pub last_recovery: Option<RecoveryReport>,
+    /// Snapshots this node served to returning peers, and the longest single
+    /// hold of its state lock while building one, in microseconds.
+    #[serde(default)]
+    pub snapshots_served: u64,
+    #[serde(default)]
+    pub snapshot_lock_max_us: u64,
     pub epoch: Epoch,
     pub server: Option<NodeId>,
     pub degraded: bool,
@@ -196,6 +246,9 @@ mod tests {
             phase: NodePhase::Ready,
             faults_injected: 0,
             last_recovery_ms: None,
+            last_recovery: None,
+            snapshots_served: 0,
+            snapshot_lock_max_us: 0,
             epoch: 0,
             server: Some(1),
             degraded: false,

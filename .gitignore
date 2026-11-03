@@ -5,3 +5,8 @@ logs/
 .DS_Store
 dist/
 bin1/
+
+# Recovery experiments: keep the summary rows, not the raw per-request logs.
+!experiments/recovery/*.csv
+experiments/recovery/raw/
+experiments/recovery/sweep*.log

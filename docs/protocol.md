@@ -210,21 +210,40 @@ snapshot protocol below.
   1..=20,000 ms. It returns `FailureAccepted {node_id, duration_ms}` before normal
   communication is suppressed, or `FailureRejected {reason}`. The client CLI
   chooses the currently elected server and requires all nodes ready beforehand.
-- `RecoveryRequest {node_id}`: a returning node requests a snapshot from a
-  configured, ready peer on a dedicated connection.
+- `RecoveryRequest {node_id, since_ms}`: a returning node asks a configured peer
+  for a snapshot, on a dedicated connection. `since_ms = null` asks for every
+  retained entry (full transfer, and always after a process start);
+  `since_ms = d` asks only for entries the peer changed in its last `d` ms, by
+  its own clock (delta transfer: `d` = time since the outage began +
+  `delta_margin_ms`). A duration, not a timestamp, so clock skew between
+  machines does not matter.
 - `RecoveryChunk {records}`: at most 64 records per chunk; each includes request
   ID, attempt/epoch, incident, complexity, and optional completed result.
 - `RecoveryComplete {node_id, epoch, server, electing, records}`: ends that fixed
-  snapshot and declares its record count and role view. Interrupted/incomplete
-  transfers are discarded. Both survivors must respond and agree on the role
-  view outside an active election before the returning node becomes ready.
+  snapshot and declares its record count and role view (read after the
+  records, so it is at least as new as they are). Interrupted/incomplete
+  transfers are discarded.
+- `RecoveryUnavailable {node_id, phase, has_state}`: the peer is not Ready, so
+  it has no snapshot to give. Sent at once, so the requester does not wait out
+  the 10 s transfer limit. `has_state = false`: the peer itself just started
+  empty, and is left out of the ready rule.
+
+When the returning node trusts what it pulled is the `ready_rule`:
+`both_agree` (both survivors answered with the same epoch and server, neither
+electing) or `majority` (one non-electing survivor answered; the other is
+waited for up to `majority_wait_ms`). See [recovery.md](recovery.md) for the
+choices and their measured costs.
 
 During `muted`, normal messages are discarded. During `recovering`, the node
-accepts live replicas and status queries but cannot bid or process client work.
-It merges both snapshots, reconstructs the ledger, resets old election timers,
-and only then enables normal participation. Status includes `phase`,
-`faults_injected`, and `last_recovery_ms`. This is live-process outage recovery,
-not durable crash recovery or a majority-committed assignment protocol.
+accepts live replicas, status queries and recovery requests (answering
+`RecoveryUnavailable`) but cannot bid or process client work. It merges the
+snapshots, reconstructs the ledger, resets old election timers, republishes
+results a survivor lacked, and only then enables normal participation. With
+`recovery.on_start`, a node that starts (or restarts after a crash) begins in
+`recovering` too. `Status` includes `phase`, `faults_injected`,
+`last_recovery_ms`, `last_recovery` (the breakdown of the last recovery),
+`snapshots_served` and `snapshot_lock_max_us`. State is in memory only: a node
+recovers from its peers, never from disk.
 
 ## Request lifecycle (on-demand mode)
 
