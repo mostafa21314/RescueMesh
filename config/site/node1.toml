@@ -1,6 +1,6 @@
 node_id = 1
 listen = "0.0.0.0:7001"
-peers = [{ id = 2, addr = "10.7.57.4:7002" }, { id = 3, addr = "10.7.57.11:7003" }]
+peers = [{ id = 2, addr = "10.26.210.65:7002" }, { id = 3, addr = "10.26.210.63:7003" }]
 election_mode = "on_demand"
 policy = "Composite"
 bid_timeout_ms = 100
