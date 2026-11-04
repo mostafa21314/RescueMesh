@@ -1,0 +1,19 @@
+node_id = 2
+listen = "0.0.0.0:7002"
+peers = [{ id = 1, addr = "10.7.22.33:7001" }, { id = 3, addr = "10.7.57.11:7003" }]
+election_mode = "on_demand"
+policy = "Composite"
+bid_timeout_ms = 100
+degraded_after_ms = 3000
+min_tenure_ms = 1000
+cpu_source = "machine"
+workers = 3
+seed = 42
+queue_capacity = 4096
+table_ttl_ms = 1800000
+
+[recovery]
+transfer = "delta"
+snapshot = "chunked"
+ready_rule = "majority"
+on_start = true
