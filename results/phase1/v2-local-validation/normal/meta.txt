@@ -1,0 +1,6 @@
+label: normal; severity=3; UDP RR; Windows-10-10.0.26200-SP0
+started_unix_ms: 1793796116335
+harness_machine: windows x86_64, 24 logical cores
+nodes: ["127.0.0.1:64348", "127.0.0.1:64349", "127.0.0.1:64350"]
+request_timeout_ms: 1000 max_attempts: 8
+args: Args { config: "E:\\RescueMesh\\.tools\\v2-local-config\\client.toml", clients: [4, 16], reps: 2, requests: 180, rate: 30.0, complexity: 5, fault_ms: None, fault_at_ms: 5000, sample_ms: 250, pause_ms: 1000, seed: 42, out: "E:\\RescueMesh\\results\\phase1\\v2-local-validation\\normal", client_bin: None, client_threads: 2, settle_secs: 15, label: "normal; severity=3; UDP RR; Windows-10-10.0.26200-SP0", before_run: None, fault_cmd: None, local_nodes: Some("E:\\RescueMesh\\.tools\\v2-local-config"), load_node: None, load_threads: 2, allow_unconverged: false, load_incumbent: false, load_follower: false }

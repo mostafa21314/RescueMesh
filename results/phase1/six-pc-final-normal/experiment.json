@@ -1,0 +1,54 @@
+{
+  "campaign": "5dfd072cfad14714a30424df78a87ccd",
+  "source_id": "6141f87aaf78186020359f9aaccf95c7c19d12218d46e6769cd4ec999831ead2",
+  "settings": {
+    "profile": "smoke",
+    "rates": [
+      30.0
+    ],
+    "processes": [
+      1
+    ],
+    "reps": 1,
+    "duration": 5,
+    "complexity": 1,
+    "workers": 3,
+    "queue_capacity": 64,
+    "seed": 42,
+    "at_seconds": 1,
+    "load_seconds": 2,
+    "load_fraction": 0.5,
+    "soak_seconds": 10,
+    "node_log_level": "warn",
+    "settle_seconds": 15.0,
+    "sample_ms": 500,
+    "lead_seconds": 1.0,
+    "points": null
+  },
+  "lab": {
+    "nodes": [
+      {
+        "host": "127.0.0.1",
+        "port": 52686,
+        "agent": "127.0.0.1:58181"
+      },
+      {
+        "host": "127.0.0.1",
+        "port": 52687,
+        "agent": "127.0.0.1:58182"
+      },
+      {
+        "host": "127.0.0.1",
+        "port": 52688,
+        "agent": "127.0.0.1:58183"
+      }
+    ],
+    "clients": [
+      "127.0.0.1:58184",
+      "127.0.0.1:58185",
+      "127.0.0.1:58186"
+    ]
+  },
+  "created_ms": 1793808862041,
+  "protocol_version": 2
+}

@@ -132,6 +132,7 @@ dependencies = [
  "anyhow",
  "clap",
  "common",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

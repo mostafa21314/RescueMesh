@@ -1,0 +1,52 @@
+{
+  "incumbent": {
+    "requests": "480",
+    "answered": "480",
+    "failed": "0",
+    "baseline_agreed": "true",
+    "converged": "true",
+    "load_actual_node": "1",
+    "elections": "0",
+    "failover_ms": "",
+    "recovery_ms": "",
+    "worker_expired": "0"
+  },
+  "follower": {
+    "requests": "480",
+    "answered": "480",
+    "failed": "0",
+    "baseline_agreed": "true",
+    "converged": "true",
+    "load_actual_node": "2",
+    "elections": "0",
+    "failover_ms": "",
+    "recovery_ms": "",
+    "worker_expired": "0"
+  },
+  "fault20": {
+    "requests": "3360",
+    "answered": "3360",
+    "failed": "0",
+    "baseline_agreed": "true",
+    "converged": "true",
+    "load_actual_node": "",
+    "elections": "1",
+    "failover_ms": "1121.000",
+    "recovery_ms": "56.000",
+    "worker_expired": "0"
+  },
+  "overload": {
+    "requests": "4800",
+    "answered": "22",
+    "failed": "4778",
+    "baseline_agreed": "true",
+    "converged": "false",
+    "load_actual_node": "",
+    "elections": "9",
+    "failover_ms": "",
+    "recovery_ms": "",
+    "worker_expired": "7",
+    "fail_stop_verified": true,
+    "failed_elapsed_and_client_ids_verified": 4778
+  }
+}

@@ -5,6 +5,9 @@
 use crate::model::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use uuid::Uuid;
+
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +38,62 @@ pub struct RecoveryResult {
     pub epoch: Epoch,
     pub degraded: bool,
     pub plan: Plan,
+    /// Origin-selected retention deadline, preserved through replication/repair.
+    #[serde(default)]
+    pub retained_until_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerQueueStatus {
+    pub node_id: NodeId,
+    pub control_queued: usize,
+    pub replication_queued: usize,
+    pub dropped_control: u64,
+    pub dropped_replication: u64,
+    pub batches_sent: u64,
+    pub reconnects: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerStats {
+    pub started: u64,
+    pub queue_wait_total_us: u64,
+    pub queue_wait_max_us: u64,
+    pub expired_before_start: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncProgress {
+    pub node_id: NodeId,
+    pub cursor: u64,
+    pub latest: u64,
+    pub repaired_results: u64,
+    pub failures: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ResultsDigest {
+    pub node_id: NodeId,
+    pub phase: NodePhase,
+    pub epoch: Epoch,
+    pub server: Option<NodeId>,
+    pub count: usize,
+    pub digest: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SyncReply {
+    pub node_id: NodeId,
+    pub incarnation: Uuid,
+    pub phase: NodePhase,
+    pub next_revision: u64,
+    pub latest_revision: u64,
+    pub records: Vec<RecoveryRecord>,
+    pub results_digest: u64,
+    pub epoch: Epoch,
+    pub server: Option<NodeId>,
+    pub electing: bool,
+    pub has_authoritative_state: bool,
 }
 
 /// What one recovery did and how long each part took.
@@ -74,6 +133,12 @@ pub enum Message {
         incident: Incident,
         /// Scales the planner's CPU cost (number of travel-time scenarios).
         complexity: u32,
+        /// Best-effort unsubscribe notifications, piggybacked without another RTT.
+        #[serde(default)]
+        finished: Vec<RequestId>,
+    },
+    ClientFinished {
+        request_ids: Vec<RequestId>,
     },
     /// Serving node (or any node holding the result) → client.
     PlanResponse {
@@ -93,7 +158,28 @@ pub enum Message {
         /// The origin computed the plan while serving alone (degraded mode).
         #[serde(default)]
         degraded: bool,
+        #[serde(default)]
+        retained_until_ms: u64,
     },
+    /// Bounded replication batch on a separate link from election traffic.
+    ReplicateBatch {
+        records: Vec<RecoveryRecord>,
+    },
+    /// Incremental anti-entropy. A different incarnation restarts the cursor.
+    SyncRequest {
+        node_id: NodeId,
+        incarnation: Option<Uuid>,
+        after_revision: u64,
+        #[serde(default)]
+        recovery: bool,
+    },
+    SyncReply(Box<SyncReply>),
+    /// Compare a fixed cohort, or a retention-safe whole-table baseline.
+    ResultsDigestRequest {
+        client_ids: Vec<Uuid>,
+        min_retained_until_ms: u64,
+    },
+    ResultsDigest(ResultsDigest),
     /// Node → both peers: a bid in an election.
     ///
     /// On-demand mode: `request_id` is `None` and the election is for
@@ -186,8 +272,14 @@ impl Message {
     pub fn kind(&self) -> &'static str {
         match self {
             Message::SubmitIncident { .. } => "SubmitIncident",
+            Message::ClientFinished { .. } => "ClientFinished",
             Message::PlanResponse { .. } => "PlanResponse",
             Message::Replicate { .. } => "Replicate",
+            Message::ReplicateBatch { .. } => "ReplicateBatch",
+            Message::SyncRequest { .. } => "SyncRequest",
+            Message::SyncReply(_) => "SyncReply",
+            Message::ResultsDigestRequest { .. } => "ResultsDigestRequest",
+            Message::ResultsDigest(_) => "ResultsDigest",
             Message::Busy { .. } => "Busy",
             Message::ElectBid { .. } => "ElectBid",
             Message::StatusRequest => "StatusRequest",
@@ -210,6 +302,22 @@ impl Message {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeStatus {
+    #[serde(default)]
+    pub server_unix_ms: u64,
+    #[serde(default)]
+    pub protocol_version: u32,
+    #[serde(default)]
+    pub configuration: Option<crate::config::NodeConfig>,
+    #[serde(default)]
+    pub platform: String,
+    #[serde(default)]
+    pub incarnation: Option<Uuid>,
+    #[serde(default)]
+    pub peer_queues: Vec<PeerQueueStatus>,
+    #[serde(default)]
+    pub sync: Vec<SyncProgress>,
+    #[serde(default)]
+    pub workers: WorkerStats,
     #[serde(default)]
     pub transport: crate::rr::TransportStats,
     pub node_id: NodeId,
@@ -280,6 +388,14 @@ pub struct NodeStatus {
 /// Answer to `ProbeRequest`: the parts of `NodeStatus` that are cheap to read.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeProbe {
+    #[serde(default)]
+    pub protocol_version: u32,
+    #[serde(default)]
+    pub peer_control_queued: usize,
+    #[serde(default)]
+    pub peer_replication_queued: usize,
+    #[serde(default)]
+    pub sync_lag: u64,
     pub node_id: NodeId,
     pub phase: NodePhase,
     pub epoch: Epoch,
@@ -301,6 +417,14 @@ mod tests {
     #[test]
     fn status_round_trips_through_json() {
         let st = NodeStatus {
+            server_unix_ms: 0,
+            protocol_version: PROTOCOL_VERSION,
+            configuration: None,
+            platform: "test".into(),
+            incarnation: None,
+            peer_queues: Vec::new(),
+            sync: Vec::new(),
+            workers: WorkerStats::default(),
             transport: crate::rr::TransportStats::default(),
             node_id: 1,
             phase: NodePhase::Ready,

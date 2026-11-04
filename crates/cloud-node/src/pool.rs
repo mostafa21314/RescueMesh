@@ -6,10 +6,13 @@
 //! election ranks on). Queued-but-not-started jobs can be dropped (step-down
 //! in Part B); running jobs always finish.
 
+use common::config::{SchedulingParams, SchedulingPolicy};
+use common::WorkerStats;
 use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PoolLoad {
@@ -20,17 +23,26 @@ pub struct PoolLoad {
 }
 
 struct Queue<J> {
-    jobs: VecDeque<(u64, J)>,
+    jobs: VecDeque<Queued<J>>,
     queued_cost: u64,
     running_cost: u64,
     running: usize,
     shutdown: bool,
+    stats: WorkerStats,
+}
+
+struct Queued<J> {
+    cost: u64,
+    job: J,
+    priority: u32,
+    entered: Instant,
 }
 
 struct Inner<J> {
     q: Mutex<Queue<J>>,
     cv: Condvar,
     capacity: usize,
+    scheduling: SchedulingParams,
 }
 
 pub struct Pool<J> {
@@ -43,6 +55,26 @@ impl<J: Send + 'static> Pool<J> {
     where
         F: Fn(J) + Send + Sync + 'static,
     {
+        Self::with_scheduler(
+            workers,
+            capacity,
+            SchedulingParams {
+                policy: SchedulingPolicy::Fifo,
+                ..Default::default()
+            },
+            handler,
+        )
+    }
+
+    pub fn with_scheduler<F>(
+        workers: usize,
+        capacity: usize,
+        scheduling: SchedulingParams,
+        handler: F,
+    ) -> Self
+    where
+        F: Fn(J) + Send + Sync + 'static,
+    {
         let inner = Arc::new(Inner {
             q: Mutex::new(Queue {
                 jobs: VecDeque::new(),
@@ -50,9 +82,11 @@ impl<J: Send + 'static> Pool<J> {
                 running_cost: 0,
                 running: 0,
                 shutdown: false,
+                stats: WorkerStats::default(),
             }),
             cv: Condvar::new(),
             capacity,
+            scheduling,
         });
         let handler = Arc::new(handler);
         let threads = (0..workers)
@@ -73,26 +107,21 @@ impl<J: Send + 'static> Pool<J> {
 
     /// Queues `job`, or hands it back if the queue is full.
     pub fn try_submit(&self, cost: u64, job: J) -> Result<(), J> {
+        self.try_submit_ranked(cost, 0, job)
+    }
+
+    pub fn try_submit_ranked(&self, cost: u64, priority: u32, job: J) -> Result<(), J> {
         let mut q = self.inner.q.lock().unwrap();
         if q.shutdown || q.jobs.len() >= self.inner.capacity {
             return Err(job);
         }
         q.queued_cost += cost;
-        q.jobs.push_back((cost, job));
-        drop(q);
-        self.inner.cv.notify_one();
-        Ok(())
-    }
-
-    /// Queues `job` even if the queue is full (a new server taking over its
-    /// request table must execute every not-completed request).
-    pub fn force_submit(&self, cost: u64, job: J) -> Result<(), J> {
-        let mut q = self.inner.q.lock().unwrap();
-        if q.shutdown {
-            return Err(job);
-        }
-        q.queued_cost += cost;
-        q.jobs.push_back((cost, job));
+        q.jobs.push_back(Queued {
+            cost,
+            job,
+            priority: priority.min(1000),
+            entered: Instant::now(),
+        });
         drop(q);
         self.inner.cv.notify_one();
         Ok(())
@@ -102,7 +131,33 @@ impl<J: Send + 'static> Pool<J> {
     pub fn drop_queued(&self) -> Vec<J> {
         let mut q = self.inner.q.lock().unwrap();
         q.queued_cost = 0;
-        q.jobs.drain(..).map(|(_, j)| j).collect()
+        q.jobs.drain(..).map(|j| j.job).collect()
+    }
+
+    pub fn stats(&self) -> WorkerStats {
+        self.inner.q.lock().unwrap().stats.clone()
+    }
+
+    pub fn free_slots(&self) -> usize {
+        self.inner
+            .capacity
+            .saturating_sub(self.inner.q.lock().unwrap().jobs.len())
+    }
+
+    pub fn discard_where(&self, predicate: impl Fn(&J) -> bool) -> Vec<J> {
+        let mut q = self.inner.q.lock().unwrap();
+        let mut removed = Vec::new();
+        let mut kept = VecDeque::new();
+        while let Some(item) = q.jobs.pop_front() {
+            if predicate(&item.job) {
+                q.queued_cost -= item.cost;
+                removed.push(item.job);
+            } else {
+                kept.push_back(item);
+            }
+        }
+        q.jobs = kept;
+        removed
     }
 
     pub fn load(&self) -> PoolLoad {
@@ -132,11 +187,38 @@ fn worker<J>(inner: &Inner<J>, handler: &(dyn Fn(J) + Send + Sync)) {
                 if q.shutdown {
                     return;
                 }
-                if let Some(item) = q.jobs.pop_front() {
-                    q.queued_cost -= item.0;
-                    q.running_cost += item.0;
+                if !q.jobs.is_empty() {
+                    let now = Instant::now();
+                    let index = if inner.scheduling.policy == SchedulingPolicy::Fifo {
+                        0
+                    } else {
+                        q.jobs
+                            .iter()
+                            .enumerate()
+                            .max_by(|(ia, a), (ib, b)| {
+                                priority_score(
+                                    a.priority,
+                                    now.duration_since(a.entered).as_secs_f64() * 1000.0,
+                                    inner.scheduling,
+                                )
+                                .total_cmp(&priority_score(
+                                    b.priority,
+                                    now.duration_since(b.entered).as_secs_f64() * 1000.0,
+                                    inner.scheduling,
+                                ))
+                                .then_with(|| ib.cmp(ia))
+                            })
+                            .map_or(0, |(i, _)| i)
+                    };
+                    let item = q.jobs.remove(index).unwrap();
+                    let waited = now.duration_since(item.entered).as_micros() as u64;
+                    q.stats.started += 1;
+                    q.stats.queue_wait_total_us += waited;
+                    q.stats.queue_wait_max_us = q.stats.queue_wait_max_us.max(waited);
+                    q.queued_cost -= item.cost;
+                    q.running_cost += item.cost;
                     q.running += 1;
-                    break item;
+                    break (item.cost, item.job);
                 }
                 q = inner.cv.wait(q).unwrap();
             }
@@ -150,11 +232,65 @@ fn worker<J>(inner: &Inner<J>, handler: &(dyn Fn(J) + Send + Sync)) {
     }
 }
 
+/// Age grows without bound; the initial urgency advantage decays exponentially.
+/// An arrival cannot postpone an older low-priority job beyond the boost window.
+fn priority_score(priority: u32, age_ms: f64, p: SchedulingParams) -> f64 {
+    age_ms
+        + p.priority_boost_ms as f64 * f64::from(priority.min(1000)) / 1000.0
+            * (-age_ms / p.priority_half_life_ms as f64).exp2()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    fn priority_order(age_low: bool, policy: SchedulingPolicy) -> Vec<u32> {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel();
+        let gate_rx = Mutex::new(gate_rx);
+        let pool = Pool::with_scheduler(
+            1,
+            3,
+            SchedulingParams {
+                policy,
+                ..Default::default()
+            },
+            move |id| {
+                started_tx.send(id).unwrap();
+                gate_rx.lock().unwrap().recv().unwrap();
+            },
+        );
+        pool.try_submit_ranked(1, 0, 0u32).unwrap();
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+        pool.try_submit_ranked(1, 0, 1).unwrap();
+        if age_low {
+            pool.inner.q.lock().unwrap().jobs[0].entered -= Duration::from_millis(500);
+        }
+        pool.try_submit_ranked(1, 1000, 2).unwrap();
+        let mut order = Vec::new();
+        for _ in 0..2 {
+            gate_tx.send(()).unwrap();
+            order.push(started_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        }
+        gate_tx.send(()).unwrap();
+        pool.shutdown();
+        order
+    }
+
+    #[test]
+    fn urgency_overtakes_recent_low_priority_but_waiting_prevents_starvation() {
+        assert_eq!(
+            priority_order(false, SchedulingPolicy::PriorityDecay),
+            vec![2, 1]
+        );
+        assert_eq!(
+            priority_order(true, SchedulingPolicy::PriorityDecay),
+            vec![1, 2]
+        );
+        assert_eq!(priority_order(false, SchedulingPolicy::Fifo), vec![1, 2]);
+    }
 
     #[test]
     fn full_queue_rejects_and_drop_queued_keeps_running_job() {

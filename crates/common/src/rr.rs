@@ -25,6 +25,7 @@ const ACK: u8 = 1;
 const HELLO: u8 = 2;
 const WELCOME: u8 = 3;
 const RESET: u8 = 4;
+const CLOSE: u8 = 5;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct TransportStats {
@@ -100,6 +101,21 @@ struct State {
     assembly: Mutex<Assembly>,
     acks: Mutex<Acks>,
     changed: Notify,
+    closing: Notify,
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        if self.acks.get_mut().unwrap().reset {
+            return;
+        }
+        let close = packet(CLOSE, self.id, 0, 0, 0, &[]);
+        // Best effort; the read-idle limit remains a fallback if CLOSE is lost.
+        if self.socket.try_send_to(&close, self.peer).is_ok() {
+            SENT.fetch_add(1, Ordering::Relaxed);
+            BYTES.fetch_add(close.len() as u64, Ordering::Relaxed);
+        }
+    }
 }
 
 struct Task(JoinHandle<()>);
@@ -134,6 +150,7 @@ fn session(socket: Arc<UdpSocket>, peer: SocketAddr, id: Uuid) -> Stream {
         assembly: Mutex::new(Assembly::default()),
         acks: Mutex::new(Acks::default()),
         changed: Notify::new(),
+        closing: Notify::new(),
     });
     Stream {
         reader: ReadHalf {
@@ -209,6 +226,12 @@ impl Stream {
                 if state.acks.lock().unwrap().welcome {
                     return Ok(stream);
                 }
+                if state.acks.lock().unwrap().reset {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "UDP session closed",
+                    ));
+                }
                 if tokio::time::timeout_at(until, changed).await.is_err() {
                     break;
                 }
@@ -250,7 +273,7 @@ async fn receive(
         let seq = u64::from_be_bytes(buf[21..29].try_into().unwrap());
         let index = u32::from_be_bytes(buf[29..33].try_into().unwrap());
         let total = u32::from_be_bytes(buf[33..37].try_into().unwrap()) as usize;
-        if kind > RESET || (kind != DATA && (n != HEADER || total != 0)) {
+        if kind > CLOSE || (kind != DATA && (n != HEADER || total != 0)) {
             INVALID.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -283,7 +306,7 @@ async fn receive(
             HELLO => {
                 let _ = send(&socket, peer, &packet(WELCOME, id, 0, 0, 0, &[])).await;
             }
-            ACK | WELCOME | RESET => {
+            ACK | WELCOME | RESET | CLOSE => {
                 let mut a = state.acks.lock().unwrap();
                 if kind == ACK && a.seq == seq {
                     a.fragments.insert(index);
@@ -291,11 +314,15 @@ async fn receive(
                 if kind == WELCOME {
                     a.welcome = true;
                 }
-                if kind == RESET {
+                if kind == RESET || kind == CLOSE {
                     a.reset = true;
+                    state.closing.notify_one();
                 }
                 drop(a);
                 state.changed.notify_one();
+            }
+            DATA if state.acks.lock().unwrap().reset => {
+                let _ = send(&socket, peer, &packet(RESET, id, seq, 0, 0, &[])).await;
             }
             DATA if accept_fragment(&state, seq, index, total, &buf[HEADER..n]) => {
                 let _ = send(&socket, peer, &packet(ACK, id, seq, index, 0, &[])).await;
@@ -379,6 +406,18 @@ impl SendMessage for WriteHalf {
 
 pub async fn read_frame(r: &mut impl ReceiveMessage) -> io::Result<Option<(Message, usize)>> {
     let r = r.reader();
+    let state = r.state.clone();
+    let closing = state.closing.notified();
+    if r.state.acks.lock().unwrap().reset {
+        return Ok(r.rx.try_recv().ok());
+    }
+    tokio::select! {
+        _ = closing => Ok(r.rx.try_recv().ok()),
+        result = receive_frame(r) => result,
+    }
+}
+
+async fn receive_frame(r: &mut ReadHalf) -> io::Result<Option<(Message, usize)>> {
     // Also bounds abandoned server sessions and partial-message retention.
     match tokio::time::timeout(IDLE, r.rx.recv()).await {
         Ok(m) => Ok(m),
@@ -470,6 +509,46 @@ pub async fn write_frame(w: &mut impl SendMessage, msg: &Message) -> io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dropping_a_short_lived_session_closes_the_remote_reader_promptly() {
+        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let client = Stream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        drop(client);
+        let reply = tokio::time::timeout(Duration::from_millis(500), read_frame(&mut server))
+            .await
+            .expect("CLOSE must release a diagnostic session before the idle timeout")
+            .unwrap();
+        assert!(reply.is_none());
+    }
+
+    #[tokio::test]
+    async fn queued_messages_are_delivered_before_close() {
+        let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = Stream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        write_frame(&mut client, &Message::ProbeRequest)
+            .await
+            .unwrap();
+        drop(client);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(matches!(
+            read_frame(&mut server).await.unwrap(),
+            Some((Message::ProbeRequest, _))
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), read_frame(&mut server))
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn fragments_survive_lost_data_lost_acks_duplicates_and_reordering() {

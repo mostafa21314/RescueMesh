@@ -1,0 +1,2 @@
+window,requests,answered,failed,n,mean_ms,sd_ms,p50_ms,p95_ms,p99_ms,max_ms
+whole,720,720,0,720,4.867945833333334,1.9400545304724135,4.935,7.835,8.788,9.892

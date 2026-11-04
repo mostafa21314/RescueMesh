@@ -1,0 +1,689 @@
+{
+  "statuses": [
+    {
+      "type": "Status",
+      "server_unix_ms": 1793807968551,
+      "protocol_version": 2,
+      "configuration": {
+        "node_id": 1,
+        "listen": "0.0.0.0:51752",
+        "peers": [
+          {
+            "id": 2,
+            "addr": "127.0.0.1:51753"
+          },
+          {
+            "id": 3,
+            "addr": "127.0.0.1:51754"
+          }
+        ],
+        "election_mode": "per_request",
+        "policy": "Composite",
+        "weights": {
+          "pending": 0.5,
+          "cpu": 0.3,
+          "service_time": 0.2
+        },
+        "bid_timeout_ms": 100,
+        "degraded_after_ms": 3000,
+        "min_tenure_ms": 1000,
+        "cpu_source": "machine",
+        "workers": 3,
+        "seed": 42,
+        "queue_capacity": 64,
+        "table_ttl_ms": 3600000,
+        "campus": {
+          "grid": 16,
+          "responders": 150,
+          "resources": 100
+        },
+        "recovery": {
+          "transfer": "delta",
+          "snapshot": "chunked",
+          "ready_rule": "majority",
+          "on_start": true,
+          "delta_margin_ms": 2000,
+          "majority_wait_ms": 500
+        },
+        "scheduling": {
+          "policy": "priority_decay",
+          "priority_boost_ms": 250,
+          "priority_half_life_ms": 1000,
+          "request_lease_ms": 10000
+        }
+      },
+      "platform": "windows x86_64 24 logical CPUs",
+      "incarnation": "8a84f695-5fee-4374-a41b-99bc944ff92f",
+      "peer_queues": [
+        {
+          "node_id": 2,
+          "control_queued": 0,
+          "replication_queued": 0,
+          "dropped_control": 0,
+          "dropped_replication": 0,
+          "batches_sent": 360,
+          "reconnects": 2
+        },
+        {
+          "node_id": 3,
+          "control_queued": 0,
+          "replication_queued": 0,
+          "dropped_control": 0,
+          "dropped_replication": 0,
+          "batches_sent": 378,
+          "reconnects": 2
+        }
+      ],
+      "sync": [
+        {
+          "node_id": 2,
+          "cursor": 510,
+          "latest": 510,
+          "repaired_results": 0,
+          "failures": 0
+        },
+        {
+          "node_id": 3,
+          "cursor": 510,
+          "latest": 510,
+          "repaired_results": 1,
+          "failures": 0
+        }
+      ],
+      "workers": {
+        "started": 407,
+        "queue_wait_total_us": 13806,
+        "queue_wait_max_us": 194,
+        "expired_before_start": 0
+      },
+      "transport": {
+        "datagrams_sent": 5990,
+        "bytes_sent": 2320768,
+        "datagrams_received": 6011,
+        "retransmissions": 0,
+        "duplicate_fragments": 0,
+        "invalid_datagrams": 0,
+        "delivery_timeouts": 0
+      },
+      "node_id": 1,
+      "phase": "ready",
+      "faults_injected": 0,
+      "last_recovery_ms": null,
+      "last_recovery": null,
+      "snapshots_served": 0,
+      "snapshot_lock_max_us": 291,
+      "epoch": 0,
+      "server": null,
+      "degraded": false,
+      "elections_decided": 510,
+      "elections_alone": 0,
+      "split_resolutions": 0,
+      "step_downs": 0,
+      "suppressed_triggers": 0,
+      "dropped_on_step_down": 0,
+      "late_results": 0,
+      "requests": 510,
+      "results": 510,
+      "results_digest": 15463029686428937394,
+      "queue_len": 0,
+      "running": 0,
+      "pending_cost": 0,
+      "replicate_conflicts": 1,
+      "duplicate_replicates": 1020,
+      "local_replans": 21,
+      "resource_overcommits": 0,
+      "peer_queue_drops": 0,
+      "peer_last_seen_ms": [
+        [
+          2,
+          23
+        ],
+        [
+          3,
+          22
+        ]
+      ],
+      "sent": {
+        "ElectBid": [
+          1020,
+          204978
+        ],
+        "PlanResponse": [
+          407,
+          258511
+        ],
+        "Probe": [
+          14,
+          4610
+        ],
+        "Replicate": [
+          814,
+          761728
+        ],
+        "Status": [
+          3,
+          7841
+        ],
+        "SyncReply": [
+          70,
+          973106
+        ],
+        "SyncRequest": [
+          70,
+          11222
+        ]
+      },
+      "received": {
+        "ClientFinished": [
+          1,
+          140
+        ],
+        "ElectBid": [
+          1020,
+          205182
+        ],
+        "ProbeRequest": [
+          15,
+          900
+        ],
+        "Replicate": [
+          103,
+          0
+        ],
+        "ReplicateBatch": [
+          91,
+          119416
+        ],
+        "StatusRequest": [
+          4,
+          244
+        ],
+        "SubmitIncident": [
+          510,
+          235452
+        ],
+        "SyncReply": [
+          70,
+          973106
+        ],
+        "SyncRequest": [
+          70,
+          11222
+        ]
+      },
+      "elections_recorded": 510,
+      "election_time_us": 361014,
+      "cpu_load": 0.08723712645114459,
+      "rss_bytes": 30720000,
+      "load_score": 163
+    },
+    {
+      "type": "Status",
+      "server_unix_ms": 1793807968551,
+      "protocol_version": 2,
+      "configuration": {
+        "node_id": 2,
+        "listen": "0.0.0.0:51753",
+        "peers": [
+          {
+            "id": 1,
+            "addr": "127.0.0.1:51752"
+          },
+          {
+            "id": 3,
+            "addr": "127.0.0.1:51754"
+          }
+        ],
+        "election_mode": "per_request",
+        "policy": "Composite",
+        "weights": {
+          "pending": 0.5,
+          "cpu": 0.3,
+          "service_time": 0.2
+        },
+        "bid_timeout_ms": 100,
+        "degraded_after_ms": 3000,
+        "min_tenure_ms": 1000,
+        "cpu_source": "machine",
+        "workers": 3,
+        "seed": 42,
+        "queue_capacity": 64,
+        "table_ttl_ms": 3600000,
+        "campus": {
+          "grid": 16,
+          "responders": 150,
+          "resources": 100
+        },
+        "recovery": {
+          "transfer": "delta",
+          "snapshot": "chunked",
+          "ready_rule": "majority",
+          "on_start": true,
+          "delta_margin_ms": 2000,
+          "majority_wait_ms": 500
+        },
+        "scheduling": {
+          "policy": "priority_decay",
+          "priority_boost_ms": 250,
+          "priority_half_life_ms": 1000,
+          "request_lease_ms": 10000
+        }
+      },
+      "platform": "windows x86_64 24 logical CPUs",
+      "incarnation": "ca594f55-0404-4f24-b8f4-c4663191a045",
+      "peer_queues": [
+        {
+          "node_id": 1,
+          "control_queued": 0,
+          "replication_queued": 0,
+          "dropped_control": 0,
+          "dropped_replication": 0,
+          "batches_sent": 33,
+          "reconnects": 2
+        },
+        {
+          "node_id": 3,
+          "control_queued": 0,
+          "replication_queued": 0,
+          "dropped_control": 0,
+          "dropped_replication": 0,
+          "batches_sent": 35,
+          "reconnects": 2
+        }
+      ],
+      "sync": [
+        {
+          "node_id": 1,
+          "cursor": 510,
+          "latest": 510,
+          "repaired_results": 0,
+          "failures": 0
+        },
+        {
+          "node_id": 3,
+          "cursor": 510,
+          "latest": 510,
+          "repaired_results": 0,
+          "failures": 0
+        }
+      ],
+      "workers": {
+        "started": 39,
+        "queue_wait_total_us": 2487,
+        "queue_wait_max_us": 140,
+        "expired_before_start": 0
+      },
+      "transport": {
+        "datagrams_sent": 5184,
+        "bytes_sent": 1429085,
+        "datagrams_received": 5206,
+        "retransmissions": 0,
+        "duplicate_fragments": 0,
+        "invalid_datagrams": 0,
+        "delivery_timeouts": 0
+      },
+      "node_id": 2,
+      "phase": "ready",
+      "faults_injected": 0,
+      "last_recovery_ms": null,
+      "last_recovery": null,
+      "snapshots_served": 0,
+      "snapshot_lock_max_us": 410,
+      "epoch": 0,
+      "server": null,
+      "degraded": false,
+      "elections_decided": 510,
+      "elections_alone": 0,
+      "split_resolutions": 0,
+      "step_downs": 0,
+      "suppressed_triggers": 0,
+      "dropped_on_step_down": 0,
+      "late_results": 0,
+      "requests": 510,
+      "results": 510,
+      "results_digest": 15463029686428937394,
+      "queue_len": 0,
+      "running": 0,
+      "pending_cost": 0,
+      "replicate_conflicts": 1,
+      "duplicate_replicates": 1020,
+      "local_replans": 1,
+      "resource_overcommits": 0,
+      "peer_queue_drops": 0,
+      "peer_last_seen_ms": [
+        [
+          1,
+          22
+        ],
+        [
+          3,
+          22
+        ]
+      ],
+      "sent": {
+        "ElectBid": [
+          1020,
+          205176
+        ],
+        "PlanResponse": [
+          39,
+          30008
+        ],
+        "Probe": [
+          14,
+          4612
+        ],
+        "Replicate": [
+          78,
+          83265
+        ],
+        "Status": [
+          3,
+          7832
+        ],
+        "SyncReply": [
+          70,
+          973142
+        ],
+        "SyncRequest": [
+          70,
+          11222
+        ]
+      },
+      "received": {
+        "ClientFinished": [
+          1,
+          140
+        ],
+        "ElectBid": [
+          1020,
+          205083
+        ],
+        "ProbeRequest": [
+          15,
+          900
+        ],
+        "Replicate": [
+          471,
+          0
+        ],
+        "ReplicateBatch": [
+          420,
+          458407
+        ],
+        "StatusRequest": [
+          4,
+          244
+        ],
+        "SubmitIncident": [
+          510,
+          235452
+        ],
+        "SyncReply": [
+          70,
+          973105
+        ],
+        "SyncRequest": [
+          70,
+          11222
+        ]
+      },
+      "elections_recorded": 510,
+      "election_time_us": 344842,
+      "cpu_load": 0.08650517479440317,
+      "rss_bytes": 30838784,
+      "load_score": 171
+    },
+    {
+      "type": "Status",
+      "server_unix_ms": 1793807968551,
+      "protocol_version": 2,
+      "configuration": {
+        "node_id": 3,
+        "listen": "0.0.0.0:51754",
+        "peers": [
+          {
+            "id": 1,
+            "addr": "127.0.0.1:51752"
+          },
+          {
+            "id": 2,
+            "addr": "127.0.0.1:51753"
+          }
+        ],
+        "election_mode": "per_request",
+        "policy": "Composite",
+        "weights": {
+          "pending": 0.5,
+          "cpu": 0.3,
+          "service_time": 0.2
+        },
+        "bid_timeout_ms": 100,
+        "degraded_after_ms": 3000,
+        "min_tenure_ms": 1000,
+        "cpu_source": "machine",
+        "workers": 3,
+        "seed": 42,
+        "queue_capacity": 64,
+        "table_ttl_ms": 3600000,
+        "campus": {
+          "grid": 16,
+          "responders": 150,
+          "resources": 100
+        },
+        "recovery": {
+          "transfer": "delta",
+          "snapshot": "chunked",
+          "ready_rule": "majority",
+          "on_start": true,
+          "delta_margin_ms": 2000,
+          "majority_wait_ms": 500
+        },
+        "scheduling": {
+          "policy": "priority_decay",
+          "priority_boost_ms": 250,
+          "priority_half_life_ms": 1000,
+          "request_lease_ms": 10000
+        }
+      },
+      "platform": "windows x86_64 24 logical CPUs",
+      "incarnation": "400295b5-ea5d-4bf2-857f-83728a3136ea",
+      "peer_queues": [
+        {
+          "node_id": 1,
+          "control_queued": 0,
+          "replication_queued": 0,
+          "dropped_control": 0,
+          "dropped_replication": 0,
+          "batches_sent": 58,
+          "reconnects": 2
+        },
+        {
+          "node_id": 2,
+          "control_queued": 0,
+          "replication_queued": 0,
+          "dropped_control": 0,
+          "dropped_replication": 0,
+          "batches_sent": 60,
+          "reconnects": 2
+        }
+      ],
+      "sync": [
+        {
+          "node_id": 1,
+          "cursor": 510,
+          "latest": 510,
+          "repaired_results": 0,
+          "failures": 0
+        },
+        {
+          "node_id": 2,
+          "cursor": 510,
+          "latest": 510,
+          "repaired_results": 0,
+          "failures": 0
+        }
+      ],
+      "workers": {
+        "started": 64,
+        "queue_wait_total_us": 3683,
+        "queue_wait_max_us": 191,
+        "expired_before_start": 0
+      },
+      "transport": {
+        "datagrams_sent": 5268,
+        "bytes_sent": 1528793,
+        "datagrams_received": 5289,
+        "retransmissions": 0,
+        "duplicate_fragments": 0,
+        "invalid_datagrams": 0,
+        "delivery_timeouts": 0
+      },
+      "node_id": 3,
+      "phase": "ready",
+      "faults_injected": 0,
+      "last_recovery_ms": null,
+      "last_recovery": null,
+      "snapshots_served": 0,
+      "snapshot_lock_max_us": 365,
+      "epoch": 0,
+      "server": null,
+      "degraded": false,
+      "elections_decided": 510,
+      "elections_alone": 0,
+      "split_resolutions": 0,
+      "step_downs": 0,
+      "suppressed_triggers": 0,
+      "dropped_on_step_down": 0,
+      "late_results": 0,
+      "requests": 510,
+      "results": 510,
+      "results_digest": 15463029686428937394,
+      "queue_len": 0,
+      "running": 0,
+      "pending_cost": 0,
+      "replicate_conflicts": 1,
+      "duplicate_replicates": 1020,
+      "local_replans": 1,
+      "resource_overcommits": 0,
+      "peer_queue_drops": 0,
+      "peer_last_seen_ms": [
+        [
+          1,
+          22
+        ],
+        [
+          2,
+          22
+        ]
+      ],
+      "sent": {
+        "ElectBid": [
+          1020,
+          205188
+        ],
+        "PlanResponse": [
+          64,
+          58690
+        ],
+        "Probe": [
+          15,
+          4919
+        ],
+        "Replicate": [
+          128,
+          155715
+        ],
+        "Status": [
+          3,
+          7835
+        ],
+        "SyncReply": [
+          70,
+          973105
+        ],
+        "SyncRequest": [
+          70,
+          11222
+        ]
+      },
+      "received": {
+        "ClientFinished": [
+          1,
+          140
+        ],
+        "ElectBid": [
+          1020,
+          205077
+        ],
+        "ProbeRequest": [
+          15,
+          900
+        ],
+        "Replicate": [
+          446,
+          0
+        ],
+        "ReplicateBatch": [
+          413,
+          422885
+        ],
+        "StatusRequest": [
+          4,
+          244
+        ],
+        "SubmitIncident": [
+          510,
+          235452
+        ],
+        "SyncReply": [
+          70,
+          973142
+        ],
+        "SyncRequest": [
+          70,
+          11222
+        ]
+      },
+      "elections_recorded": 510,
+      "election_time_us": 367152,
+      "cpu_load": 0.08745490708168374,
+      "rss_bytes": 31047680,
+      "load_score": 169
+    }
+  ],
+  "cohort_digests": [
+    {
+      "type": "ResultsDigest",
+      "node_id": 1,
+      "phase": "ready",
+      "epoch": 0,
+      "server": null,
+      "count": 450,
+      "digest": 15726617242828165423
+    },
+    {
+      "type": "ResultsDigest",
+      "node_id": 2,
+      "phase": "ready",
+      "epoch": 0,
+      "server": null,
+      "count": 450,
+      "digest": 15726617242828165423
+    },
+    {
+      "type": "ResultsDigest",
+      "node_id": 3,
+      "phase": "ready",
+      "epoch": 0,
+      "server": null,
+      "count": 450,
+      "digest": 15726617242828165423
+    }
+  ],
+  "client_ids": [
+    "5e4f8c40-d55c-4c82-93ac-fdabfd79c7a0",
+    "6d09e4a2-7c56-4914-a761-4af5b49f77d5",
+    "afd7175c-9a0a-487e-9ac2-f405b4f690d4"
+  ]
+}

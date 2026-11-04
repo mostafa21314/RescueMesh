@@ -1,6 +1,6 @@
 node_id = 1
 listen = "0.0.0.0:7001"
-peers = [{ id = 2, addr = "10.26.210.65:7002" }, { id = 3, addr = "10.26.210.63:7003" }]
+peers = [{ id = 2, addr = "10.26.210.63:7002" }, { id = 3, addr = "10.26.210.64:7003" }]
 election_mode = "on_demand"
 policy = "Composite"
 bid_timeout_ms = 100
@@ -17,3 +17,9 @@ transfer = "delta"
 snapshot = "chunked"
 ready_rule = "majority"
 on_start = true
+
+[scheduling]
+policy = "priority_decay"
+priority_boost_ms = 250
+priority_half_life_ms = 1000
+request_lease_ms = 10000

@@ -1,0 +1,163 @@
+{
+  "at_ms": 1793808645128,
+  "agents": {
+    "127.0.0.1:54344": {
+      "api_version": 1,
+      "role": "server",
+      "ms": 1793808645098,
+      "source_id": "a68eebec0c96adc130b16ebeb5b1254bdb8cac81fb53bb58eb26eb009493033a",
+      "os": "Windows-10-10.0.26200-SP0",
+      "logical_cpus": 24,
+      "binary": {
+        "path": "E:\\RescueMesh\\target\\reliability-v2\\release\\cloud-node.exe",
+        "bytes": 66484832,
+        "sha256": "313be9c9ecc045ee78c531de58a2f5f2b000d74a148f97f6251cff565ff12030"
+      },
+      "node_pid": null,
+      "metrics": {
+        "at_ms": 1793808645098,
+        "cpu_total": 18485149375000,
+        "cpu_idle": 17462029375000,
+        "memory_available_bytes": null,
+        "network_rx_bytes": null,
+        "network_tx_bytes": null
+      }
+    },
+    "127.0.0.1:54345": {
+      "api_version": 1,
+      "role": "server",
+      "ms": 1793808645098,
+      "source_id": "a68eebec0c96adc130b16ebeb5b1254bdb8cac81fb53bb58eb26eb009493033a",
+      "os": "Windows-10-10.0.26200-SP0",
+      "logical_cpus": 24,
+      "binary": {
+        "path": "E:\\RescueMesh\\target\\reliability-v2\\release\\cloud-node.exe",
+        "bytes": 66484832,
+        "sha256": "313be9c9ecc045ee78c531de58a2f5f2b000d74a148f97f6251cff565ff12030"
+      },
+      "node_pid": null,
+      "metrics": {
+        "at_ms": 1793808645098,
+        "cpu_total": 18485149375000,
+        "cpu_idle": 17462029375000,
+        "memory_available_bytes": null,
+        "network_rx_bytes": null,
+        "network_tx_bytes": null
+      }
+    },
+    "127.0.0.1:54346": {
+      "api_version": 1,
+      "role": "server",
+      "ms": 1793808645098,
+      "source_id": "a68eebec0c96adc130b16ebeb5b1254bdb8cac81fb53bb58eb26eb009493033a",
+      "os": "Windows-10-10.0.26200-SP0",
+      "logical_cpus": 24,
+      "binary": {
+        "path": "E:\\RescueMesh\\target\\reliability-v2\\release\\cloud-node.exe",
+        "bytes": 66484832,
+        "sha256": "313be9c9ecc045ee78c531de58a2f5f2b000d74a148f97f6251cff565ff12030"
+      },
+      "node_pid": null,
+      "metrics": {
+        "at_ms": 1793808645098,
+        "cpu_total": 18485149375000,
+        "cpu_idle": 17462029375000,
+        "memory_available_bytes": null,
+        "network_rx_bytes": null,
+        "network_tx_bytes": null
+      }
+    },
+    "127.0.0.1:54348": {
+      "api_version": 1,
+      "role": "client",
+      "ms": 1793808645098,
+      "source_id": "a68eebec0c96adc130b16ebeb5b1254bdb8cac81fb53bb58eb26eb009493033a",
+      "os": "Windows-10-10.0.26200-SP0",
+      "logical_cpus": 24,
+      "binary": {
+        "path": "E:\\RescueMesh\\target\\reliability-v2\\release\\client.exe",
+        "bytes": 49097756,
+        "sha256": "4020863b10730f5e65d2cf1eb6209628e5ff28eca07e5540ee3d7cd19e885145"
+      },
+      "node_pid": null,
+      "metrics": {
+        "at_ms": 1793808645098,
+        "cpu_total": 18485149375000,
+        "cpu_idle": 17462029375000,
+        "memory_available_bytes": null,
+        "network_rx_bytes": null,
+        "network_tx_bytes": null
+      }
+    },
+    "127.0.0.1:54350": {
+      "api_version": 1,
+      "role": "client",
+      "ms": 1793808645098,
+      "source_id": "a68eebec0c96adc130b16ebeb5b1254bdb8cac81fb53bb58eb26eb009493033a",
+      "os": "Windows-10-10.0.26200-SP0",
+      "logical_cpus": 24,
+      "binary": {
+        "path": "E:\\RescueMesh\\target\\reliability-v2\\release\\client.exe",
+        "bytes": 49097756,
+        "sha256": "4020863b10730f5e65d2cf1eb6209628e5ff28eca07e5540ee3d7cd19e885145"
+      },
+      "node_pid": null,
+      "metrics": {
+        "at_ms": 1793808645098,
+        "cpu_total": 18485149375000,
+        "cpu_idle": 17462029375000,
+        "memory_available_bytes": null,
+        "network_rx_bytes": null,
+        "network_tx_bytes": null
+      }
+    },
+    "127.0.0.1:54351": {
+      "api_version": 1,
+      "role": "client",
+      "ms": 1793808645098,
+      "source_id": "a68eebec0c96adc130b16ebeb5b1254bdb8cac81fb53bb58eb26eb009493033a",
+      "os": "Windows-10-10.0.26200-SP0",
+      "logical_cpus": 24,
+      "binary": {
+        "path": "E:\\RescueMesh\\target\\reliability-v2\\release\\client.exe",
+        "bytes": 49097756,
+        "sha256": "4020863b10730f5e65d2cf1eb6209628e5ff28eca07e5540ee3d7cd19e885145"
+      },
+      "node_pid": null,
+      "metrics": {
+        "at_ms": 1793808645098,
+        "cpu_total": 18485149375000,
+        "cpu_idle": 17462029375000,
+        "memory_available_bytes": null,
+        "network_rx_bytes": null,
+        "network_tx_bytes": null
+      }
+    }
+  },
+  "clocks": {
+    "127.0.0.1:54344": {
+      "offset_ms": -0.168701171875,
+      "uncertainty_ms": 0.0
+    },
+    "127.0.0.1:54345": {
+      "offset_ms": -0.168701171875,
+      "uncertainty_ms": 0.0
+    },
+    "127.0.0.1:54346": {
+      "offset_ms": -0.168701171875,
+      "uncertainty_ms": 0.0
+    },
+    "127.0.0.1:54348": {
+      "offset_ms": -0.168701171875,
+      "uncertainty_ms": 0.0
+    },
+    "127.0.0.1:54350": {
+      "offset_ms": -0.168701171875,
+      "uncertainty_ms": 0.0
+    },
+    "127.0.0.1:54351": {
+      "offset_ms": -0.168701171875,
+      "uncertainty_ms": 0.0
+    }
+  }
+}

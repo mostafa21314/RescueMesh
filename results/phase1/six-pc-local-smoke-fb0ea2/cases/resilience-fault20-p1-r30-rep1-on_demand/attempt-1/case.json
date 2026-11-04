@@ -1,0 +1,12 @@
+{
+  "stage": "resilience",
+  "scenario": "fault20",
+  "processes": 1,
+  "rate": 30.0,
+  "duration": 24,
+  "rep": 1,
+  "mode": "on_demand",
+  "seed": 2696790436754833,
+  "complexity": 1,
+  "id": "resilience-fault20-p1-r30-rep1-on_demand"
+}

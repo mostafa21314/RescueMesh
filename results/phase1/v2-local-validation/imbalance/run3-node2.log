@@ -1,0 +1,3 @@
+2026-11-04T12:42:52.589900Z  INFO cloud_node::node: node started node=2 protocol_version=2 incarnation=888aa95c-eaad-468f-8fed-5d2cb8d1a88f scheduling=SchedulingParams { policy: PriorityDecay, priority_boost_ms: 250, priority_half_life_ms: 1000, request_lease_ms: 10000 } addr=127.0.0.1:64349 workers=4 mode=OnDemand policy=Composite cpu_source=Process zones=256 responders=150
+2026-11-04T12:42:54.320318Z  INFO cloud_node::node: now serving node=2 epoch=1 degraded=false took_over=7
+2026-11-04T12:42:54.320364Z  INFO cloud_node::node: election epoch 1 trigger=no_server trigger_request=7b2d293a/0 bids=[(1, 97), (2, 0), (3, 0)] incumbent=[] outcome=decided winner=Some(2) duration_ms=0.54 messages_sent=2 node=2

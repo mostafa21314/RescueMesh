@@ -115,6 +115,7 @@ async fn retry_is_answered_from_results_table_by_any_node() {
 
         let mut s = common::rr::Stream::connect(&peer_addr).await.unwrap();
         let retry = common::Message::SubmitIncident {
+            finished: Vec::new(),
             request_id: first.request_id,
             attempt: 2,
             client_epoch: first.epoch.unwrap(),
@@ -171,6 +172,7 @@ async fn full_queue_replies_busy() {
         let client_id = uuid::Uuid::new_v4();
         for seq in 0..10 {
             let msg = common::Message::SubmitIncident {
+                finished: Vec::new(),
                 request_id: common::RequestId { client_id, seq },
                 attempt: 1,
                 client_epoch: warm.epoch.unwrap(),

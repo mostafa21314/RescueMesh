@@ -113,6 +113,26 @@ pub struct Client {
     dispatch: Arc<Dispatch>,
 }
 
+struct PendingRequest<'a> {
+    client: &'a Client,
+    request_id: RequestId,
+}
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        self.client
+            .dispatch
+            .pending
+            .lock()
+            .unwrap()
+            .remove(&self.request_id);
+        for link in &self.client.links {
+            let _ = link.try_send(Message::ClientFinished {
+                request_ids: vec![self.request_id],
+            });
+        }
+    }
+}
+
 impl Client {
     /// Must be called inside a tokio runtime; spawns one link task per node.
     pub fn new(cfg: ClientConfig) -> Self {
@@ -160,6 +180,10 @@ impl Client {
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
         self.dispatch.pending.lock().unwrap().insert(request_id, tx);
+        let pending = PendingRequest {
+            client: self,
+            request_id,
+        };
 
         let timeout = Duration::from_millis(self.cfg.request_timeout_ms);
         let sent_at_ms = unix_ms();
@@ -186,6 +210,7 @@ impl Client {
                 client_epoch: self.highest_epoch(),
                 incident: incident.clone(),
                 complexity,
+                finished: Vec::new(),
             };
             for link in &self.links {
                 if link.try_send(msg.clone()).is_err() {
@@ -228,7 +253,7 @@ impl Client {
             }
         }
         out.elapsed = start.elapsed();
-        self.dispatch.pending.lock().unwrap().remove(&request_id);
+        drop(pending);
         tracing::debug!(
             %request_id,
             answered = out.answered(),
@@ -258,10 +283,43 @@ async fn link_task(
     )> = None;
     let mut backoff = BACKOFF_MIN;
     let mut next_try = Instant::now();
-    while let Some(msg) = rx.recv().await {
+    let mut finished = Vec::new();
+    loop {
+        let (next, flush) = if finished.is_empty() {
+            (rx.recv().await, false)
+        } else {
+            match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
+                Ok(Some(msg)) => (Some(msg), false),
+                _ => (
+                    Some(Message::ClientFinished {
+                        request_ids: std::mem::take(&mut finished),
+                    }),
+                    true,
+                ),
+            }
+        };
+        let Some(mut msg) = next else { break };
         if let Message::SubmitIncident { request_id, .. } = &msg {
             if !dispatch.pending.lock().unwrap().contains_key(request_id) {
                 continue;
+            }
+        }
+        if !flush {
+            match &mut msg {
+                Message::ClientFinished { request_ids } => {
+                    finished.append(request_ids);
+                    if finished.len() < 64 {
+                        continue;
+                    }
+                    *request_ids = std::mem::take(&mut finished);
+                }
+                Message::SubmitIncident {
+                    finished: notifications,
+                    ..
+                } => {
+                    notifications.append(&mut finished);
+                }
+                _ => {}
             }
         }
         if writer
@@ -333,6 +391,30 @@ pub async fn query_status(addr: &str, timeout: Duration) -> anyhow::Result<NodeS
         }
     };
     tokio::time::timeout(timeout, fut).await?
+}
+
+pub async fn query_results_digest(
+    addr: &str,
+    client_ids: Vec<Uuid>,
+    min_retained_until_ms: u64,
+    timeout: Duration,
+) -> anyhow::Result<ResultsDigest> {
+    tokio::time::timeout(timeout, async {
+        let mut stream = Stream::connect(addr).await?;
+        write_frame(
+            &mut stream,
+            &Message::ResultsDigestRequest {
+                client_ids,
+                min_retained_until_ms,
+            },
+        )
+        .await?;
+        match read_frame(&mut stream).await? {
+            Some((Message::ResultsDigest(digest), _)) => Ok(digest),
+            _ => anyhow::bail!("missing scoped results digest"),
+        }
+    })
+    .await?
 }
 
 /// Asks one node for a cheap load sample (no results digest); the stress

@@ -1,0 +1,6 @@
+2026-11-04T13:14:56.350666Z  INFO cloud_node::node: node started node=1 protocol_version=2 incarnation=6d37d8a1-da76-421a-b7b4-e99612643197 scheduling=SchedulingParams { policy: PriorityDecay, priority_boost_ms: 250, priority_half_life_ms: 1000, request_lease_ms: 10000 } addr=127.0.0.1:64348 workers=4 mode=OnDemand policy=Composite cpu_source=Process zones=256 responders=150
+2026-11-04T13:14:56.534202Z  INFO cloud_node::node: now serving node=1 epoch=1 degraded=false took_over=2
+2026-11-04T13:14:56.534291Z  INFO cloud_node::node: election epoch 1 trigger=no_server trigger_request=0e940abd/0 bids=[(1, 0), (2, 0), (3, 0)] incumbent=[] outcome=decided winner=Some(1) duration_ms=0.50 messages_sent=2 node=1
+2026-11-04T13:15:01.642778Z  WARN cloud_node::node: temporary failure started node=1 duration_ms=20000
+2026-11-04T13:15:21.656858Z  INFO cloud_node::node: recovery started; election participation disabled node=1 cause="mute" rp=RecoveryParams { transfer: Delta, snapshot: Chunked, ready_rule: Majority, on_start: true, delta_margin_ms: 2000, majority_wait_ms: 500 }
+2026-11-04T13:15:21.713700Z  INFO cloud_node::node: recovery complete; node ready node=1 cause="mute" total_ms=56 drain_ms=0 fetch_ms=55 install_ms=1 rounds=1 records=4849 bytes=3599142 new_results=2409 republished=128 results=3006 epoch=2

@@ -14,6 +14,7 @@ pub struct RequestEntry {
     /// Last time this entry or its result changed: what a delta recovery
     /// transfer selects on.
     pub changed: Instant,
+    pub last_interest: Instant,
     pub last_attempt: u32,
     /// Node epoch when the highest attempt so far arrived.
     pub last_epoch: Epoch,
@@ -29,6 +30,7 @@ pub struct Response {
     pub epoch: Epoch,
     pub degraded: bool,
     pub plan: Plan,
+    pub retained_until_ms: u64,
 }
 
 impl Response {
@@ -39,6 +41,18 @@ impl Response {
             epoch: self.epoch,
             degraded: self.degraded,
             plan: self.plan.clone(),
+        }
+    }
+}
+
+impl From<RecoveryResult> for Response {
+    fn from(result: RecoveryResult) -> Self {
+        Self {
+            served_by: result.served_by,
+            epoch: result.epoch,
+            degraded: result.degraded,
+            plan: result.plan,
+            retained_until_ms: result.retained_until_ms,
         }
     }
 }
@@ -73,6 +87,10 @@ pub struct Tables {
     /// `results_digest`, kept up to date on every change so a status query
     /// doesn't re-serialize the whole table under the state lock.
     digest: u64,
+    revision: u64,
+    changes: BTreeMap<u64, RequestId>,
+    versions: HashMap<RequestId, u64>,
+    hashes: HashMap<RequestId, u64>,
 }
 
 fn entry_hash(k: &RequestId, r: &Response) -> u64 {
@@ -116,6 +134,7 @@ impl Tables {
                 epoch: r.epoch,
                 degraded: r.degraded,
                 plan: r.plan.clone(),
+                retained_until_ms: r.retained_until_ms,
             }),
         })
     }
@@ -145,6 +164,7 @@ impl Tables {
                     epoch: result.epoch,
                     degraded: result.degraded,
                     plan: result.plan,
+                    retained_until_ms: result.retained_until_ms,
                 };
                 match self.offer(r.request_id, response, &r.incident, now) {
                     Offer::Stored => merged.stored += 1,
@@ -169,6 +189,7 @@ impl Tables {
     ) -> Option<Previous> {
         match self.requests.get_mut(&request_id) {
             Some(e) => {
+                e.last_interest = now;
                 let prev = Previous {
                     attempt: e.last_attempt,
                     epoch: e.last_epoch,
@@ -187,6 +208,7 @@ impl Tables {
                     RequestEntry {
                         first_seen: now,
                         changed: now,
+                        last_interest: now,
                         last_attempt: attempt,
                         last_epoch: epoch,
                         completed: self.results.contains_key(&request_id),
@@ -219,6 +241,7 @@ impl Tables {
             .or_insert_with(|| RequestEntry {
                 first_seen: now,
                 changed: now,
+                last_interest: now,
                 last_attempt: 0,
                 last_epoch: response.epoch,
                 completed: true,
@@ -229,20 +252,77 @@ impl Tables {
         match self.results.get_mut(&request_id) {
             None => {
                 entry.changed = now;
-                self.digest = self.digest.wrapping_add(entry_hash(&request_id, &response));
+                let hash = entry_hash(&request_id, &response);
+                self.digest = self.digest.wrapping_add(hash);
+                self.hashes.insert(request_id, hash);
                 self.results.insert(request_id, (now, response));
+                self.changed(request_id);
                 Offer::Stored
             }
             Some((_, old)) if preferred(&response, old) => {
                 entry.changed = now;
+                let hash = entry_hash(&request_id, &response);
                 self.digest = self
                     .digest
-                    .wrapping_sub(entry_hash(&request_id, old))
-                    .wrapping_add(entry_hash(&request_id, &response));
-                Offer::Replaced(std::mem::replace(old, response))
+                    .wrapping_sub(self.hashes[&request_id])
+                    .wrapping_add(hash);
+                self.hashes.insert(request_id, hash);
+                let old = std::mem::replace(old, response);
+                self.changed(request_id);
+                Offer::Replaced(old)
             }
             Some(_) => Offer::Kept,
         }
+    }
+
+    fn changed(&mut self, request_id: RequestId) {
+        self.revision += 1;
+        if let Some(previous) = self.versions.insert(request_id, self.revision) {
+            self.changes.remove(&previous);
+        }
+        self.changes.insert(self.revision, request_id);
+    }
+
+    /// A bounded page of the latest retained version of changed results.
+    /// Expired/overwritten revisions are holes, not missing retained state.
+    pub fn sync_page(&self, after: u64) -> (u64, u64, Vec<RecoveryRecord>) {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let mut records = Vec::new();
+        let mut bytes = 0;
+        let mut next = after;
+        for (&revision, id) in self.changes.range((Excluded(after), Unbounded)) {
+            let Some(record) = self.recovery_record(id) else {
+                continue;
+            };
+            let size = serde_json::to_vec(&record).expect("serialize record").len();
+            if !records.is_empty() && (records.len() >= 64 || bytes + size > 256 * 1024) {
+                return (next, self.revision, records);
+            }
+            bytes += size;
+            next = revision;
+            records.push(record);
+        }
+        (self.revision, self.revision, records)
+    }
+
+    pub fn scoped_digest(
+        &self,
+        clients: &[uuid::Uuid],
+        min_retained_until_ms: u64,
+    ) -> (usize, u64) {
+        let mut count = 0;
+        let mut digest = 0u64;
+        for (id, (_, response)) in &self.results {
+            if (!clients.is_empty() && !clients.contains(&id.client_id))
+                || (response.retained_until_ms > 0
+                    && response.retained_until_ms <= min_retained_until_ms)
+            {
+                continue;
+            }
+            count += 1;
+            digest = digest.wrapping_add(self.hashes[id]);
+        }
+        (count, digest)
     }
 
     /// Not-completed requests, oldest first: what a new server takes over.
@@ -261,6 +341,12 @@ impl Tables {
         self.results.get(request_id).map(|(_, r)| r)
     }
 
+    pub fn iter_results(&self) -> impl Iterator<Item = (RequestId, &Response)> {
+        self.results
+            .iter()
+            .map(|(id, (_, response))| (*id, response))
+    }
+
     pub fn request(&self, request_id: &RequestId) -> Option<&RequestEntry> {
         self.requests.get(request_id)
     }
@@ -268,10 +354,21 @@ impl Tables {
     /// Drops entries older than `ttl`.
     pub fn sweep(&mut self, now: Instant, ttl: Duration) {
         let mut digest = self.digest;
+        let wall = unix_ms();
+        let versions = &mut self.versions;
+        let changes = &mut self.changes;
+        let hashes = &mut self.hashes;
         self.results.retain(|k, (t, r)| {
-            let keep = now.duration_since(*t) < ttl;
+            let keep = if r.retained_until_ms == 0 {
+                now.duration_since(*t) < ttl
+            } else {
+                wall < r.retained_until_ms
+            };
             if !keep {
-                digest = digest.wrapping_sub(entry_hash(k, r));
+                digest = digest.wrapping_sub(hashes.remove(k).expect("result hash"));
+                if let Some(version) = versions.remove(k) {
+                    changes.remove(&version);
+                }
             }
             keep
         });
@@ -306,6 +403,12 @@ impl Tables {
 mod tests {
     use super::*;
     use uuid::Uuid;
+    fn r(seq: u64) -> RequestId {
+        RequestId {
+            client_id: Uuid::nil(),
+            seq,
+        }
+    }
 
     fn incident() -> Incident {
         Incident {
@@ -352,6 +455,7 @@ mod tests {
     fn response(served_by: NodeId, epoch: Epoch) -> Response {
         Response {
             served_by,
+            retained_until_ms: 0,
             epoch,
             degraded: false,
             plan: Plan {
@@ -365,6 +469,43 @@ mod tests {
                 planned_at_ms: 0,
             },
         }
+    }
+
+    #[test]
+    fn repair_journal_keeps_latest_versions_and_advances_across_expiration() {
+        let now = Instant::now();
+        let mut tables = Tables::default();
+        let mut first = response(1, 1);
+        first.retained_until_ms = unix_ms().saturating_sub(1);
+        tables.offer(r(1), first, &incident(), now);
+        tables.offer(r(2), response(1, 1), &incident(), now);
+        tables.offer(r(2), response(1, 2), &incident(), now);
+        let (next, latest, records) = tables.sync_page(0);
+        assert_eq!((next, latest, records.len()), (3, 3, 2));
+        assert_eq!(records[1].result.as_ref().unwrap().epoch, 2);
+        tables.sweep(now, Duration::from_secs(10));
+        let (next, latest, records) = tables.sync_page(1);
+        assert_eq!((next, latest, records.len()), (3, 3, 1));
+        assert_eq!(records[0].request_id, r(2));
+        assert!(tables.sync_page(3).2.is_empty());
+    }
+
+    #[test]
+    fn cohort_digest_ignores_other_clients_and_soon_expiring_history() {
+        let now = Instant::now();
+        let mut tables = Tables::default();
+        let mut soon = response(1, 1);
+        soon.retained_until_ms = unix_ms() + 1000;
+        tables.offer(r(1), soon, &incident(), now);
+        let mut other = r(2);
+        other.client_id = uuid::Uuid::new_v4();
+        let mut later = response(1, 1);
+        later.retained_until_ms = unix_ms() + 60_000;
+        tables.offer(other, later, &incident(), now);
+        assert_eq!(tables.scoped_digest(&[], 0).0, 2);
+        assert_eq!(tables.scoped_digest(&[], unix_ms() + 10_000).0, 1);
+        assert_eq!(tables.scoped_digest(&[other.client_id], 0).0, 1);
+        assert_eq!(tables.scoped_digest(&[uuid::Uuid::new_v4()], 0).0, 0);
     }
 
     #[test]

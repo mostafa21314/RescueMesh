@@ -14,16 +14,33 @@ struct Args {
     /// Planner threads; omitted uses config, zero chooses for this machine.
     #[arg(long)]
     workers: Option<usize>,
+    /// Append server events to this file as well as the terminal.
+    #[arg(long)]
+    log_file: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
-        .init();
     let args = Args::parse();
+    let filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    if let Some(path) = &args.log_file {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        use tracing_subscriber::fmt::writer::MakeWriterExt;
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file).and(std::io::stdout))
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
     let mut cfg = NodeConfig::load(&args.config)?;
     if let Some(workers) = args.workers {
         cfg.workers = if workers == 0 {

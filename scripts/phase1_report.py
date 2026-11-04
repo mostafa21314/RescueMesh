@@ -105,6 +105,10 @@ def summarize(scenario, runs, requests):
         'p50_ms': quantile(latency, .5), 'p95_ms': quantile(latency, .95), 'p99_ms': quantile(latency, .99),
         'goodput_mean_rps': goodput[0], 'goodput_ci95': goodput[1],
         'converged_runs': sum(r.get('converged') == 'true' for r in runs),
+        'baseline_verified_runs': sum(r.get('baseline_agreed') == 'true' for r in runs),
+        'baseline_failed_runs': sum(r.get('baseline_agreed') == 'false' for r in runs),
+        'baseline_unknown_runs': sum('baseline_agreed' not in r for r in runs),
+        'convergence_scope': ';'.join(sorted({r.get('convergence_scope', 'legacy_whole_table') for r in runs})),
         'fault_runs_requested': len(fault_runs),
         'fault_runs_injected': sum(bool(r.get('victim')) for r in fault_runs),
         'client_exit_failures': int(sum(number(r, 'client_exit_failures', 0) for r in runs)),
@@ -116,6 +120,13 @@ def summarize(scenario, runs, requests):
         'udp_duplicate_fragments': int(sum(number(r, 'udp_duplicate_fragments', 0) for r in runs)),
         'udp_delivery_timeouts': int(sum(number(r, 'udp_delivery_timeouts', 0) for r in runs)),
         'peer_queue_drops': int(sum(number(r, 'peer_queue_drops', 0) for r in runs)),
+        'dropped_control': int(sum(number(r, 'dropped_control', 0) for r in runs)),
+        'dropped_replication': int(sum(number(r, 'dropped_replication', 0) for r in runs)),
+        'repaired_results': int(sum(number(r, 'repaired_results', 0) for r in runs)),
+        'worker_expired': int(sum(number(r, 'worker_expired', 0) for r in runs)),
+        'worker_queue_wait_mean_ms': ci([number(r, 'worker_queue_wait_mean_ms') for r in runs])[0],
+        'failed_elapsed_p95_ms': quantile([number(r, 'elapsed_ms') for r in requests
+            if r.get('answered') != 'true' and math.isfinite(number(r, 'elapsed_ms'))], .95),
         'resource_overcommits': int(sum(number(r, 'overcommits', 0) for r in runs)),
     }
 
@@ -178,6 +189,21 @@ def scenario_plots(name, runs, requests, samples, out):
     axes[3].set(xlabel='Time from workload start (s)', ylabel='CPU EWMA (%)')
     axes[3].set_ylim(bottom=0)
     images.append(save(fig, out, f'{name}-timeline'))
+    if samples and 'peer_replication_queued' in samples[0]:
+        fig, axes = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
+        for i, node in enumerate(nodes):
+            probes = [r for r in selected_samples if r['node'] == node]
+            times = [number(r, 't_ms')/1000 for r in probes]
+            for ax, key, label in zip(axes, ('peer_replication_queued', 'peer_control_queued', 'sync_lag'),
+                                      ('Replication messages', 'Control messages', 'Known unpulled revisions')):
+                ax.plot(times, [number(r,key) for r in probes], color=COLORS[i % len(COLORS)], label=f'node {node}')
+                ax.set_ylabel(label)
+                ax.grid(alpha=.2)
+                ax.set_ylim(bottom=0)
+        axes[0].set_title(f'{name}: run {chosen["run"]}, outgoing queues and repair progress')
+        axes[0].legend(ncol=3)
+        axes[-1].set_xlabel('Time from workload start (s)')
+        images.append(save(fig, out, f'{name}-peer-queues'))
     return images
 
 
@@ -263,28 +289,36 @@ def generate(root):
         '95% Student-t intervals describe variation across repeated runs. N/A means fewer than two runs. Fresh local clusters isolate repetitions; remote clusters retain history unless explicitly restarted.',
         'Wilson intervals are an approximate binomial reference; requests share servers and are correlated, so they do not establish real-world reliability. Zero observed failures is not proof of zero failure probability.',
         'A requested fault without a recorded victim is an invalid fault experiment. Inspect client exit failures, missing records, peer queue drops, resource overcommits and convergence failures.',
-        'Convergence means equal retained result counts/digests after processing becomes idle. It is separate from client success and from the returning node becoming Ready.',
+        'Protocol 2 convergence compares the current run client UUIDs after processing is idle, including at least every answered result. Legacy runs compare whole retained tables. See convergence_scope in reliability.csv.',
+        'A verified baseline requires matching retention-safe digests and role views. Baseline unknown means legacy data; a failed baseline indicates explicit soak mode. Shared remote history still prevents claiming fresh independent repetitions.',
+        'Protocol 2 writes baseline/final node JSON, preserves failed-request elapsed times and client UUIDs, and records split control/replication drops, repairs and worker queue waits. Repairs and drops are per-node counters rather than counts of unique incidents.',
+        'Repair lag compares installed cursors with the last revisions observed from peers; it cannot reveal updates created while a peer is unreachable. Zero known lag alone does not establish convergence.',
         'Node counters are process-wide and include diagnostics/ACKs. Retransmissions indicate missing acknowledgements, which may be caused by data loss, ACK loss or delayed processing.',
         'These are measurements of the named machines, workload and network only. Multi-PC tests should use synchronized clocks; client latency itself uses a monotonic clock.',
     ]
-    headers = ['Scenario', 'Clients', 'Runs', 'Requests', 'Success % [Wilson 95%]', 'p50 / p95 / p99 ms', 'Goodput ± CI', 'Converged', 'Faults injected/requested', 'Missing', 'Exit failures', 'Peer drops / overcommits']
+    headers = ['Scenario', 'Clients', 'Runs', 'Requests', 'Success % [Wilson 95%]', 'p50 / p95 / p99 ms', 'Goodput ± CI', 'Converged', 'Baseline verified / failed / unknown', 'Faults injected/requested', 'Missing', 'Exit failures', 'Peer drops / overcommits']
     table = []
     for r in all_summary:
         table.append([r['scenario'], str(r['clients']), str(r['runs']), str(r['requests']),
                       f"{fmt(r['success_pct'])} [{fmt(r['wilson_low_pct'])}, {fmt(r['wilson_high_pct'])}]",
                       ' / '.join(fmt(r[k]) for k in ('p50_ms', 'p95_ms', 'p99_ms')),
                       f"{fmt(r['goodput_mean_rps'])} ± {fmt(r['goodput_ci95'])}",
-                      f"{r['converged_runs']}/{r['runs']}", f"{r['fault_runs_injected']}/{r['fault_runs_requested']}",
+                      f"{r['converged_runs']}/{r['runs']}",
+                      f"{r['baseline_verified_runs']} / {r['baseline_failed_runs']} / {r['baseline_unknown_runs']}",
+                      f"{r['fault_runs_injected']}/{r['fault_runs_requested']}",
                       str(r['missing_records']), str(r['client_exit_failures']),
                       f"{r['peer_queue_drops']} / {r['resource_overcommits']}"])
     md = ['# Phase 1 UDP reliability report', '', '| ' + ' | '.join(headers) + ' |',
           '|' + '|'.join(['---']*len(headers)) + '|']
     md += ['| ' + ' | '.join(row) + ' |' for row in table]
     diagnostic_headers = ['Scenario', 'Clients', 'Retried requests', 'Busy replies', 'Peak queue',
-                          'UDP retransmissions', 'UDP delivery timeouts', 'Peak node RSS MiB']
+                          'UDP retransmissions', 'UDP delivery timeouts', 'Peak node RSS MiB',
+                          'Control / replication drops', 'Repaired results', 'Expired jobs', 'Worker queue wait ms', 'Failed elapsed p95 ms']
     diagnostics = [[r['scenario'], str(r['clients']), str(r['retries']), str(r['busy_replies']),
                     str(r['peak_queue']), str(r['udp_retransmissions']), str(r['udp_delivery_timeouts']),
-                    fmt(r['peak_rss_mb'])] for r in all_summary]
+                    fmt(r['peak_rss_mb']), f"{r['dropped_control']} / {r['dropped_replication']}",
+                    str(r['repaired_results']), str(r['worker_expired']), fmt(r['worker_queue_wait_mean_ms']),
+                    fmt(r['failed_elapsed_p95_ms'])] for r in all_summary]
     md += ['', '## Load and transport diagnostics', '', '| ' + ' | '.join(diagnostic_headers) + ' |',
            '|' + '|'.join(['---']*len(diagnostic_headers)) + '|']
     md += ['| ' + ' | '.join(row) + ' |' for row in diagnostics]

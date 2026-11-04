@@ -1,26 +1,11 @@
-//! Outbound links to the other cloud nodes.
-//!
-//! Servers talk to each other only to replicate and (Part B) to elect, so a
-//! link opens on demand: its task connects when the first message is queued,
-//! and reconnects with exponential backoff after a failure. There are no
-//! heartbeats. Each direction of a node pair uses its own UDP RR session;
-//! inbound peer messages arrive on our listener like client traffic.
-//!
-//! Delivery is at-least-once while both ends are up: a frame whose write
-//! failed is resent after reconnecting, and receivers apply messages
-//! idempotently. A frame acknowledged just before the peer dies can still be
-//! lost; catching the peer up when it returns is the recovery protocol's job.
-//! When a peer pulls a recovery snapshot from us, everything still queued for
-//! it is in that snapshot, so the queue is cleared and the link reconnects at
-//! once ([`PeerLinks::reset`]).
-
+//! Independent control and batched replication links. Overflow is observable;
+//! the retained result journal supplies incremental repair outside these queues.
 use common::config::PeerConfig;
 use common::counters::Counters;
-use common::rr::write_frame;
-use common::rr::Stream;
+use common::rr::{write_frame, Stream};
 use common::*;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -29,131 +14,136 @@ use tokio::task::JoinHandle;
 pub const BACKOFF_MIN: Duration = Duration::from_millis(100);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(2);
 pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
-/// Messages buffered per peer while its link is down; beyond this they are
-/// dropped and counted.
 pub const QUEUE_LIMIT: usize = 4096;
-const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
-
+const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 struct Control {
     enabled: AtomicBool,
     generation: AtomicU64,
 }
-
 struct Envelope {
     generation: u64,
-    /// The link's reset count when queued; older envelopes are not sent.
     resets: u64,
     message: Message,
 }
-
-/// One peer's outbound queue, shared with its link task.
-struct Link {
+#[derive(Default)]
+struct Lane {
     queue: Mutex<VecDeque<Envelope>>,
     queued: Notify,
+    dropped: AtomicU64,
+    inflight: AtomicUsize,
+}
+#[derive(Default)]
+struct Link {
+    control: Lane,
+    replication: Lane,
     resets: AtomicU64,
     reset: Notify,
+    batches_sent: AtomicU64,
+    reconnects: AtomicU64,
 }
-
 pub struct PeerLinks {
     links: BTreeMap<NodeId, Arc<Link>>,
     control: Arc<Control>,
     last_seen: Mutex<HashMap<NodeId, Instant>>,
-    drops: AtomicU64,
 }
 
 impl PeerLinks {
     pub fn spawn(peers: &[PeerConfig], sent: Arc<Counters>) -> (Arc<Self>, Vec<JoinHandle<()>>) {
-        let mut links = BTreeMap::new();
-        let mut tasks = Vec::new();
         let control = Arc::new(Control {
             enabled: AtomicBool::new(true),
             generation: AtomicU64::new(0),
         });
+        let mut links = BTreeMap::new();
+        let mut tasks = Vec::new();
         for p in peers {
-            let link = Arc::new(Link {
-                queue: Mutex::new(VecDeque::new()),
-                queued: Notify::new(),
-                resets: AtomicU64::new(0),
-                reset: Notify::new(),
-            });
+            let link = Arc::new(Link::default());
             links.insert(p.id, link.clone());
-            tasks.push(tokio::spawn(link_task(
-                p.id,
-                p.addr.clone(),
-                link,
-                sent.clone(),
-                control.clone(),
-            )));
+            for data in [false, true] {
+                tasks.push(tokio::spawn(link_task(
+                    p.id,
+                    p.addr.clone(),
+                    link.clone(),
+                    sent.clone(),
+                    control.clone(),
+                    data,
+                )));
+            }
         }
-        let me = Arc::new(PeerLinks {
-            links,
-            last_seen: Mutex::new(HashMap::new()),
-            drops: AtomicU64::new(0),
-            control,
-        });
-        (me, tasks)
+        (
+            Arc::new(Self {
+                links,
+                control,
+                last_seen: Mutex::new(HashMap::new()),
+            }),
+            tasks,
+        )
     }
-
-    pub fn send(&self, to: NodeId, msg: Message) {
+    pub fn send(&self, to: NodeId, message: Message) {
         if !self.control.enabled.load(Ordering::SeqCst) {
             return;
         }
-        if let Some(link) = self.links.get(&to) {
-            let mut queue = link.queue.lock().unwrap();
-            if queue.len() >= QUEUE_LIMIT {
-                drop(queue);
-                self.drops.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(peer = to, "peer queue full, message dropped");
-                return;
+        let Some(link) = self.links.get(&to) else {
+            return;
+        };
+        let data = matches!(message, Message::Replicate { .. });
+        let lane = if data {
+            &link.replication
+        } else {
+            &link.control
+        };
+        let mut queue = lane.queue.lock().unwrap();
+        if queue.len() >= QUEUE_LIMIT {
+            let dropped = lane.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped.is_power_of_two() {
+                tracing::warn!(
+                    peer = to,
+                    data,
+                    dropped,
+                    "peer queue overflow; retained results will be repaired"
+                );
             }
-            queue.push_back(Envelope {
-                generation: self.control.generation.load(Ordering::SeqCst),
-                resets: link.resets.load(Ordering::SeqCst),
-                message: msg,
-            });
-            drop(queue);
-            link.queued.notify_one();
+            return;
         }
+        queue.push_back(Envelope {
+            generation: self.control.generation.load(Ordering::SeqCst),
+            resets: link.resets.load(Ordering::SeqCst),
+            message,
+        });
+        drop(queue);
+        lane.queued.notify_one();
     }
-
-    /// `to` is taking a recovery snapshot from us. Call it under the state
-    /// lock that the snapshot is read under: every frame queued for `to` so
-    /// far is then covered by the snapshot, so it is dropped (with the one
-    /// being retried), and the link stops backing off and reconnects now.
-    /// Without this a peer that was down long enough to fill its queue missed
-    /// frames sent after its snapshot, while the backlog drained.
+    /// Only a FULL snapshot covers all queued history. A delta must not call this.
     pub fn reset(&self, to: NodeId) {
         if let Some(link) = self.links.get(&to) {
-            let mut queue = link.queue.lock().unwrap();
+            let mut control = link.control.queue.lock().unwrap();
+            let mut data = link.replication.queue.lock().unwrap();
             link.resets.fetch_add(1, Ordering::SeqCst);
-            queue.clear();
-            drop(queue);
-            link.reset.notify_one();
+            control.clear();
+            data.clear();
+            drop(data);
+            drop(control);
+            link.reset.notify_waiters();
+            link.control.queued.notify_one();
+            link.replication.queued.notify_one();
         }
     }
-
     pub fn suspend(&self) {
         self.control.enabled.store(false, Ordering::SeqCst);
         self.control.generation.fetch_add(1, Ordering::SeqCst);
     }
-
     pub fn resume(&self) {
         self.control.enabled.store(true, Ordering::SeqCst);
     }
-
-    pub fn broadcast(&self, msg: Message) {
+    pub fn broadcast(&self, message: Message) {
         for id in self.links.keys() {
-            self.send(*id, msg.clone());
+            self.send(*id, message.clone());
         }
     }
-
-    /// Notes that a message from `id` just arrived.
     pub fn heard_from(&self, id: NodeId) {
         if self.links.contains_key(&id) {
             self.last_seen.lock().unwrap().insert(id, Instant::now());
         }
     }
-
     pub fn last_seen_ms(&self) -> Vec<(NodeId, Option<u64>)> {
         let seen = self.last_seen.lock().unwrap();
         self.links
@@ -161,9 +151,66 @@ impl PeerLinks {
             .map(|id| (*id, seen.get(id).map(|t| t.elapsed().as_millis() as u64)))
             .collect()
     }
-
+    pub fn queues(&self) -> Vec<PeerQueueStatus> {
+        self.links
+            .iter()
+            .map(|(&node_id, link)| PeerQueueStatus {
+                node_id,
+                control_queued: link.control.queue.lock().unwrap().len()
+                    + link.control.inflight.load(Ordering::Relaxed),
+                replication_queued: link.replication.queue.lock().unwrap().len()
+                    + link.replication.inflight.load(Ordering::Relaxed),
+                dropped_control: link.control.dropped.load(Ordering::Relaxed),
+                dropped_replication: link.replication.dropped.load(Ordering::Relaxed),
+                batches_sent: link.batches_sent.load(Ordering::Relaxed),
+                reconnects: link.reconnects.load(Ordering::Relaxed),
+            })
+            .collect()
+    }
     pub fn drops(&self) -> u64 {
-        self.drops.load(Ordering::Relaxed)
+        self.links
+            .values()
+            .map(|l| {
+                l.control.dropped.load(Ordering::Relaxed)
+                    + l.replication.dropped.load(Ordering::Relaxed)
+            })
+            .sum()
+    }
+}
+
+fn batch(envelopes: &[Envelope]) -> Message {
+    Message::ReplicateBatch {
+        records: envelopes
+            .iter()
+            .map(|e| {
+                let Message::Replicate {
+                    epoch,
+                    origin,
+                    request_id,
+                    plan,
+                    incident,
+                    degraded,
+                    retained_until_ms,
+                } = &e.message
+                else {
+                    unreachable!()
+                };
+                RecoveryRecord {
+                    request_id: *request_id,
+                    attempt: 0,
+                    epoch: *epoch,
+                    incident: incident.clone(),
+                    complexity: 0,
+                    result: Some(RecoveryResult {
+                        served_by: *origin,
+                        epoch: *epoch,
+                        degraded: *degraded,
+                        plan: plan.clone(),
+                        retained_until_ms: *retained_until_ms,
+                    }),
+                }
+            })
+            .collect(),
     }
 }
 
@@ -173,77 +220,94 @@ async fn link_task(
     link: Arc<Link>,
     sent: Arc<Counters>,
     control: Arc<Control>,
+    data: bool,
 ) {
+    let lane = if data {
+        &link.replication
+    } else {
+        &link.control
+    };
     let mut conn: Option<Stream> = None;
     let mut backoff = BACKOFF_MIN;
-    let mut failures = 0u32;
     loop {
-        let next = link.queue.lock().unwrap().pop_front();
-        let Some(envelope) = next else {
-            link.queued.notified().await;
-            continue;
-        };
-        let msg = envelope.message;
-        loop {
-            if !control.enabled.load(Ordering::SeqCst)
-                || envelope.generation != control.generation.load(Ordering::SeqCst)
-            {
-                conn = None;
-                break;
+        let mut envelopes = Vec::new();
+        {
+            let mut queue = lane.queue.lock().unwrap();
+            let mut bytes = 0;
+            while let Some(e) = queue.pop_front() {
+                if e.generation != control.generation.load(Ordering::SeqCst)
+                    || e.resets != link.resets.load(Ordering::SeqCst)
+                {
+                    continue;
+                }
+                bytes += serde_json::to_vec(&e.message)
+                    .expect("serialize peer message")
+                    .len();
+                envelopes.push(e);
+                if !data || envelopes.len() >= 64 || bytes >= 192 * 1024 {
+                    break;
+                }
             }
-            if envelope.resets != link.resets.load(Ordering::SeqCst) {
+        }
+        if envelopes.is_empty() {
+            lane.queued.notified().await;
+            continue;
+        }
+        lane.inflight.store(envelopes.len(), Ordering::Relaxed);
+        let message = if data {
+            batch(&envelopes)
+        } else {
+            envelopes[0].message.clone()
+        };
+        loop {
+            let first = &envelopes[0];
+            if !control.enabled.load(Ordering::SeqCst)
+                || first.generation != control.generation.load(Ordering::SeqCst)
+                || first.resets != link.resets.load(Ordering::SeqCst)
+            {
                 conn = None;
                 backoff = BACKOFF_MIN;
                 break;
             }
             if conn.is_none() {
                 match tokio::time::timeout(CONNECT_TIMEOUT, Stream::connect(&addr)).await {
-                    Ok(Ok(s)) => {
-                        tracing::info!(peer, %addr, "peer link connected");
-                        conn = Some(s);
+                    Ok(Ok(stream)) => {
+                        conn = Some(stream);
                         backoff = BACKOFF_MIN;
-                        failures = 0;
-                        // A recovery reset may have happened while the UDP
-                        // handshake was awaiting its reply. Recheck the envelope.
+                        link.reconnects.fetch_add(1, Ordering::Relaxed);
                         continue;
                     }
-                    outcome => {
-                        failures += 1;
-                        let why = match outcome {
-                            Ok(Err(e)) => e.to_string(),
-                            _ => "connect timed out".to_string(),
-                        };
-                        if failures == 1 {
-                            tracing::warn!(peer, %addr, %why, "peer unreachable, retrying with backoff");
-                        } else {
-                            tracing::debug!(peer, %addr, %why, ?backoff, "peer still unreachable");
-                        }
+                    _ => {
                         tokio::select! {
-                            _ = tokio::time::sleep(backoff) => {
-                                backoff = (backoff * 2).min(BACKOFF_MAX);
-                            }
+                            _ = tokio::time::sleep(backoff) => backoff = (backoff*2).min(BACKOFF_MAX),
                             _ = link.reset.notified() => backoff = BACKOFF_MIN,
                         }
                         continue;
                     }
                 }
             }
-            let stream = conn.as_mut().expect("connected above");
-            match tokio::time::timeout(WRITE_TIMEOUT, write_frame(stream, &msg)).await {
-                Ok(Ok(n)) => {
-                    sent.add(msg.kind(), n);
+            match tokio::time::timeout(WRITE_TIMEOUT, write_frame(conn.as_mut().unwrap(), &message))
+                .await
+            {
+                Ok(Ok(bytes)) => {
+                    if data {
+                        link.batches_sent.fetch_add(1, Ordering::Relaxed);
+                    }
+                    for (i, e) in envelopes.iter().enumerate() {
+                        sent.add(
+                            e.message.kind(),
+                            bytes / envelopes.len() + usize::from(i < bytes % envelopes.len()),
+                        );
+                    }
                     break;
                 }
                 error => {
-                    tracing::debug!(
-                        peer,
-                        ?error,
-                        "peer link write failed or timed out, reconnecting"
-                    );
+                    tracing::debug!(peer, data, ?error, "peer write failed; reconnecting");
                     conn = None;
                 }
             }
         }
+        lane.inflight.store(0, Ordering::Relaxed);
     }
 }
 

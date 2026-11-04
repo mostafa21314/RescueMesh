@@ -1,0 +1,12 @@
+{
+  "stage": "soak",
+  "scenario": "soak",
+  "processes": 1,
+  "rate": 30.0,
+  "duration": 10,
+  "rep": 1,
+  "mode": "on_demand",
+  "seed": 2440823557853202,
+  "complexity": 1,
+  "id": "soak-soak-p1-r30-rep1-on_demand"
+}

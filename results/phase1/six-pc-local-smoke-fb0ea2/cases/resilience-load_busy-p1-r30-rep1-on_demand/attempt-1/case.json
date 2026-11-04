@@ -1,0 +1,12 @@
+{
+  "stage": "resilience",
+  "scenario": "load_busy",
+  "processes": 1,
+  "rate": 30.0,
+  "duration": 5,
+  "rep": 1,
+  "mode": "on_demand",
+  "seed": 1677028291863005,
+  "complexity": 1,
+  "id": "resilience-load_busy-p1-r30-rep1-on_demand"
+}

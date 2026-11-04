@@ -1,5 +1,13 @@
 # Phase 1: Windows/Linux roles, UDP Request–Reply and reliability experiments
 
+The current implementation uses application protocol 2. Read
+[the reliability and scheduling update](reliability-v2.md) before upgrading the
+three-server setup; it includes the new baseline checks and decay scheduler.
+The historical UDP measurements at the end of this guide predate that update.
+
+The current six-PC `.62–.67` layout and paired election-mode experiments are in
+[the six-PC study guide](six-pc-study.md).
+
 The application now uses **Request–Reply over UDP** for clients, cloud peers,
 elections, replication, diagnostics and recovery. RR means Request–Reply here;
 the load-aware election is retained. Phase 2 discovery and services are outside

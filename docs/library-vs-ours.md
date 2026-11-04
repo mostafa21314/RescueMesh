@@ -38,3 +38,6 @@ and conflict resolution are our code.
 | Election: triggers, bids, 2-of-3 decision, incumbent exclusion, epochs and step-down, takeover, split-winner resolution, degraded mode, per-request mode | `cloud-node::election` (sans-IO), wired in `cloud-node::node` |
 | One-result-per-request rule and ledger release for superseded results | `cloud-node::tables`, `cloud-node::ledger` |
 | Stress harness: process sweep, sampler, fault timing, metrics, percentiles, Student-t confidence intervals, Jain's index | `client::stress`, `client::stats`, `client` bin `stress` |
+| Control/data separation, bounded replication batches and revision-cursor state repair | `cloud-node::peers`, `cloud-node::node::anti_entropy`, `cloud-node::tables` |
+| Worker priority with exponential decay and aging, bounded takeover and client-interest leases | `cloud-node::pool`, `cloud-node::node`, `common::config::SchedulingParams` |
+| Retention-safe baseline validation and per-run cohort convergence | `client` bin `stress`, `common::msg::ResultsDigest`, `cloud-node::tables` |

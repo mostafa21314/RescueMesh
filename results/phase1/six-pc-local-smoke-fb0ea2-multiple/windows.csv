@@ -1,0 +1,5 @@
+case,mode,window,requests,answered,failed,n,mean_ms,sd_ms,p50_ms,p95_ms,p99_ms,max_ms
+normal-normal-p2-r30-rep1-on_demand,on_demand,whole,720,720,0,720,4.553858333333333,2.1956582468739003,4.648,7.718,9.363,12.375
+normal-normal-p2-r30-rep1-per_request,per_request,whole,720,720,0,720,5.000797222222222,2.240901121520486,5.07,8.343,9.355,11.623
+normal-normal-p2-r30-rep2-on_demand,on_demand,whole,720,720,0,720,4.867945833333334,1.9400545304724135,4.935,7.835,8.788,9.892
+normal-normal-p2-r30-rep2-per_request,per_request,whole,720,720,0,720,6.357640277777778,2.322820811581213,6.885,9.781,10.709,12.297

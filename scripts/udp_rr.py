@@ -53,7 +53,7 @@ def call(addr, message, timeout=2.0):
                 continue
             if typ == 3 and len(data) == HEADER.size:
                 welcome, next_send, backoff = True, 0, .03
-            elif typ == 4:
+            elif typ in (4, 5):
                 raise ConnectionError('UDP session expired; server may have restarted')
             elif typ == 1 and seq == 0:
                 acked.add(index)
@@ -70,5 +70,7 @@ def call(addr, message, timeout=2.0):
                 fragments[index] = data[HEADER.size:]
                 sock.send(packet(1, index=index))
                 if len(fragments) == count:
-                    return json.loads(b''.join(fragments[i] for i in range(count)))
+                    reply = json.loads(b''.join(fragments[i] for i in range(count)))
+                    sock.send(packet(5))
+                    return reply
     raise TimeoutError(f'No UDP reply from {addr} within {timeout}s')

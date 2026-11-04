@@ -1,0 +1,7 @@
+{
+  "default_rejected_divergent_baseline": true,
+  "default_started_measured_runs": 0,
+  "explicit_soak_recorded_baseline_agreed": false,
+  "soak_converged": "false",
+  "merged_request_uuid_and_elapsed_present": true
+}

@@ -23,11 +23,11 @@
 use clap::Parser;
 use client::stats::{ci95, jain, percentile, Ci};
 use client::stress::{parse_client_csv, run_metrics, Fault, Req, RunMetrics};
-use client::{inject_failure, query_probe, query_status, set_load};
+use client::{inject_failure, query_probe, query_results_digest, query_status, set_load};
 use common::config::ClientConfig;
 use common::msg::{NodePhase, NodeProbe, NodeStatus};
 use common::rng::Rng;
-use common::{unix_ms, NodeId};
+use common::{unix_ms, NodeId, ResultsDigest, PROTOCOL_VERSION};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -115,6 +115,15 @@ struct Args {
     load_node: Option<u32>,
     #[arg(long, default_value_t = 2)]
     load_threads: usize,
+    /// Explicit soak mode: permit a divergent baseline or continue after failed convergence.
+    #[arg(long)]
+    allow_unconverged: bool,
+    /// Apply imbalance to the elected server after warm-up.
+    #[arg(long, conflicts_with_all = ["load_node", "load_follower"])]
+    load_incumbent: bool,
+    /// Apply imbalance to a follower selected after warm-up.
+    #[arg(long, conflicts_with_all = ["load_node", "load_incumbent"])]
+    load_follower: bool,
 }
 
 /// One probe answer (or `None`: no answer within `PROBE_TIMEOUT`).
@@ -127,6 +136,14 @@ struct Sample {
 /// One run's measurements: client-side metrics, node counter deltas summed
 /// over the nodes, sampler aggregates, convergence and fault figures.
 struct RunRow {
+    baseline_agreed: bool,
+    worker_expired: u64,
+    worker_queue_wait_mean_ms: f64,
+    repaired_results: u64,
+    dropped_control: u64,
+    dropped_replication: u64,
+    peer_replication_queue_max: usize,
+    load_actual_node: Option<NodeId>,
     workload_wall_ms: f64,
     expected_requests: usize,
     fault_requested: bool,
@@ -204,6 +221,26 @@ impl RunRow {
             .collect::<Vec<_>>()
             .join(";");
         vec![
+            ("baseline_agreed", self.baseline_agreed.to_string()),
+            ("convergence_scope", "current_run_client_ids".to_string()),
+            ("worker_expired", self.worker_expired.to_string()),
+            (
+                "worker_queue_wait_mean_ms",
+                f(self.worker_queue_wait_mean_ms),
+            ),
+            ("repaired_results", self.repaired_results.to_string()),
+            ("dropped_control", self.dropped_control.to_string()),
+            ("dropped_replication", self.dropped_replication.to_string()),
+            (
+                "peer_replication_queue_max",
+                self.peer_replication_queue_max.to_string(),
+            ),
+            (
+                "load_actual_node",
+                self.load_actual_node
+                    .map(|n| n.to_string())
+                    .unwrap_or_default(),
+            ),
             ("run", self.run.to_string()),
             ("rep", self.rep.to_string()),
             ("clients", self.clients.to_string()),
@@ -336,6 +373,16 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
     let cfg = Arc::new(ClientConfig::load(&args.config)?);
+    anyhow::ensure!(
+        cfg.nodes.len() == 3
+            && cfg
+                .nodes
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == 3,
+        "Phase 1 stress tests require three distinct server endpoints"
+    );
     anyhow::ensure!(!args.clients.is_empty() && args.reps > 0, "nothing to run");
     anyhow::ensure!(
         args.rate.is_finite() && args.rate > 0.0,
@@ -387,11 +434,11 @@ async fn main() -> anyhow::Result<()> {
 
     let mut runs_csv = None::<BufWriter<File>>;
     let mut samples_csv = BufWriter::new(File::create(args.out.join("samples.csv"))?);
-    writeln!(samples_csv, "run,t_ms,node,reachable,phase,epoch,server,queue_len,running,pending_cost,load_score,cpu_load,rss_mb,results")?;
+    writeln!(samples_csv, "run,t_ms,node,reachable,phase,epoch,server,queue_len,running,pending_cost,load_score,cpu_load,rss_mb,results,peer_control_queued,peer_replication_queued,sync_lag,protocol_version")?;
     let mut requests_csv = BufWriter::new(File::create(args.out.join("requests.csv"))?);
     writeln!(
         requests_csv,
-        "run,clients,rep,client,seq,sent_rel_ms,latency_ms,served_by,epoch,attempts,busy,answered"
+        "run,clients,rep,client,seq,sent_rel_ms,latency_ms,served_by,epoch,attempts,busy,answered,client_id,elapsed_ms"
     )?;
 
     let mut rows = Vec::new();
@@ -457,7 +504,12 @@ async fn main() -> anyhow::Result<()> {
             .entry(clients)
             .or_default()
             .extend(reqs.iter().filter_map(|r| r.latency_ms));
+        let failed_convergence = !row.converged;
         rows.push(row);
+        if failed_convergence && !args.allow_unconverged {
+            failure = Some(anyhow::anyhow!("run {run} failed convergence; stopping before another run inherits divergent state (see after-run{run}.json)"));
+            break;
+        }
     }
     samples_csv.flush()?;
     requests_csv.flush()?;
@@ -499,6 +551,12 @@ async fn prepare(
     let mut warm = spawn_client(args, client_bin, 20, 0.0, args.seed, &csv)?;
     let status = tokio::task::spawn_blocking(move || warm.wait()).await??;
     anyhow::ensure!(status.success(), "warm-up client failed: {status}");
+    let warm_requests = parse_client_csv(&std::fs::read_to_string(&csv)?, 0)?;
+    anyhow::ensure!(
+        args.allow_unconverged
+            || (warm_requests.len() == 20 && warm_requests.iter().all(Req::answered)),
+        "warm-up requests were unanswered; stopping before measuring an unhealthy cluster"
+    );
     wait_idle(cfg, limit).await
 }
 
@@ -598,6 +656,8 @@ async fn run_once(
         anyhow::ensure!(status.success(), "--before-run failed: {status}");
     }
     wait_idle(cfg, limit).await?;
+    let horizon = baseline_horizon(args);
+    healthy_baseline(args, cfg, limit, horizon, run, "entry").await?;
     let loaded = if let Some(id) = args.load_node {
         let statuses = status_all(cfg).await;
         let i = statuses
@@ -613,20 +673,37 @@ async fn run_once(
         None
     };
     prepare(args, cfg, client_bin, run).await?;
+    let loaded = if args.load_incumbent || args.load_follower {
+        let statuses = status_all(cfg).await;
+        let server = statuses
+            .iter()
+            .flatten()
+            .find_map(|s| s.server)
+            .ok_or_else(|| anyhow::anyhow!("warm-up did not elect a server"))?;
+        let i = statuses
+            .iter()
+            .position(|s| {
+                s.as_ref().is_some_and(|s| {
+                    if args.load_incumbent {
+                        s.node_id == server
+                    } else {
+                        s.node_id != server
+                    }
+                })
+            })
+            .ok_or_else(|| anyhow::anyhow!("no load target answered"))?;
+        let duration =
+            (args.requests as f64 / args.rate * 1000.0) as u64 + args.settle_secs * 1000 + 15_000;
+        set_load(&cfg.nodes[i], args.load_threads, duration, STATUS_TIMEOUT).await?;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        Some(cfg.nodes[i].clone())
+    } else {
+        loaded
+    };
     wait_idle(cfg, limit).await?;
-    let mut before = status_all(cfg).await;
-    for _ in 0..2 {
-        if before.iter().all(Option::is_some) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        before = status_all(cfg).await;
-    }
-    anyhow::ensure!(
-        before.iter().all(Option::is_some),
-        "a node did not answer Status before run {run}"
-    );
-    let before: Vec<NodeStatus> = before.into_iter().flatten().collect();
+    let horizon = baseline_horizon(args);
+    let (before, baseline_agreed) =
+        healthy_baseline(args, cfg, limit, horizon, run, "before").await?;
 
     let stop = Arc::new(AtomicBool::new(false));
     let t0 = Instant::now();
@@ -673,11 +750,6 @@ async fn run_once(
     };
     stop.store(true, Ordering::Relaxed);
     let samples = sampler.await?;
-    let (converge, after) = converge(cfg, limit).await;
-    if let Some(addr) = loaded {
-        set_load(&addr, 0, 0, STATUS_TIMEOUT).await?;
-    }
-
     let mut reqs = Vec::new();
     let mut exit_failures = 0;
     for (i, csv, status) in waited {
@@ -690,6 +762,25 @@ async fn run_once(
         let _ = std::fs::remove_file(&csv);
     }
     let m = run_metrics(&reqs, fault.as_ref());
+    let mut cohort: Vec<_> = reqs.iter().filter_map(|r| r.client_id).collect();
+    cohort.sort();
+    cohort.dedup();
+    anyhow::ensure!(cohort.len() == clients as usize, "request CSVs lack client UUIDs; update every client binary or inspect failed client processes");
+    let (converge, after) = converge(cfg, limit, &cohort, m.answered).await;
+    std::fs::write(
+        args.out.join(format!("after-run{run}.json")),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "statuses": after, "client_ids": cohort, "convergence_scope": "current_run_client_ids", "answered": m.answered,
+            "digests": digest_all(cfg, &cohort, 0).await,
+        }))?,
+    )?;
+    let load_actual_node = loaded
+        .as_ref()
+        .and_then(|addr| cfg.nodes.iter().position(|a| a == addr))
+        .map(|i| before[i].node_id);
+    if let Some(addr) = loaded {
+        set_load(&addr, 0, 0, STATUS_TIMEOUT).await?;
+    }
 
     // Node counters: after − before, summed over the nodes that answered.
     let pairs: Vec<(&NodeStatus, &NodeStatus)> = before
@@ -742,6 +833,19 @@ async fn run_once(
     let cpu_tops = per_tick(&|t| t.iter().map(|p| p.cpu_load).fold(0.0, f64::max));
 
     let row = RunRow {
+        baseline_agreed,
+        load_actual_node,
+        worker_expired: delta(&|s| s.workers.expired_before_start),
+        worker_queue_wait_mean_ms: delta(&|s| s.workers.queue_wait_total_us) as f64
+            / delta(&|s| s.workers.started).max(1) as f64
+            / 1000.0,
+        repaired_results: delta(&|s| s.sync.iter().map(|p| p.repaired_results).sum()),
+        dropped_control: delta(&|s| s.peer_queues.iter().map(|p| p.dropped_control).sum()),
+        dropped_replication: delta(&|s| s.peer_queues.iter().map(|p| p.dropped_replication).sum()),
+        peer_replication_queue_max: probes()
+            .map(|p| p.peer_replication_queued)
+            .max()
+            .unwrap_or(0),
         workload_wall_ms,
         expected_requests: clients as usize * args.requests as usize,
         fault_requested: args.fault_ms.is_some(),
@@ -850,17 +954,15 @@ async fn wait_idle(cfg: &ClientConfig, limit: Duration) -> anyhow::Result<()> {
 async fn converge(
     cfg: &ClientConfig,
     limit: Duration,
+    clients: &[uuid::Uuid],
+    minimum_results: usize,
 ) -> (Option<Duration>, Vec<Option<NodeStatus>>) {
     let t0 = Instant::now();
     loop {
         if idle(&probe_all(cfg).await) {
-            let st = status_all(cfg).await;
-            let digests: Option<Vec<u64>> = st
-                .iter()
-                .map(|s| s.as_ref().map(|s| s.results_digest))
-                .collect();
-            if digests.is_some_and(|d| d.windows(2).all(|w| w[0] == w[1])) {
-                return (Some(t0.elapsed()), st);
+            let digests = digest_all(cfg, clients, 0).await;
+            if agreed(&digests) && digests.iter().flatten().all(|d| d.count >= minimum_results) {
+                return (Some(t0.elapsed()), status_all(cfg).await);
             }
         }
         if t0.elapsed() >= limit {
@@ -868,6 +970,159 @@ async fn converge(
         }
         tokio::time::sleep(POLL).await;
     }
+}
+
+async fn digest_all(
+    cfg: &ClientConfig,
+    clients: &[uuid::Uuid],
+    horizon: u64,
+) -> Vec<Option<ResultsDigest>> {
+    let mut tasks = JoinSet::new();
+    for (i, addr) in cfg.nodes.iter().cloned().enumerate() {
+        let clients = clients.to_vec();
+        tasks.spawn(async move {
+            (
+                i,
+                query_results_digest(&addr, clients, horizon, STATUS_TIMEOUT)
+                    .await
+                    .ok(),
+            )
+        });
+    }
+    let mut digests = vec![None; cfg.nodes.len()];
+    while let Some(Ok((i, digest))) = tasks.join_next().await {
+        digests[i] = digest;
+    }
+    digests
+}
+
+fn agreed(digests: &[Option<ResultsDigest>]) -> bool {
+    let Some(Some(first)) = digests.first() else {
+        return false;
+    };
+    digests.iter().all(|d| {
+        d.as_ref().is_some_and(|d| {
+            d.phase == NodePhase::Ready
+                && d.epoch == first.epoch
+                && d.server == first.server
+                && d.count == first.count
+                && d.digest == first.digest
+        })
+    })
+}
+
+async fn healthy_baseline(
+    args: &Args,
+    cfg: &ClientConfig,
+    limit: Duration,
+    horizon: u64,
+    run: u32,
+    label: &str,
+) -> anyhow::Result<(Vec<NodeStatus>, bool)> {
+    let deadline = Instant::now() + limit;
+    loop {
+        let statuses = status_all(cfg).await;
+        let digests = if statuses
+            .iter()
+            .flatten()
+            .all(|s| s.protocol_version == PROTOCOL_VERSION)
+        {
+            digest_all(cfg, &[], horizon).await
+        } else {
+            vec![None; cfg.nodes.len()]
+        };
+        std::fs::write(
+            args.out.join(format!("{label}-run{run}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "statuses": statuses, "digests": digests, "baseline_min_retained_until_ms": horizon,
+                "soak_mode": args.allow_unconverged,
+            }))?,
+        )?;
+        for status in statuses.iter().flatten() {
+            anyhow::ensure!(
+                status.protocol_version == PROTOCOL_VERSION,
+                "node {} uses protocol {}; rebuild and restart ALL nodes with protocol {}",
+                status.node_id,
+                status.protocol_version,
+                PROTOCOL_VERSION
+            );
+            let required = (args.requests as f64 / args.rate * 1000.0) as u64
+                + args.settle_secs * 2000
+                + u64::from(cfg.max_attempts) * cfg.request_timeout_ms
+                + 30_000;
+            anyhow::ensure!(
+                status
+                    .configuration
+                    .as_ref()
+                    .is_some_and(|c| c.table_ttl_ms > required),
+                "node {} retention must exceed workload + settle + retry window ({required} ms)",
+                status.node_id
+            );
+            let config = status
+                .configuration
+                .as_ref()
+                .expect("validated configuration");
+            anyhow::ensure!(
+                config.campus == cfg.campus,
+                "client and node {} campus configurations differ",
+                status.node_id
+            );
+            if let Some(other) = statuses
+                .iter()
+                .flatten()
+                .next()
+                .and_then(|s| s.configuration.as_ref())
+            {
+                anyhow::ensure!(
+                    config.seed == other.seed
+                        && config.policy == other.policy
+                        && config.election_mode == other.election_mode,
+                    "nodes must share the campus seed and election policy/mode"
+                );
+            }
+        }
+        if statuses.iter().all(Option::is_some) {
+            let ids: std::collections::BTreeSet<_> =
+                statuses.iter().flatten().map(|s| s.node_id).collect();
+            anyhow::ensure!(
+                ids == [1, 2, 3].into_iter().collect(),
+                "server endpoints must identify nodes 1, 2 and 3 exactly once"
+            );
+        }
+        let idle = statuses.iter().all(|s| {
+            s.as_ref()
+                .is_some_and(|s| s.phase == NodePhase::Ready && s.queue_len == 0 && s.running == 0)
+        });
+        let peers_drained = statuses.iter().flatten().all(|s| {
+            s.peer_queues
+                .iter()
+                .all(|q| q.control_queued == 0 && q.replication_queued == 0)
+        });
+        let has_server = label != "before"
+            || statuses.iter().flatten().all(|s| {
+                s.configuration
+                    .as_ref()
+                    .is_some_and(|c| c.election_mode == common::config::ElectionMode::PerRequest)
+                    || s.server.is_some()
+            });
+        let healthy = idle
+            && has_server
+            && statuses.iter().flatten().all(|s| !s.degraded)
+            && peers_drained
+            && agreed(&digests);
+        if idle && (healthy || args.allow_unconverged) {
+            return Ok((statuses.into_iter().flatten().collect(), healthy));
+        }
+        anyhow::ensure!(Instant::now() < deadline,
+            "unhealthy baseline before run {run}; inspect {label}-run{run}.json. Repair/restart the cluster, or explicitly select --allow-unconverged for a soak experiment");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+fn baseline_horizon(args: &Args) -> u64 {
+    unix_ms().saturating_add(
+        (args.requests as f64 / args.rate * 1000.0) as u64 + args.settle_secs * 2000 + 30_000,
+    )
 }
 
 async fn sample(
@@ -1006,7 +1261,7 @@ fn write_samples(
         match &s.probe {
             Some(p) => writeln!(
                 w,
-                "{run},{},{},true,{:?},{},{},{},{},{},{},{:.3},{:.1},{}",
+                "{run},{},{},true,{:?},{},{},{},{},{},{},{:.3},{:.1},{},{},{},{},{}",
                 s.t_ms,
                 p.node_id,
                 p.phase,
@@ -1018,11 +1273,15 @@ fn write_samples(
                 p.load_score,
                 p.cpu_load,
                 p.rss_bytes as f64 / 1048576.0,
-                p.results
+                p.results,
+                p.peer_control_queued,
+                p.peer_replication_queued,
+                p.sync_lag,
+                p.protocol_version
             )?,
             None => writeln!(
                 w,
-                "{run},{},{},false,,,,,,,,,,",
+                "{run},{},{},false,,,,,,,,,,,,,,",
                 s.t_ms,
                 nodes.get(s.node).copied().unwrap_or_default()
             )?,
@@ -1043,7 +1302,7 @@ fn write_requests(
     for r in reqs {
         writeln!(
             w,
-            "{run},{clients},{rep},{},{},{},{},{},{},{},{},{}",
+            "{run},{clients},{rep},{},{},{},{},{},{},{},{},{},{},{}",
             r.client,
             r.seq,
             r.sent_ms as i64 - start_ms as i64,
@@ -1052,7 +1311,11 @@ fn write_requests(
             opt(r.epoch),
             r.attempts,
             r.busy,
-            r.answered()
+            r.answered(),
+            r.client_id.map(|id| id.to_string()).unwrap_or_default(),
+            r.elapsed_ms
+                .map(|ms| format!("{ms:.3}"))
+                .unwrap_or_default()
         )?;
     }
     Ok(())

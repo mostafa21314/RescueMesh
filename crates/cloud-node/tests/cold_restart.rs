@@ -158,7 +158,10 @@ async fn two_restarted_nodes_wait_for_a_ready_peer_and_skip_each_other() {
         let one = restart_with(1, &addrs, rule).await;
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert_eq!(one.status().phase, NodePhase::Recovering);
-        assert_eq!(one.status().results, 0, "nothing installed yet");
+        // Incremental pages can be installed safely before the role view is
+        // accepted; the node must still neither elect nor serve.
+        assert_eq!(one.status().elections_decided, 0);
+        assert_eq!(one.status().epoch, 0);
 
         // Node 3 comes back: node 1 answers "not ready" (it is recovering
         // itself), so node 3 recovers from node 2; then node 1 can too.

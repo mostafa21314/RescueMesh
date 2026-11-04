@@ -15,7 +15,7 @@ from recovery_bench import client_toml, node_toml
 from udp_rr import PAYLOAD, call
 
 ROOT = Path(__file__).resolve().parent.parent
-BIN = ROOT / 'target' / 'release'
+BIN = Path(os.environ.get('RESCUEMESH_BIN_DIR', str(ROOT / 'target' / 'release'))).resolve()
 EXE = '.exe' if os.name == 'nt' else ''
 
 
@@ -36,8 +36,9 @@ class Interoperability(unittest.TestCase):
                         cfg.write_text(node_toml(i, {'on_start': False}, addrs), encoding='utf-8')
                         sock.close()
                         children.append(subprocess.Popen(
-                            [str(BIN / f'cloud-node{EXE}'), '--config', str(cfg)],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+                            [str(BIN / f'cloud-node{EXE}'), '--config', str(cfg), '--log-file', str(directory / f'node{i+1}.log')],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            env={**os.environ, 'RUST_LOG': 'info'}))
                     for addr in addrs:
                         deadline = time.monotonic() + 10
                         while True:
@@ -55,6 +56,8 @@ class Interoperability(unittest.TestCase):
                                    check=True, timeout=20, stdout=subprocess.DEVNULL)
                     status = call(addrs[0], {'type': 'StatusRequest'}, 3)
                     self.assertEqual(status['type'], 'Status')
+                    self.assertEqual(status['protocol_version'], 2)
+                    self.assertIn('protocol_version=2', (directory / 'node1.log').read_text(encoding='utf-8'))
                     self.assertEqual(call(addrs[0], {'type': 'SetLoad', 'threads': 1,
                                                    'duration_ms': 100}, 3)['type'], 'LoadAccepted')
                     self.assertEqual(call(addrs[0], {'type': 'SetLoad', 'threads': 0,

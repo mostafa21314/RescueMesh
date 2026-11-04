@@ -84,6 +84,12 @@ table_ttl_ms = 1800000
 
 [recovery]
 {rec}
+
+[scheduling]
+policy = "priority_decay"
+priority_boost_ms = 250
+priority_half_life_ms = 1000
+request_lease_ms = 10000
 """
 
 

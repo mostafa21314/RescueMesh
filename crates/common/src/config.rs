@@ -137,6 +137,38 @@ pub struct NodeConfig {
     pub campus: CampusParams,
     #[serde(default)]
     pub recovery: RecoveryParams,
+    #[serde(default)]
+    pub scheduling: SchedulingParams,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulingPolicy {
+    Fifo,
+    #[default]
+    PriorityDecay,
+}
+
+/// Worker admission and priority policy; independent of server election.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SchedulingParams {
+    pub policy: SchedulingPolicy,
+    pub priority_boost_ms: u64,
+    pub priority_half_life_ms: u64,
+    /// A takeover considers only requests with recent live client interest.
+    pub request_lease_ms: u64,
+}
+
+impl Default for SchedulingParams {
+    fn default() -> Self {
+        Self {
+            policy: SchedulingPolicy::PriorityDecay,
+            priority_boost_ms: 250,
+            priority_half_life_ms: 1000,
+            request_lease_ms: 10_000,
+        }
+    }
 }
 
 /// What a returning node pulls from each survivor (docs/recovery.md, R2).
@@ -145,8 +177,8 @@ pub struct NodeConfig {
 pub enum Transfer {
     /// Every retained request and result.
     Full,
-    /// Only entries the survivor changed while this node was away (plus
-    /// `delta_margin_ms`); a process that just started still pulls everything.
+    /// Protocol 2: incremental result pages from a validated per-incarnation
+    /// revision cursor. A new source incarnation starts at revision zero.
     #[default]
     Delta,
 }
@@ -189,8 +221,8 @@ pub struct RecoveryParams {
     /// recover from them before taking part (docs/recovery.md, R5). Off: a
     /// restarted node starts Ready and empty.
     pub on_start: bool,
-    /// Delta transfer: extra history sent before the outage started, to cover
-    /// replicas that were still in flight when it began.
+    /// Legacy republish lookback around an outage. Protocol 2 delta transfer
+    /// uses validated revision cursors instead of this time window.
     pub delta_margin_ms: u64,
     /// Majority rule: how long to wait for the second survivor after the first.
     pub majority_wait_ms: u64,
@@ -233,6 +265,16 @@ impl NodeConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.scheduling.priority_half_life_ms == 0
+            || self.scheduling.priority_boost_ms > 60_000
+            || self.scheduling.request_lease_ms == 0
+            || self.scheduling.request_lease_ms > 300_000
+            || self.scheduling.priority_boost_ms >= self.scheduling.request_lease_ms
+        {
+            return Err(ConfigError::Invalid(
+                "invalid scheduling half-life, boost or request lease".into(),
+            ));
+        }
         let mut ids = HashSet::from([self.node_id]);
         for p in &self.peers {
             if !ids.insert(p.id) {

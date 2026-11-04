@@ -1,0 +1,6 @@
+label: faulty; severity=3; UDP RR; Linux-7.0.0-42-generic-x86_64-with-glibc2.43
+started_unix_ms: 1793765756865
+harness_machine: linux x86_64, 24 logical cores
+nodes: ["10.26.210.61:7001", "10.26.210.65:7002", "10.26.210.63:7003"]
+request_timeout_ms: 1000 max_attempts: 8
+args: Args { config: "/home/g5/Desktop/RescueMesh/config/site/client.toml", clients: [4, 8, 16], reps: 5, requests: 1800, rate: 30.0, complexity: 5, fault_ms: Some(20000), fault_at_ms: 15000, sample_ms: 250, pause_ms: 1000, seed: 42, out: "/home/g5/Desktop/RescueMesh/results/phase1/zerotier-study-1/faulty", client_bin: None, client_threads: 2, settle_secs: 60, label: "faulty; severity=3; UDP RR; Linux-7.0.0-42-generic-x86_64-with-glibc2.43", before_run: None, fault_cmd: None, local_nodes: None, load_node: None, load_threads: 2 }

@@ -10,6 +10,8 @@ use std::collections::BTreeMap;
 /// One request, as a `client --out` CSV records it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Req {
+    pub client_id: Option<uuid::Uuid>,
+    pub elapsed_ms: Option<f64>,
     /// Index of the client process within the run.
     pub client: u32,
     pub seq: u64,
@@ -61,10 +63,14 @@ pub fn parse_client_csv(text: &str, client: u32) -> anyhow::Result<Vec<Req>> {
         Ok(if s.is_empty() { None } else { Some(s.parse()?) })
     }
     let mut out = Vec::new();
+    let client_id = header.iter().position(|h| *h == "client_id");
+    let elapsed = header.iter().position(|h| *h == "elapsed_ms");
     for (i, line) in lines.enumerate().filter(|(_, l)| !l.is_empty()) {
         let f: Vec<&str> = line.split(',').collect();
         anyhow::ensure!(f.len() == header.len(), "line {}: wrong field count", i + 2);
         out.push(Req {
+            client_id: client_id.and_then(|i| f[i].parse().ok()),
+            elapsed_ms: elapsed.and_then(|i| f[i].parse().ok()),
             client,
             seq: f[seq].parse()?,
             sent_ms: f[sent].parse()?,
@@ -214,6 +220,8 @@ mod tests {
 
     fn req(seq: u64, sent: u64, latency: Option<u64>, node: NodeId) -> Req {
         Req {
+            client_id: None,
+            elapsed_ms: latency.map(|l| l as f64),
             client: 0,
             seq,
             sent_ms: sent,
@@ -240,6 +248,16 @@ mod tests {
         assert!(!v[1].answered());
         assert_eq!((v[1].attempts, v[1].busy), (5, 2));
         assert!(parse_client_csv("seq\n1\n", 0).is_err());
+    }
+
+    #[test]
+    fn preserves_client_uuid_and_failed_request_elapsed_time() {
+        let text = "client_id,seq,sent_at_ms,response_at_ms,latency_ms,served_by,epoch,degraded,attempts,busy_replies,answered,elapsed_ms\n00000000-0000-0000-0000-000000000001,2,1100,,,,,false,8,2,false,8025.5\n";
+        let rows = parse_client_csv(text, 0).unwrap();
+        assert_eq!(rows[0].client_id, Some(uuid::Uuid::from_u128(1)));
+        assert_eq!(rows[0].elapsed_ms, Some(8025.5));
+        assert!(!rows[0].answered());
+        assert_eq!(rows[0].latency_ms, None);
     }
 
     #[test]

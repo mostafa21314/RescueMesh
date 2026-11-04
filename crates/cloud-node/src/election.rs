@@ -452,6 +452,20 @@ impl Core {
         out
     }
 
+    /// A stable peer view can heal missed role messages while no new work runs.
+    pub fn on_peer_view(
+        &mut self,
+        now: Instant,
+        epoch: Epoch,
+        server: Option<NodeId>,
+    ) -> Vec<Action> {
+        self.peer_heard();
+        match server {
+            Some(server) => self.on_replicate(now, epoch, server),
+            None => self.observe_client_epoch(now, epoch),
+        }
+    }
+
     // --------------------------------------------------------------- helpers
 
     /// How long `server` has held the role in the current epoch, as this node
@@ -724,6 +738,19 @@ mod tests {
 
     const TIMEOUT: Duration = Duration::from_millis(100);
     const DEGRADED: Duration = Duration::from_secs(3);
+
+    #[test]
+    fn stable_peer_views_heal_missed_epochs_without_fresh_results() {
+        let now = Instant::now();
+        let mut c = core(1, ElectionMode::OnDemand);
+        c.recover_view(now, 3, Some(2));
+        c.on_peer_view(now, 4, Some(3));
+        assert_eq!((c.epoch(), c.server()), (4, Some(3)));
+        c.on_peer_view(now, 4, Some(2));
+        assert_eq!(c.server(), Some(2));
+        c.on_peer_view(now, 5, None);
+        assert_eq!((c.epoch(), c.server()), (5, None));
+    }
 
     fn core(me: NodeId, mode: ElectionMode) -> Core {
         Core::new(Params {

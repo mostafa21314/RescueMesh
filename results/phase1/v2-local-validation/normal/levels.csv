@@ -1,0 +1,3 @@
+clients,offered_rps,runs,requests,answered_pct,retried_pct,thr_mean,thr_ci,p50_mean,p50_ci,p95_mean,p95_ci,p99_mean,p99_ci,pooled_mean,pooled_p50,pooled_p95,pooled_p99,pooled_p999,pooled_max,elections_mean,elections_ci,electbid_msgs_mean,election_ms_mean,replicate_bytes_per_answer,suppressed_mean,queue_max_mean,cpu_mean,converged_runs,converge_ms_mean,converge_ms_ci,top_share_mean
+4,120.000,2,1440,100.000,0.000,116.062,2.380,5.267,0.972,7.445,1.144,10.110,4.218,5.456,5.264,7.490,10.404,16.104,16.543,0.000,0.000,0.000,,1809.501,0.000,0.000,0.025,2,1.831,3.847,1.000
+16,480.000,2,5760,100.000,0.000,403.759,0.360,6.310,0.241,12.459,6.779,14.409,2.681,7.203,6.312,12.497,14.557,20.878,28.443,0.000,0.000,0.000,,1621.204,0.000,5.500,0.074,2,1.167,0.639,1.000

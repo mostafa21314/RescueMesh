@@ -34,6 +34,7 @@ type Reply = mpsc::UnboundedSender<Message>;
 type Versions = HashMap<RequestId, (Epoch, NodeId)>;
 
 struct Job {
+    expires: Instant,
     generation: u64,
     request_id: RequestId,
     incident: Incident,
@@ -47,6 +48,8 @@ struct Done {
     job: Job,
     plan: Option<Plan>,
 }
+
+mod anti_entropy;
 
 struct State {
     phase: NodePhase,
@@ -66,6 +69,8 @@ struct State {
     inflight: HashSet<RequestId>,
     /// Per-request mode: elections won before the client's message arrived.
     pending_wins: HashSet<RequestId>,
+    recovery_inserted: u64,
+    has_been_ready: bool,
 }
 
 #[derive(Default)]
@@ -82,9 +87,12 @@ struct Stats {
     snapshot_lock_max_us: AtomicU64,
     elections_recorded: AtomicU64,
     election_time_us: AtomicU64,
+    expired_jobs: Arc<AtomicU64>,
 }
 
 struct Shared {
+    incarnation: uuid::Uuid,
+    sync: Mutex<BTreeMap<NodeId, anti_entropy::Progress>>,
     campus: Arc<Campus>,
     generation: Arc<AtomicU64>,
     stopped: AtomicBool,
@@ -185,12 +193,25 @@ pub async fn start_with_listener(
         let (campus, ledger, load) = (campus.clone(), ledger.clone(), load.clone());
         let replans = stats.local_replans.clone();
         let generation = generation.clone();
-        Pool::new(cfg.workers, cfg.queue_capacity, move |job: Job| {
-            let started = Instant::now();
-            let plan = plan_and_commit(&campus, &ledger, &replans, &job, &generation);
-            load.record_service(started.elapsed(), planner::expected_cost(job.complexity));
-            let _ = done_tx.send(Done { job, plan });
-        })
+        let expired = stats.expired_jobs.clone();
+        Pool::with_scheduler(
+            cfg.workers,
+            cfg.queue_capacity,
+            cfg.scheduling,
+            move |job: Job| {
+                let started = Instant::now();
+                let plan = if started > job.expires {
+                    expired.fetch_add(1, Ordering::Relaxed);
+                    None
+                } else {
+                    plan_and_commit(&campus, &ledger, &replans, &job, &generation)
+                };
+                if plan.is_some() {
+                    load.record_service(started.elapsed(), planner::expected_cost(job.complexity));
+                }
+                let _ = done_tx.send(Done { job, plan });
+            },
+        )
     };
 
     let core = Core::new(election::Params {
@@ -203,6 +224,8 @@ pub async fn start_with_listener(
         min_tenure: Duration::from_millis(cfg.min_tenure_ms),
     });
     let shared = Arc::new(Shared {
+        incarnation: uuid::Uuid::new_v4(),
+        sync: Mutex::new(BTreeMap::new()),
         campus: campus.clone(),
         generation,
         stopped: AtomicBool::new(false),
@@ -222,6 +245,8 @@ pub async fn start_with_listener(
             reply_to: HashMap::new(),
             inflight: HashSet::new(),
             pending_wins: HashSet::new(),
+            recovery_inserted: 0,
+            has_been_ready: !cfg.recovery.on_start,
         }),
         cfg,
         ledger,
@@ -242,6 +267,12 @@ pub async fn start_with_listener(
     tasks.push(tokio::spawn(accept_loop(shared.clone(), listener)));
     tasks.push(tokio::spawn(completion_loop(shared.clone(), done_rx)));
     tasks.push(tokio::spawn(sweep_loop(shared.clone())));
+    for peer in &shared.cfg.peers {
+        tasks.push(tokio::spawn(anti_entropy::run(
+            shared.clone(),
+            peer.clone(),
+        )));
+    }
     if shared.cfg.recovery.on_start {
         // Cold start. While `Starting` the node answers probes but takes no part.
         // If a peer shows the cluster has been running (a restart after a crash),
@@ -262,7 +293,9 @@ pub async fn start_with_listener(
             }
         }
         if history.is_empty() {
-            shared.state.lock().unwrap().phase = NodePhase::Ready;
+            let mut st = shared.state.lock().unwrap();
+            st.phase = NodePhase::Ready;
+            st.has_been_ready = true;
         } else {
             shared.state.lock().unwrap().phase = NodePhase::Recovering;
             tracing::info!(
@@ -275,6 +308,9 @@ pub async fn start_with_listener(
     }
     tracing::info!(
         node = shared.cfg.node_id,
+        protocol_version = PROTOCOL_VERSION,
+        incarnation = %shared.incarnation,
+        scheduling = ?shared.cfg.scheduling,
         %addr,
         workers = shared.cfg.workers,
         mode = ?shared.cfg.election_mode,
@@ -306,6 +342,7 @@ fn inject_failure(shared: &Arc<Shared>, duration: Duration) -> anyhow::Result<()
     st.last_recovery_ms = None;
     st.muted_at = Some(Instant::now());
     st.recovery_epoch = st.core.epoch();
+    st.recovery_inserted = 0;
     shared.generation.fetch_add(1, Ordering::SeqCst);
     shared.peers.suspend();
     shared.pool.drop_queued();
@@ -362,8 +399,15 @@ async fn transfer_round(shared: &Arc<Shared>, since_ms: Option<u64>) -> Round {
     let (tx, mut rx) = mpsc::unbounded_channel();
     for p in &shared.cfg.peers {
         let (tx, addr, id, me) = (tx.clone(), p.addr.clone(), p.id, shared.cfg.node_id);
+        let sh = shared.clone();
+        let peer = p.clone();
         tokio::spawn(async move {
-            let _ = tx.send(crate::recovery::fetch(&addr, me, id, since_ms).await);
+            let fetched = if rp.transfer == Transfer::Delta {
+                anti_entropy::fetch(&sh, &peer).await
+            } else {
+                crate::recovery::fetch(&addr, me, id, since_ms).await
+            };
+            let _ = tx.send(fetched);
         });
     }
     drop(tx);
@@ -517,20 +561,31 @@ async fn recover(shared: Arc<Shared>, cause: Cause) {
             peer_versions.push((snap.peer, versions));
             report.new_results += st.tables.merge_recovery(snap.records, now).stored;
         }
+        report.new_results += st.recovery_inserted;
+        st.recovery_inserted = 0;
         let mut ledger = Ledger::new(&shared.campus);
-        for record in st.tables.recovery_records(None) {
-            if let Some(result) = &record.result {
-                ledger.apply(record.request_id, &result.plan, unix_ms());
-            }
+        for (id, result) in st.tables.iter_results() {
+            ledger.apply(id, &result.plan, unix_ms());
         }
         *shared.ledger.lock().unwrap() = ledger;
         st.core.recover_view(now, epoch, server);
         st.inflight.clear();
         st.phase = NodePhase::Ready;
+        st.has_been_ready = true;
         shared.peers.resume();
         // Also publish retained results that may have completed just before
         // the outage without reaching a survivor.
+        let mut published = HashMap::<NodeId, usize>::new();
         for id in candidates {
+            let Some(response) = st.tables.result(&id) else {
+                continue;
+            };
+            if !peer_versions.iter().any(|(peer, versions)| {
+                published.get(peer).copied().unwrap_or(0) < 64
+                    && versions.get(&id) != Some(&(response.epoch, response.served_by))
+            }) {
+                continue;
+            }
             let Some(record) = st.tables.recovery_record(&id) else {
                 continue;
             };
@@ -542,11 +597,15 @@ async fn recover(shared: Arc<Shared>, cause: Cause) {
                 plan: r.plan,
                 incident: record.incident,
                 degraded: r.degraded,
+                retained_until_ms: r.retained_until_ms,
             };
             for (peer, versions) in &peer_versions {
-                if versions.get(&id) != Some(&(r.epoch, r.served_by)) {
+                if published.get(peer).copied().unwrap_or(0) < 64
+                    && versions.get(&id) != Some(&(r.epoch, r.served_by))
+                {
                     shared.peers.send(*peer, message.clone());
                     report.republished += 1;
+                    *published.entry(*peer).or_default() += 1;
                 }
             }
         }
@@ -593,7 +652,7 @@ fn serve_snapshot(shared: &Shared, node_id: NodeId, since_ms: Option<u64>, reply
         let _ = reply.send(Message::RecoveryUnavailable {
             node_id: shared.cfg.node_id,
             phase: st.phase,
-            has_state: st.tables.len() != (0, 0),
+            has_state: st.has_been_ready && st.tables.len() != (0, 0),
         });
         return;
     }
@@ -601,7 +660,9 @@ fn serve_snapshot(shared: &Shared, node_id: NodeId, since_ms: Option<u64>, reply
     // every frame queued for the peer so far is covered by the snapshot, so
     // the peer's link drops it and reconnects at once; frames queued from now
     // on reach it (Marwan's link reset, design log November 3).
-    shared.peers.reset(node_id);
+    if since_ms.is_none() {
+        shared.peers.reset(node_id);
+    }
     let count = match shared.cfg.recovery.snapshot {
         SnapshotBuild::Locked => {
             // Build and queue the whole snapshot in one hold of the lock.
@@ -770,6 +831,9 @@ fn handle(shared: &Arc<Shared>, msg: Message, reply: &Reply) {
         && !matches!(
             msg,
             Message::Replicate { .. }
+                | Message::ReplicateBatch { .. }
+                | Message::SyncRequest { .. }
+                | Message::ResultsDigestRequest { .. }
                 | Message::StatusRequest
                 | Message::ProbeRequest
                 | Message::RecoveryRequest { .. }
@@ -778,6 +842,95 @@ fn handle(shared: &Arc<Shared>, msg: Message, reply: &Reply) {
         return;
     }
     match msg {
+        Message::ClientFinished { request_ids } => {
+            if request_ids.len() > 256 {
+                return;
+            }
+            let mut st = shared.state.lock().unwrap();
+            for id in request_ids {
+                if !st.reply_to.get(&id).is_some_and(|r| r.same_channel(reply)) {
+                    continue;
+                }
+                st.reply_to.remove(&id);
+                for job in shared.pool.discard_where(|job| job.request_id == id) {
+                    st.inflight.remove(&job.request_id);
+                }
+            }
+        }
+        Message::SyncRequest {
+            node_id,
+            incarnation,
+            after_revision,
+            recovery,
+        } => {
+            if !shared.cfg.peers.iter().any(|p| p.id == node_id) {
+                return;
+            }
+            let st = shared.state.lock().unwrap();
+            let after = if incarnation == Some(shared.incarnation) {
+                after_revision
+            } else {
+                0
+            };
+            let held = Instant::now();
+            let (next_revision, latest_revision, records) = if st.phase == NodePhase::Ready {
+                st.tables.sync_page(after)
+            } else {
+                (after, after, Vec::new())
+            };
+            if recovery && st.phase == NodePhase::Ready {
+                shared
+                    .stats
+                    .snapshots_served
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            shared
+                .stats
+                .snapshot_lock_max_us
+                .fetch_max(held.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let _ = reply.send(Message::SyncReply(Box::new(SyncReply {
+                node_id: shared.cfg.node_id,
+                incarnation: shared.incarnation,
+                phase: st.phase,
+                next_revision,
+                latest_revision,
+                records,
+                results_digest: st.tables.results_digest(),
+                epoch: st.core.epoch(),
+                server: st.core.server(),
+                electing: st.core.electing(),
+                has_authoritative_state: st.has_been_ready,
+            })));
+        }
+        Message::ResultsDigestRequest {
+            client_ids,
+            min_retained_until_ms,
+        } => {
+            if client_ids.len() > 256 {
+                return;
+            }
+            let st = shared.state.lock().unwrap();
+            let (count, digest) = st.tables.scoped_digest(&client_ids, min_retained_until_ms);
+            let _ = reply.send(Message::ResultsDigest(ResultsDigest {
+                node_id: shared.cfg.node_id,
+                phase: st.phase,
+                epoch: st.core.epoch(),
+                server: st.core.server(),
+                count,
+                digest,
+            }));
+        }
+        Message::ReplicateBatch { records } => {
+            if records.len() > 64 {
+                return;
+            }
+            for record in records {
+                if let Some(result) = record.result {
+                    shared.stats.received.add("Replicate", 0);
+                    on_replicate(shared, record.request_id, record.incident, result.into());
+                }
+            }
+        }
         Message::SetLoad {
             threads,
             duration_ms,
@@ -820,15 +973,33 @@ fn handle(shared: &Arc<Shared>, msg: Message, reply: &Reply) {
             client_epoch,
             incident,
             complexity,
-        } => on_submit(
-            shared,
-            request_id,
-            attempt,
-            client_epoch,
-            incident,
-            complexity,
-            reply,
-        ),
+            finished,
+        } => {
+            if finished.len() > 256 {
+                return;
+            }
+            {
+                let mut st = shared.state.lock().unwrap();
+                for id in finished {
+                    if !st.reply_to.get(&id).is_some_and(|r| r.same_channel(reply)) {
+                        continue;
+                    }
+                    st.reply_to.remove(&id);
+                    for job in shared.pool.discard_where(|job| job.request_id == id) {
+                        st.inflight.remove(&job.request_id);
+                    }
+                }
+            }
+            on_submit(
+                shared,
+                request_id,
+                attempt,
+                client_epoch,
+                incident,
+                complexity,
+                reply,
+            )
+        }
         Message::Replicate {
             epoch,
             origin,
@@ -836,7 +1007,21 @@ fn handle(shared: &Arc<Shared>, msg: Message, reply: &Reply) {
             plan,
             incident,
             degraded,
-        } => on_replicate(shared, epoch, origin, request_id, plan, incident, degraded),
+            retained_until_ms,
+        } => {
+            on_replicate(
+                shared,
+                request_id,
+                incident,
+                Response {
+                    served_by: origin,
+                    epoch,
+                    plan,
+                    degraded,
+                    retained_until_ms,
+                },
+            );
+        }
         Message::ElectBid {
             target_epoch,
             node_id,
@@ -922,20 +1107,31 @@ fn on_submit(
     if st.core.serving()
         && !st.inflight.contains(&request_id)
         && st.tables.result(&request_id).is_none()
-        && !submit(shared, st, request_id, false)
+        && !submit(shared, st, request_id)
     {
         tracing::debug!(%request_id, attempt, "queue full, replying Busy");
         let _ = reply.send(Message::Busy { request_id });
     }
 }
 
-/// Queues a recorded request on the pool. False if the queue is full
-/// (`force` ignores the limit: takeover).
-fn submit(shared: &Shared, st: &mut State, request_id: RequestId, force: bool) -> bool {
+/// All queue admission is bounded, including a newly elected server's work.
+fn submit(shared: &Shared, st: &mut State, request_id: RequestId) -> bool {
     let Some(e) = st.tables.request(&request_id) else {
         return false;
     };
+    let expires = e.last_interest + Duration::from_millis(shared.cfg.scheduling.request_lease_ms);
+    if Instant::now() > expires {
+        return false;
+    }
+    let now_ms = unix_ms();
+    let priority = planner::priority(
+        &shared.campus,
+        &shared.ledger.lock().unwrap().snapshot(now_ms),
+        &e.incident,
+        now_ms,
+    );
     let job = Job {
+        expires,
         generation: shared.generation.load(Ordering::SeqCst),
         request_id,
         incident: e.incident.clone(),
@@ -944,11 +1140,7 @@ fn submit(shared: &Shared, st: &mut State, request_id: RequestId, force: bool) -
         degraded: st.core.degraded(),
     };
     let cost = planner::expected_cost(e.complexity);
-    let queued = if force {
-        shared.pool.force_submit(cost, job)
-    } else {
-        shared.pool.try_submit(cost, job)
-    };
+    let queued = shared.pool.try_submit_ranked(cost, priority, job);
     if queued.is_ok() {
         st.inflight.insert(request_id);
         true
@@ -997,11 +1189,26 @@ fn run_actions(shared: &Arc<Shared>, st: &mut State, actions: Vec<Action>) {
                 );
             }
             Action::BecameServer => {
-                // Every not-completed request, oldest first, even past the
-                // queue limit: they were already accepted by the cluster.
+                // Only recent live interests, admitted within the same bound
+                // as new requests. Old table history is repaired, not replayed.
                 let mut queued = 0;
-                for rid in st.tables.pending_oldest_first() {
-                    if !st.inflight.contains(&rid) && submit(shared, st, rid, true) {
+                let mut active: Vec<_> = st
+                    .reply_to
+                    .iter()
+                    .filter(|(_, reply)| !reply.is_closed())
+                    .filter_map(|(id, _)| {
+                        st.tables
+                            .request(id)
+                            .filter(|r| !r.completed)
+                            .map(|r| (r.first_seen, *id))
+                    })
+                    .collect();
+                active.sort();
+                for (_, rid) in active {
+                    if shared.pool.free_slots() == 0 {
+                        break;
+                    }
+                    if !st.inflight.contains(&rid) && submit(shared, st, rid) {
                         queued += 1;
                     }
                 }
@@ -1019,7 +1226,7 @@ fn run_actions(shared: &Arc<Shared>, st: &mut State, actions: Vec<Action>) {
                 }
                 if !st.tables.has_request(&rid) {
                     st.pending_wins.insert(rid); // the client's message hasn't arrived yet
-                } else if !submit(shared, st, rid, false) {
+                } else if !submit(shared, st, rid) {
                     if let Some(r) = st.reply_to.get(&rid) {
                         let _ = r.send(Message::Busy { request_id: rid });
                     }
@@ -1107,10 +1314,10 @@ async fn completion_loop(shared: Arc<Shared>, mut done_rx: mpsc::UnboundedReceiv
         {
             continue;
         }
+        st.inflight.remove(&request_id);
         let Some(plan) = plan else {
             continue;
         };
-        st.inflight.remove(&request_id);
 
         // A plan finished after this node stopped serving its epoch is late.
         // It is stored and replicated under the result rule (higher epoch,
@@ -1127,6 +1334,7 @@ async fn completion_loop(shared: Arc<Shared>, mut done_rx: mpsc::UnboundedReceiv
             epoch: job.epoch,
             degraded: job.degraded,
             plan,
+            retained_until_ms: unix_ms().saturating_add(shared.cfg.table_ttl_ms),
         };
         match st
             .tables
@@ -1166,6 +1374,7 @@ async fn completion_loop(shared: Arc<Shared>, mut done_rx: mpsc::UnboundedReceiv
                     plan: response.plan,
                     incident,
                     degraded: response.degraded,
+                    retained_until_ms: response.retained_until_ms,
                 });
             }
         }
@@ -1174,22 +1383,24 @@ async fn completion_loop(shared: Arc<Shared>, mut done_rx: mpsc::UnboundedReceiv
 
 fn on_replicate(
     shared: &Arc<Shared>,
-    epoch: Epoch,
-    origin: NodeId,
     request_id: RequestId,
-    plan: Plan,
     incident: Incident,
-    degraded: bool,
-) {
+    response: Response,
+) -> bool {
+    let epoch = response.epoch;
+    let origin = response.served_by;
+    if response.retained_until_ms > 0 && response.retained_until_ms <= unix_ms() {
+        return false;
+    }
     shared.peers.heard_from(origin);
     let now = Instant::now();
     let mut guard = shared.state.lock().unwrap();
     let st = &mut *guard;
     if st.phase == NodePhase::Muted {
-        return;
+        return false;
     }
-    if !shared.cfg.peers.iter().any(|p| p.id == origin) {
-        return;
+    if origin != shared.cfg.node_id && !shared.cfg.peers.iter().any(|p| p.id == origin) {
+        return false;
     }
     st.recovery_epoch = st.recovery_epoch.max(epoch);
     if st.phase == NodePhase::Ready {
@@ -1197,12 +1408,6 @@ fn on_replicate(
         run_actions(shared, st, acts);
     }
 
-    let response = Response {
-        served_by: origin,
-        epoch,
-        degraded,
-        plan,
-    };
     let applied = match st
         .tables
         .offer(request_id, response.clone(), &incident, now)
@@ -1212,13 +1417,18 @@ fn on_replicate(
                 .stats
                 .duplicate_replicates
                 .fetch_add(1, Ordering::Relaxed);
-            return;
+            return false;
         }
-        Offer::Stored => shared
-            .ledger
-            .lock()
-            .unwrap()
-            .apply(request_id, &response.plan, unix_ms()),
+        Offer::Stored => {
+            if st.phase == NodePhase::Recovering {
+                st.recovery_inserted += 1;
+            }
+            shared
+                .ledger
+                .lock()
+                .unwrap()
+                .apply(request_id, &response.plan, unix_ms())
+        }
         Offer::Replaced(old) => {
             let mut l = shared.ledger.lock().unwrap();
             l.release(request_id, &old.plan, unix_ms());
@@ -1247,6 +1457,7 @@ fn on_replicate(
             .fetch_add(applied.resource_overcommits as u64, Ordering::Relaxed);
         tracing::warn!(%request_id, units = applied.resource_overcommits, "replicated plan overcommits resources");
     }
+    true
 }
 
 async fn sweep_loop(shared: Arc<Shared>) {
@@ -1258,7 +1469,14 @@ async fn sweep_loop(shared: Arc<Shared>) {
         let st = &mut *guard;
         st.tables.sweep(Instant::now(), ttl);
         let tables = &st.tables;
-        st.reply_to.retain(|r, _| tables.has_request(r));
+        let now = Instant::now();
+        let lease = Duration::from_millis(shared.cfg.scheduling.request_lease_ms);
+        st.reply_to.retain(|r, reply| {
+            !reply.is_closed()
+                && tables
+                    .request(r)
+                    .is_some_and(|e| now.duration_since(e.last_interest) <= lease)
+        });
         st.pending_wins.retain(|r| tables.has_request(r));
     }
 }
@@ -1270,6 +1488,29 @@ fn status(shared: &Shared) -> NodeStatus {
     let (requests, results) = st.tables.len();
     let c = st.core.counters;
     NodeStatus {
+        server_unix_ms: unix_ms(),
+        protocol_version: PROTOCOL_VERSION,
+        configuration: Some(shared.cfg.clone()),
+        platform: format!(
+            "{} {} {} logical CPUs",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            std::thread::available_parallelism().map_or(1, |n| n.get())
+        ),
+        incarnation: Some(shared.incarnation),
+        peer_queues: shared.peers.queues(),
+        sync: shared
+            .sync
+            .lock()
+            .unwrap()
+            .values()
+            .map(|p| p.stats.clone())
+            .collect(),
+        workers: {
+            let mut workers = shared.pool.stats();
+            workers.expired_before_start = shared.stats.expired_jobs.load(Ordering::Relaxed);
+            workers
+        },
         transport: common::rr::stats(),
         node_id: shared.cfg.node_id,
         phase: st.phase,
@@ -1318,6 +1559,21 @@ fn probe(shared: &Shared) -> NodeProbe {
     let st = shared.state.lock().unwrap();
     let (requests, results) = st.tables.len();
     NodeProbe {
+        protocol_version: PROTOCOL_VERSION,
+        peer_control_queued: shared.peers.queues().iter().map(|q| q.control_queued).sum(),
+        peer_replication_queued: shared
+            .peers
+            .queues()
+            .iter()
+            .map(|q| q.replication_queued)
+            .sum(),
+        sync_lag: shared
+            .sync
+            .lock()
+            .unwrap()
+            .values()
+            .map(|p| p.stats.latest.saturating_sub(p.stats.cursor))
+            .sum(),
         node_id: shared.cfg.node_id,
         phase: st.phase,
         epoch: st.core.epoch(),

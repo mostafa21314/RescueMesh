@@ -7,6 +7,15 @@ client or test controller. Start with the
 [Windows/Linux Phase 1 guide](docs/udp-phase1.md) for machine roles, LAN setup,
 normal/imbalance/fault controls, severity presets and reliability limits.
 
+**Protocol 2:** batched replication, independent control links, incremental
+state repair, bounded takeover, priority scheduling with decay, and checked
+experiment baselines are described in [reliability-v2.md](docs/reliability-v2.md).
+Rebuild all peers and clients together before repeating the ZeroTier study.
+
+For the **three-server / three-client-PC comparison of both modes**, use the
+[six-PC study guide](docs/six-pc-study.md): current `.62–.67` addresses, automatic
+server lifecycle, 30–200 requests/s/process, scheduled starts, SD/CI and commands.
+
 ```text
 cargo build --release
 python -m pip install -r scripts/requirements-report.txt

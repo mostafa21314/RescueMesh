@@ -27,6 +27,12 @@ struct Args {
     /// Seed for the synthetic incidents (default: random).
     #[arg(long)]
     seed: Option<u64>,
+    /// Scheduled Unix-millisecond start, used by the six-PC study barrier.
+    #[arg(long, conflicts_with_all = ["status", "inject_failure"])]
+    start_at_ms: Option<u64>,
+    /// Stable synthetic reporter label for matched workload comparisons.
+    #[arg(long)]
+    reporter: Option<String>,
     /// Per-request CSV log.
     #[arg(long, default_value = "client_run.csv")]
     out: PathBuf,
@@ -74,41 +80,69 @@ async fn main() -> anyhow::Result<()> {
         .seed
         .unwrap_or_else(|| client.client_id().as_u64_pair().0);
     let mut rng = Rng::new(seed);
-    let reporter = format!("client-{}", &client.client_id().simple().to_string()[..8]);
+    let reporter = args
+        .reporter
+        .unwrap_or_else(|| format!("client-{}", &client.client_id().simple().to_string()[..8]));
     tracing::info!(client = %client.client_id(), count = args.count, rate = args.rate, complexity = args.complexity, seed, "starting run");
 
-    let start = Instant::now();
+    let scheduled_start = args.start_at_ms.unwrap_or_else(common::unix_ms);
+    let now = common::unix_ms();
+    anyhow::ensure!(
+        scheduled_start <= now.saturating_add(60_000),
+        "start must be within the next 60 seconds"
+    );
+    if scheduled_start > now {
+        tokio::time::sleep(Duration::from_millis(scheduled_start - now)).await;
+    }
+    let start = Instant::now()
+        .checked_sub(Duration::from_millis(
+            common::unix_ms().saturating_sub(scheduled_start),
+        ))
+        .unwrap_or_else(Instant::now);
     let mut tasks = tokio::task::JoinSet::new();
     for i in 0..args.count {
+        let offset = if args.rate > 0.0 {
+            Duration::from_secs_f64(i as f64 / args.rate)
+        } else {
+            Duration::ZERO
+        };
+        let due = start + offset;
         if args.rate > 0.0 {
-            tokio::time::sleep_until(
-                (start + Duration::from_secs_f64(i as f64 / args.rate)).into(),
-            )
-            .await;
+            tokio::time::sleep_until(due.into()).await;
         }
         let incident = synth_incident(&mut rng, zones, &reporter);
         let c = client.clone();
         let complexity = args.complexity;
-        tasks.spawn(async move { c.submit(incident, complexity).await });
+        let scheduled_at_ms = scheduled_start.saturating_add(offset.as_millis() as u64);
+        tasks.spawn(async move {
+            let dispatch_lag_ms =
+                Instant::now().saturating_duration_since(due).as_secs_f64() * 1000.0;
+            (
+                c.submit(incident, complexity).await,
+                scheduled_at_ms,
+                dispatch_lag_ms,
+            )
+        });
     }
-    let mut outcomes: Vec<Outcome> = tasks.join_all().await;
+    let mut logged = tasks.join_all().await;
     let wall = start.elapsed();
-    outcomes.sort_by_key(|o| o.request_id.seq);
+    logged.sort_by_key(|o| o.0.request_id.seq);
 
-    write_csv(&args.out, &outcomes)?;
+    write_csv(&args.out, &logged)?;
+    let outcomes: Vec<_> = logged.into_iter().map(|o| o.0).collect();
     summarize(&outcomes, wall, &client);
     tracing::info!(file = %args.out.display(), "per-request log written");
     Ok(())
 }
 
-fn write_csv(path: &PathBuf, outcomes: &[Outcome]) -> anyhow::Result<()> {
+fn write_csv(path: &PathBuf, outcomes: &[(Outcome, u64, f64)]) -> anyhow::Result<()> {
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
-    writeln!(f, "client_id,seq,sent_at_ms,response_at_ms,latency_ms,served_by,epoch,degraded,attempts,busy_replies,answered,elapsed_ms")?;
-    for o in outcomes {
+    writeln!(f, "client_id,seq,sent_at_ms,response_at_ms,latency_ms,served_by,epoch,degraded,attempts,busy_replies,answered,elapsed_ms,scheduled_at_ms,dispatch_lag_ms")?;
+    for (o, scheduled_at_ms, dispatch_lag_ms) in outcomes {
         let opt = |v: Option<u64>| v.map(|x| x.to_string()).unwrap_or_default();
         writeln!(
             f,
-            "{},{},{},{},{},{},{},{},{},{},{},{:.3}",
+            "{},{},{},{},{},{},{},{},{},{},{},{:.3},{},{:.3}",
             o.request_id.client_id,
             o.request_id.seq,
             o.sent_at_ms,
@@ -122,7 +156,9 @@ fn write_csv(path: &PathBuf, outcomes: &[Outcome]) -> anyhow::Result<()> {
             o.attempts,
             o.busy_replies,
             o.answered(),
-            o.elapsed.as_secs_f64() * 1000.0
+            o.elapsed.as_secs_f64() * 1000.0,
+            scheduled_at_ms,
+            dispatch_lag_ms
         )?;
     }
     Ok(())

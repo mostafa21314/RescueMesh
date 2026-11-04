@@ -30,3 +30,9 @@ ready_rule = "majority"         # both_agree | majority: majority resumes with o
 on_start = true                 # at start, probe the peers; if the cluster is running, recover before serving
 delta_margin_ms = 2000
 majority_wait_ms = 500
+
+[scheduling]
+policy = "priority_decay"
+priority_boost_ms = 250
+priority_half_life_ms = 1000
+request_lease_ms = 10000

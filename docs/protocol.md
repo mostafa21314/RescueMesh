@@ -7,13 +7,18 @@ write-up, demo commands, and the limits of the recovery model.
 
 ## Transport and framing
 
+Application protocol 2 adds batched replication, revision-based repair,
+per-request subscription cleanup, worker scheduling diagnostics and scoped
+result comparisons. All peers should be upgraded together. The complete
+current behavior is described in [reliability-v2.md](reliability-v2.md).
+
 - UDP Request–Reply (`common::rr`). One UDP port per node (`listen` in its
   config) serves clients, peers and diagnostics. JSON messages retain the same
   `type` field (`{"type":"Busy","request_id":{...}}`).
 - Each datagram has a 37-byte header: `RMR1` (4 bytes), kind (1 byte), session
   UUID (16 bytes), message sequence (u64), fragment index (u32), and total JSON
   message length (u32). Integers in the header are big-endian. Kinds are DATA=0,
-  ACK=1, HELLO=2, WELCOME=3, RESET=4. Control packets have no body.
+  ACK=1, HELLO=2, WELCOME=3, RESET=4, CLOSE=5. Control packets have no body.
 - A datagram is at most 1,200 bytes (1,163 payload); a complete JSON message is
   at most 1 MiB. Sequence numbers start at zero independently in each direction.
   HELLO/WELCOME establishes a session associated with the source address and
@@ -28,6 +33,9 @@ write-up, demo commands, and the limits of the recovery model.
   listener sessions and 128 pending accepts. A read idle for 60 seconds closes
   the session; links reconnect as needed. Higher-layer deadlines can terminate
   a transfer before the transport's retry budget is exhausted.
+- Session disposal sends best-effort CLOSE. A receiver drains accepted messages
+  before EOF, stops acknowledging new DATA on that session, and releases the
+  connection task. Read-idle expiration still handles lost CLOSE packets.
 - `common::wire` retains the old length-prefix codec for historical compatibility
   tests; the application no longer opens TCP sockets. The optional lab-agent
   HTTP management API remains separate from this application transport.
@@ -49,11 +57,14 @@ write-up, demo commands, and the limits of the recovery model.
 ### `SubmitIncident` (client → every node)
 
 ```
-{ type, request_id, attempt, client_epoch, incident, complexity }
+{ type, request_id, attempt, client_epoch, incident, complexity, finished }
 ```
 
 - `client_epoch`: highest `epoch` the client has seen in any `PlanResponse` (0 at start).
 - `complexity`: planner cost knob (number of travel-time scenarios), clamped to 1..=1000.
+- `finished`: optional bounded list of completed/cancelled request IDs from this
+  session. These release obsolete subscriptions and queued work; stored results
+  remain available. An idle client can send `ClientFinished {request_ids}` instead.
 - Receiving node, in order:
   1. If `client_epoch` is higher than its epoch (and it isn't already electing that
      epoch), it adopts `client_epoch` with the server unknown, stepping down if it
@@ -95,10 +106,16 @@ write-up, demo commands, and the limits of the recovery model.
 ### `Replicate` (server → both peers)
 
 ```
-{ type, epoch, origin, request_id, plan, incident, degraded }
+{ type, epoch, origin, request_id, plan, incident, degraded, retained_until_ms }
 ```
 
 - Sent after the server has replied to the client (and also for late results; below).
+- `retained_until_ms`: source-selected absolute result expiry, preserved by
+  replication and repair. Expired results are not installed. Keep server clocks
+  synchronized when comparing retention across PCs.
+- Protocol 2 normally transports these updates in `ReplicateBatch {records}`,
+  up to 64 records per bounded batch. Control traffic has a separate queue and
+  UDP session, so a replication backlog does not delay election bids.
 - Role effects (on-demand mode):
   - `epoch` higher than the receiver's: the receiver adopts it with
     `server = origin`, stepping down if it was serving.
@@ -243,15 +260,33 @@ node answers it, like `StatusRequest`; a muted node answers nothing.
 | CPU sampling | every 250 ms, EWMA α = 0.3 | `load` | Feeds the score's CPU term. |
 | Peer connect timeout | 500 ms | `peers::CONNECT_TIMEOUT` | |
 | Peer reconnect backoff | 100 ms doubling to 2 s | `peers::BACKOFF_*` | A peer link opens when its first message is queued; a frame whose write failed is resent after reconnecting (at-least-once while both ends are up). |
-| Peer queue | 4096 messages | `peers::QUEUE_LIMIT` | Beyond it, messages to that peer are dropped and counted (`peer_queue_drops`). |
+| Peer queues | 4096 control + 4096 replication messages per peer | `peers::QUEUE_LIMIT` | Overflow is counted by queue and in `peer_queue_drops`; retained results can be repaired independently. |
 | Finished per-request keys | 60 s | `election::FINISHED_KEEP` | Late bids for them are ignored. |
 | Table TTL | `table_ttl_ms` = 1 800 000 (30 min, D38) | node.toml | Request- and results-table entries older than this are removed (swept every second); a retry after that is recomputed, not answered from the table. Must be much longer than a client's full retry window (5 × 1 s). |
 
-No periodic heartbeats: normal operation exchanges `Replicate` and `ElectBid`.
-A client's retry is the failure detector. Returning nodes additionally use the
-snapshot protocol below.
+Client retries still trigger on-demand failure elections. Protocol 2 also polls
+each peer every 250 ms using `SyncRequest`: replies carry bounded incremental
+result pages and a role view. This repairs dropped replication and missed role
+messages without requiring another client request. It does not proactively
+replace a loaded server that continues answering within the retry deadline.
 
 ## Temporary failure and rejoin messages
+
+Default `transfer = "delta"` in protocol 2 uses
+`SyncRequest {node_id, incarnation, after_revision, recovery}` and `SyncReply`.
+The source validates its incarnation UUID; a mismatch restarts the cursor at
+zero. Pages contain at most 64 records plus next/latest revisions and the
+source's phase/role view. The receiver advances only after installing a page;
+installed progress survives a transfer timeout. Startup recovery and periodic
+repair use the same revision index. Ready-state participation is still gated
+by the configured `ready_rule` described below.
+
+`ResultsDigestRequest {client_ids, min_retained_until_ms}` selects a run cohort
+or a retention-safe baseline for diagnostics. `ResultsDigest` returns that
+scope's count and digest with the node's phase and role view.
+
+The fixed-snapshot messages below remain for `transfer = "full"` and legacy
+diagnostics. Their time-window option does not select the protocol 2 delta path.
 
 - `InjectFailure {duration_ms}`: trusted demo controller asks one node to mute for
   1..=20,000 ms. It returns `FailureAccepted {node_id, duration_ms}` before normal
@@ -259,11 +294,11 @@ snapshot protocol below.
   chooses the currently elected server and requires all nodes ready beforehand.
 - `RecoveryRequest {node_id, since_ms}`: a returning node asks a configured peer
   for a snapshot, on a dedicated connection. `since_ms = null` asks for every
-  retained entry (full transfer, and always after a process start);
+  retained entry (full transfer);
   `since_ms = d` asks only for entries the peer changed in its last `d` ms, by
-  its own clock (delta transfer: `d` = time since the outage began +
-  `delta_margin_ms`). A duration, not a timestamp, so clock skew between
-  machines does not matter.
+  its own clock. This legacy filter uses a duration, not a timestamp. A filtered
+  snapshot preserves queued records outside its window; only a full snapshot
+  resets the sender's old replication backlog.
 - `RecoveryChunk {records}`: at most 64 records per chunk; each includes request
   ID, attempt/epoch, incident, complexity, and optional completed result.
 - `RecoveryComplete {node_id, epoch, server, electing, records}`: ends that fixed
@@ -290,9 +325,11 @@ answers only probes, status and recovery requests. See [recovery](recovery.md).
 
 During `muted`, normal messages are discarded. During `recovering`, the node
 accepts live replicas, status queries and recovery requests (answering
-`RecoveryUnavailable`) but cannot bid or process client work. It merges the
-snapshots, reconstructs the ledger, resets old election timers, republishes
-results a survivor lacked, and only then enables normal participation.
+`RecoveryUnavailable` for fixed snapshots) but cannot bid or process client
+work. It installs repair pages or merges full snapshots, reconstructs the
+ledger, resets old election timers and republishes a bounded set of results a
+survivor lacked. Periodic repair delivers the remaining retained results after
+normal participation resumes.
 `Status` includes `phase`, `faults_injected`,
 `last_recovery_ms`, `last_recovery` (the breakdown of the last recovery),
 `snapshots_served` and `snapshot_lock_max_us`. State is in memory only: a node

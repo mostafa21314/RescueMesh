@@ -1,0 +1,12 @@
+{
+  "stage": "resilience",
+  "scenario": "load_idle",
+  "processes": 1,
+  "rate": 30.0,
+  "duration": 5,
+  "rep": 1,
+  "mode": "per_request",
+  "seed": 86275623659755,
+  "complexity": 1,
+  "id": "resilience-load_idle-p1-r30-rep1-per_request"
+}

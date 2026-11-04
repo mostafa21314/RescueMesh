@@ -1,0 +1,3 @@
+E:\RescueMesh\target\reliability-v2\release\stress.exe --config E:\RescueMesh\.tools\v2-local-config\client.toml --out E:\RescueMesh\results\phase1\v2-final-checks\follower\imbalance --clients 4 --rate 30.0 --complexity 5 --requests 120 --reps 1 --seed 42 --settle-secs 20 --label "imbalance; severity=2; UDP RR; Windows-10-10.0.26200-SP0" --local-nodes E:\RescueMesh\.tools\v2-local-config --load-follower --load-threads 8
+run 1/1 rep 1 clients 4: 480/480 answered, 113.6 req/s, p50 5.22 p99 9.28 ms, elections 0, converged true (1 ms)
+wrote E:\RescueMesh\results\phase1\v2-final-checks\follower\imbalance

@@ -25,7 +25,8 @@ PRESETS = {
 
 def binary(name):
     suffix = '.exe' if os.name == 'nt' else ''
-    for directory in (ROOT / 'target' / 'release', ROOT):
+    directories = [Path(os.environ['RESCUEMESH_BIN_DIR']).resolve()] if os.environ.get('RESCUEMESH_BIN_DIR') else [ROOT / 'target' / 'release', ROOT]
+    for directory in directories:
         path = directory / (name + suffix)
         if path.is_file():
             return str(path)
@@ -98,6 +99,8 @@ def test(args):
         raise ValueError('rate, duration and repetitions must be positive and finite')
     if args.fault_at_ms < 0 or args.load_threads <= 0 or args.settle_secs <= 0:
         raise ValueError('fault-at-ms must be nonnegative; load-threads and settle-secs must be positive')
+    if args.local and args.before_run:
+        raise ValueError('--local owns its servers; --before-run is for externally managed runs')
     if not all(int(v) > 0 for v in clients.split(',')) or not 1 <= complexity <= 1000:
         raise ValueError('client counts must be positive; complexity must be 1..1000')
     if args.out.exists() and any(args.out.iterdir()):
@@ -111,7 +114,7 @@ def test(args):
     args.out.mkdir(parents=True, exist_ok=True)
     config = args.config_dir / 'client.toml'
     metadata = {**vars(args), 'os': platform.platform(), 'cpu': platform.processor(),
-                'logical_cpus': os.cpu_count(), 'transport': 'UDP-RR RMR1',
+                'logical_cpus': os.cpu_count(), 'transport': 'UDP-RR RMR1', 'protocol_version': 2,
                 'clients': clients, 'rate_per_client': rate, 'complexity': complexity,
                 'started_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
                 'isolated_runs': args.local}
@@ -125,20 +128,29 @@ def test(args):
                        '--label', f'{scenario}; severity={args.severity}; UDP RR; {platform.platform()}']
             if args.local:
                 command += ['--local-nodes', str(args.config_dir)]
+            if args.allow_unconverged:
+                command += ['--allow-unconverged']
+            if args.before_run:
+                command += ['--before-run', args.before_run]
             if scenario in ('faulty', 'combined'):
                 command += ['--fault-ms', str(args.fault_ms), '--fault-at-ms', str(args.fault_at_ms)]
             if scenario in ('imbalance', 'combined'):
-                command += ['--load-node', str(args.load_node), '--load-threads', str(args.load_threads)]
+                if args.load_target == 'fixed':
+                    command += ['--load-node', str(args.load_node)]
+                else:
+                    command += ['--load-' + args.load_target]
+                command += ['--load-threads', str(args.load_threads)]
             run(command)
     finally:
         # A remote server's load has a timer too, but reset it promptly if a run
         # is interrupted. Local children are owned/cleaned up by the Rust harness.
         if not args.local and any(s in ('imbalance', 'combined') for s in scenarios):
             nodes = tomllib.loads(config.read_text(encoding='utf-8'))['nodes']
-            try:
-                call(endpoint(nodes[args.load_node - 1]), {'type': 'SetLoad', 'threads': 0, 'duration_ms': 0}, 5)
-            except OSError as error:
-                print(f'Load reset unavailable; its timer will expire: {error}', file=sys.stderr)
+            for addr in nodes:
+                try:
+                    call(endpoint(addr), {'type': 'SetLoad', 'threads': 0, 'duration_ms': 0}, 5)
+                except OSError as error:
+                    print(f'{addr}: load reset unavailable; its timer will expire: {error}', file=sys.stderr)
         if not args.no_report and list(args.out.rglob('runs.csv')):
             run([sys.executable, str(ROOT / 'scripts' / 'phase1_report.py'), str(args.out)])
 
@@ -152,6 +164,7 @@ def main():
     p = sub.add_parser('server', help='run this PC as one cloud peer')
     p.add_argument('--node', type=int, choices=(1, 2, 3), required=True)
     p.add_argument('--workers', type=int, default=0, help='0 selects a suitable count for this PC')
+    p.add_argument('--log-file', type=Path, help='default: logs/nodeN.log')
     p = sub.add_parser('client', help='send synthetic incidents; any PC can be a client')
     p.add_argument('--severity', type=int, choices=range(1, 6), default=2)
     p.add_argument('--count', type=int, default=1000)
@@ -173,10 +186,13 @@ def main():
     p.add_argument('--fault-ms', type=int, default=10_000)
     p.add_argument('--fault-at-ms', type=int, default=5000)
     p.add_argument('--load-node', type=int, choices=(1, 2, 3), default=1)
+    p.add_argument('--load-target', choices=('fixed', 'incumbent', 'follower'), default='fixed')
     p.add_argument('--load-threads', type=int, default=2)
     p.add_argument('--settle-secs', type=int, default=60)
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--no-report', action='store_true')
+    p.add_argument('--allow-unconverged', action='store_true', help='explicit soak mode; retain failed baselines and continue after divergent runs')
+    p.add_argument('--before-run', help='run this restart/setup command before every repetition')
     stamp = dt.datetime.now().strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:6]
     p.add_argument('--out', type=Path, default=ROOT / 'results' / 'phase1' / stamp)
     p = sub.add_parser('report', help='generate or regenerate figures from collected CSVs')
@@ -191,7 +207,9 @@ def main():
     if args.mode == 'setup':
         setup(args)
     elif args.mode == 'server':
-        run([binary('cloud-node'), '--config', str(args.config_dir / f'node{args.node}.toml'), '--workers', str(args.workers)])
+        log = args.log_file or ROOT / 'logs' / f'node{args.node}.log'
+        run([binary('cloud-node'), '--config', str(args.config_dir / f'node{args.node}.toml'),
+             '--workers', str(args.workers), '--log-file', str(log)])
     elif args.mode == 'client':
         _, rate, complexity = PRESETS[args.severity]
         run([binary('client'), '--config', str(args.config_dir / 'client.toml'), '--count', str(args.count),
