@@ -23,7 +23,7 @@
 use clap::Parser;
 use client::stats::{ci95, jain, percentile, Ci};
 use client::stress::{parse_client_csv, run_metrics, Fault, Req, RunMetrics};
-use client::{inject_failure, query_probe, query_status};
+use client::{inject_failure, query_probe, query_status, set_load};
 use common::config::ClientConfig;
 use common::msg::{NodePhase, NodeProbe, NodeStatus};
 use common::rng::Rng;
@@ -107,6 +107,14 @@ struct Args {
     /// cold restart: `scripts/restart_node.sh {node} {ms}`.
     #[arg(long, requires = "fault_ms")]
     fault_cmd: Option<String>,
+    /// Start a fresh owned local cluster per run, using node1..3.toml here.
+    #[arg(long, conflicts_with = "before_run")]
+    local_nodes: Option<PathBuf>,
+    /// Apply temporary CPU load to this node id during each run.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=3))]
+    load_node: Option<u32>,
+    #[arg(long, default_value_t = 2)]
+    load_threads: usize,
 }
 
 /// One probe answer (or `None`: no answer within `PROBE_TIMEOUT`).
@@ -119,6 +127,14 @@ struct Sample {
 /// One run's measurements: client-side metrics, node counter deltas summed
 /// over the nodes, sampler aggregates, convergence and fault figures.
 struct RunRow {
+    workload_wall_ms: f64,
+    expected_requests: usize,
+    fault_requested: bool,
+    udp_sent: u64,
+    udp_bytes: u64,
+    udp_retransmissions: u64,
+    udp_duplicates: u64,
+    udp_timeouts: u64,
     run: u32,
     rep: u32,
     clients: u32,
@@ -192,13 +208,31 @@ impl RunRow {
             ("rep", self.rep.to_string()),
             ("clients", self.clients.to_string()),
             ("offered_rps", f(self.offered_rps)),
-            ("requests", m.requests.to_string()),
+            ("requests", self.expected_requests.to_string()),
+            ("observed_requests", m.requests.to_string()),
             ("answered", m.answered.to_string()),
-            ("failed", (m.requests - m.answered).to_string()),
+            (
+                "failed",
+                self.expected_requests
+                    .saturating_sub(m.answered)
+                    .to_string(),
+            ),
+            ("fault_requested", self.fault_requested.to_string()),
+            ("fault_injected", self.fault.is_some().to_string()),
+            ("udp_datagrams_sent", self.udp_sent.to_string()),
+            ("udp_bytes_sent", self.udp_bytes.to_string()),
+            ("udp_retransmissions", self.udp_retransmissions.to_string()),
+            ("udp_duplicate_fragments", self.udp_duplicates.to_string()),
+            ("udp_delivery_timeouts", self.udp_timeouts.to_string()),
             ("retried", m.retried.to_string()),
             ("busy_replies", m.busy.to_string()),
             ("span_ms", f(m.span_ms)),
             ("throughput_rps", f(m.throughput)),
+            ("workload_wall_ms", f(self.workload_wall_ms)),
+            (
+                "goodput_rps",
+                f(m.answered as f64 * 1000.0 / self.workload_wall_ms.max(1.0)),
+            ),
             ("lat_mean", f(m.latency.mean)),
             ("lat_p50", f(m.latency.p50)),
             ("lat_p95", f(m.latency.p95)),
@@ -303,7 +337,22 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let cfg = Arc::new(ClientConfig::load(&args.config)?);
     anyhow::ensure!(!args.clients.is_empty() && args.reps > 0, "nothing to run");
-    anyhow::ensure!(args.rate > 0.0, "--rate must be > 0 (open loop)");
+    anyhow::ensure!(
+        args.rate.is_finite() && args.rate > 0.0,
+        "--rate must be finite and > 0 (open loop)"
+    );
+    anyhow::ensure!(
+        args.requests > 0 && args.clients.iter().all(|c| *c > 0),
+        "requests and clients must be positive"
+    );
+    anyhow::ensure!(
+        args.sample_ms > 0 && args.client_threads > 0 && args.settle_secs > 0,
+        "sample-ms, client-threads and settle-secs must be positive"
+    );
+    anyhow::ensure!(
+        !args.out.join("runs.csv").exists(),
+        "output already contains runs.csv; choose a new directory"
+    );
     let run_ms = args.requests as f64 / args.rate * 1e3;
     if let Some(ms) = args.fault_ms {
         anyhow::ensure!(
@@ -323,10 +372,6 @@ async fn main() -> anyhow::Result<()> {
     );
     std::fs::create_dir_all(args.out.join("tmp"))?;
     write_meta(&args, &cfg)?;
-
-    if args.before_run.is_none() {
-        prepare(&args, &cfg, &client_bin, 0).await?;
-    }
 
     // Rep-major order with the levels shuffled in every rep, so a drift over
     // the sweep (table growth, thermal throttling) is not confounded with load.
@@ -449,11 +494,6 @@ async fn prepare(
     run: u32,
 ) -> anyhow::Result<()> {
     let limit = Duration::from_secs(args.settle_secs);
-    if let Some(hook) = &args.before_run {
-        let mut cmd = shell(hook);
-        let status = tokio::task::spawn_blocking(move || cmd.status()).await??;
-        anyhow::ensure!(status.success(), "--before-run failed: {status}");
-    }
     wait_idle(cfg, limit).await?;
     let csv = args.out.join(format!("tmp/warmup{run}.csv"));
     let mut warm = spawn_client(args, client_bin, 20, 0.0, args.seed, &csv)?;
@@ -490,6 +530,58 @@ fn spawn_client(
         .spawn()?)
 }
 
+/// Own only the children this run created. Drop also cleans up on errors.
+struct LocalNodes(Vec<std::process::Child>);
+impl Drop for LocalNodes {
+    fn drop(&mut self) {
+        for child in &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn start_local(args: &Args, run: u32) -> anyhow::Result<LocalNodes> {
+    let mut children = LocalNodes(Vec::new());
+    let Some(dir) = &args.local_nodes else {
+        return Ok(children);
+    };
+    let client_cfg = ClientConfig::load(&args.config)?;
+    let mut configs = Vec::new();
+    for id in 1..=3 {
+        let path = dir.join(format!("node{id}.toml"));
+        let cfg = common::config::NodeConfig::load(&path)?;
+        let addr: std::net::SocketAddr = cfg.listen.parse()?;
+        anyhow::ensure!(
+            addr.ip().is_loopback(),
+            "--local-nodes requires loopback listeners"
+        );
+        anyhow::ensure!(
+            client_cfg.nodes.contains(&cfg.listen),
+            "client config must point at this local cluster"
+        );
+        // Reserve all UDP ports before starting anything; never attach a test
+        // to an unrelated cluster which happens to be running on these ports.
+        configs.push((path, std::net::UdpSocket::bind(addr)?));
+    }
+    let bin = std::env::current_exe()?
+        .with_file_name(format!("cloud-node{}", std::env::consts::EXE_SUFFIX));
+    for (i, (path, reservation)) in configs.into_iter().enumerate() {
+        drop(reservation);
+        let log = File::create(args.out.join(format!("run{run}-node{}.log", i + 1)))?;
+        children.0.push(
+            Command::new(&bin)
+                .arg("--config")
+                .arg(path)
+                .env("RUST_LOG", "info")
+                .stdout(log.try_clone()?)
+                .stderr(log)
+                .spawn()?,
+        );
+    }
+    Ok(children)
+}
+
 async fn run_once(
     args: &Args,
     cfg: &Arc<ClientConfig>,
@@ -499,9 +591,28 @@ async fn run_once(
     clients: u32,
 ) -> anyhow::Result<(RunRow, Vec<Req>, Vec<Sample>)> {
     let limit = Duration::from_secs(args.settle_secs);
-    if args.before_run.is_some() {
-        prepare(args, cfg, client_bin, run).await?;
+    let _local = start_local(args, run)?;
+    if let Some(hook) = &args.before_run {
+        let mut cmd = shell(hook);
+        let status = tokio::task::spawn_blocking(move || cmd.status()).await??;
+        anyhow::ensure!(status.success(), "--before-run failed: {status}");
     }
+    wait_idle(cfg, limit).await?;
+    let loaded = if let Some(id) = args.load_node {
+        let statuses = status_all(cfg).await;
+        let i = statuses
+            .iter()
+            .position(|s| s.as_ref().is_some_and(|s| s.node_id == id))
+            .ok_or_else(|| anyhow::anyhow!("load node {id} did not answer"))?;
+        let duration =
+            (args.requests as f64 / args.rate * 1000.0) as u64 + args.settle_secs * 1000 + 15_000;
+        set_load(&cfg.nodes[i], args.load_threads, duration, STATUS_TIMEOUT).await?;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        Some(cfg.nodes[i].clone())
+    } else {
+        None
+    };
+    prepare(args, cfg, client_bin, run).await?;
     wait_idle(cfg, limit).await?;
     let mut before = status_all(cfg).await;
     for _ in 0..2 {
@@ -549,6 +660,7 @@ async fn run_once(
             .collect::<Vec<_>>()
     })
     .await?;
+    let workload_wall_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let fault = match fault_task {
         Some(t) => match t.await? {
             Ok(x) => Some(x),
@@ -562,6 +674,9 @@ async fn run_once(
     stop.store(true, Ordering::Relaxed);
     let samples = sampler.await?;
     let (converge, after) = converge(cfg, limit).await;
+    if let Some(addr) = loaded {
+        set_load(&addr, 0, 0, STATUS_TIMEOUT).await?;
+    }
 
     let mut reqs = Vec::new();
     let mut exit_failures = 0;
@@ -627,6 +742,14 @@ async fn run_once(
     let cpu_tops = per_tick(&|t| t.iter().map(|p| p.cpu_load).fold(0.0, f64::max));
 
     let row = RunRow {
+        workload_wall_ms,
+        expected_requests: clients as usize * args.requests as usize,
+        fault_requested: args.fault_ms.is_some(),
+        udp_sent: delta(&|s| s.transport.datagrams_sent),
+        udp_bytes: delta(&|s| s.transport.bytes_sent),
+        udp_retransmissions: delta(&|s| s.transport.retransmissions),
+        udp_duplicates: delta(&|s| s.transport.duplicate_fragments),
+        udp_timeouts: delta(&|s| s.transport.delivery_timeouts),
         run,
         rep,
         clients,
@@ -945,7 +1068,7 @@ fn write_levels(
     let mut csv = BufWriter::new(File::create(args.out.join("levels.csv"))?);
     let mut md = String::new();
     let fault_run = args.fault_ms.is_some();
-    let requests: usize = rows.iter().map(|r| r.m.requests).sum();
+    let requests: usize = rows.iter().map(|r| r.expected_requests).sum();
     let answered: usize = rows.iter().map(|r| r.m.answered).sum();
     writeln!(md, "# Stress results: {}\n", args.out.display())?;
     if !args.label.is_empty() {
@@ -1051,7 +1174,7 @@ fn write_levels(
                 .map(|r| r.m.fault.as_ref().map_or(f64::NAN, g))
                 .collect()
         };
-        let req: usize = rs.iter().map(|r| r.m.requests).sum();
+        let req: usize = rs.iter().map(|r| r.expected_requests).sum();
         let ans: usize = rs.iter().map(|r| r.m.answered).sum();
         let retried: usize = rs.iter().map(|r| r.m.retried).sum();
         let repl: u64 = rs.iter().map(|r| r.replicate_bytes).sum();

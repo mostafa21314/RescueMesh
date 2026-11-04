@@ -7,6 +7,7 @@ pub mod counters;
 pub mod model;
 pub mod msg;
 pub mod rng;
+pub mod rr;
 pub mod wire;
 
 pub use model::*;

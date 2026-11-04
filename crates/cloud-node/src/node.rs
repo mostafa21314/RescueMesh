@@ -12,14 +12,14 @@ use crate::pool::Pool;
 use crate::tables::{Offer, Response, Tables};
 use common::config::{ElectionMode, NodeConfig, ReadyRule, SnapshotBuild, Transfer};
 use common::counters::Counters;
-use common::wire::{read_frame, write_frame};
+use common::rr::{read_frame, write_frame};
+use common::rr::{Listener, Stream};
 use common::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -93,6 +93,7 @@ struct Shared {
     state: Mutex<State>,
     pool: Pool<Job>,
     load: Arc<LoadMonitor>,
+    artificial_load: crate::load::LoadGenerator,
     peers: Arc<PeerLinks>,
     stats: Stats,
 }
@@ -155,19 +156,20 @@ impl NodeHandle {
             t.abort();
         }
         self.shared.load.stop();
+        let _ = self.shared.artificial_load.set(0, Duration::ZERO);
         self.shared.pool.shutdown();
     }
 }
 
 /// Binds `cfg.listen` and starts the node.
 pub async fn start(cfg: NodeConfig) -> anyhow::Result<NodeHandle> {
-    let listener = TcpListener::bind(&cfg.listen).await?;
+    let listener = Listener::bind(&cfg.listen).await?;
     start_with_listener(cfg, listener).await
 }
 
 pub async fn start_with_listener(
     cfg: NodeConfig,
-    listener: TcpListener,
+    listener: Listener,
 ) -> anyhow::Result<NodeHandle> {
     cfg.validate()?;
     let addr = listener.local_addr()?;
@@ -225,6 +227,7 @@ pub async fn start_with_listener(
         ledger,
         pool,
         load,
+        artificial_load: crate::load::LoadGenerator::default(),
         peers,
         stats,
     });
@@ -416,9 +419,10 @@ fn accepted_view(shared: &Shared, round: &Round) -> Option<(Epoch, Option<NodeId
             let first = round.snapshots.first()?;
             (needed > 0
                 && round.snapshots.len() == needed
-                && round.snapshots.iter().all(|s| {
-                    valid(s) && s.epoch == first.epoch && s.server == first.server
-                }))
+                && round
+                    .snapshots
+                    .iter()
+                    .all(|s| valid(s) && s.epoch == first.epoch && s.server == first.server))
             .then_some((first.epoch, first.server))
         }
         // Itself plus one survivor is 2 of 3. Of the usable views, the
@@ -492,11 +496,10 @@ async fn recover(shared: Arc<Shared>, cause: Cause) {
         // What we might hold that a survivor lacks: everything we hold (full),
         // or what changed shortly before the outage (delta). Taken before the
         // merge, which marks merged entries as changed now.
-        let candidates =
-            st.tables
-                .recovery_keys(since_ms.map(|ms| {
-                    now.checked_sub(Duration::from_millis(ms)).unwrap_or(started)
-                }));
+        let candidates = st.tables.recovery_keys(since_ms.map(|ms| {
+            now.checked_sub(Duration::from_millis(ms))
+                .unwrap_or(started)
+        }));
         let mut peer_versions = Vec::new();
         for snap in round.snapshots {
             report.snapshots_used += 1;
@@ -505,7 +508,11 @@ async fn recover(shared: Arc<Shared>, cause: Cause) {
             let versions: Versions = snap
                 .records
                 .iter()
-                .filter_map(|r| r.result.as_ref().map(|x| (r.request_id, (x.epoch, x.served_by))))
+                .filter_map(|r| {
+                    r.result
+                        .as_ref()
+                        .map(|x| (r.request_id, (x.epoch, x.served_by)))
+                })
                 .collect();
             peer_versions.push((snap.peer, versions));
             report.new_results += st.tables.merge_recovery(snap.records, now).stored;
@@ -620,8 +627,10 @@ fn serve_snapshot(shared: &Shared, node_id: NodeId, since_ms: Option<u64>, reply
             let mut count = 0;
             for chunk in keys.chunks(64) {
                 let (st, t) = lock();
-                let records: Vec<RecoveryRecord> =
-                    chunk.iter().filter_map(|id| st.tables.recovery_record(id)).collect();
+                let records: Vec<RecoveryRecord> = chunk
+                    .iter()
+                    .filter_map(|id| st.tables.recovery_record(id))
+                    .collect();
                 note(t, &mut max_hold);
                 drop(st);
                 count += records.len();
@@ -641,7 +650,10 @@ fn serve_snapshot(shared: &Shared, node_id: NodeId, since_ms: Option<u64>, reply
     });
     note(t, &mut max_hold);
     drop(st);
-    shared.stats.snapshots_served.fetch_add(1, Ordering::Relaxed);
+    shared
+        .stats
+        .snapshots_served
+        .fetch_add(1, Ordering::Relaxed);
     shared
         .stats
         .snapshot_lock_max_us
@@ -695,7 +707,7 @@ fn score(shared: &Shared) -> u32 {
         .score(shared.cfg.policy, &shared.cfg.weights)
 }
 
-async fn accept_loop(shared: Arc<Shared>, listener: TcpListener) {
+async fn accept_loop(shared: Arc<Shared>, listener: Listener) {
     // Connection tasks live in the JoinSet, so aborting this task closes them.
     let mut conns = JoinSet::new();
     loop {
@@ -703,7 +715,6 @@ async fn accept_loop(shared: Arc<Shared>, listener: TcpListener) {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
                     if shared.state.lock().unwrap().phase == NodePhase::Muted { continue; }
-                    let _ = stream.set_nodelay(true);
                     conns.spawn(serve_conn(shared.clone(), stream));
                 }
                 Err(e) => tracing::warn!(%e, "accept failed"),
@@ -713,7 +724,7 @@ async fn accept_loop(shared: Arc<Shared>, listener: TcpListener) {
     }
 }
 
-async fn serve_conn(shared: Arc<Shared>, stream: TcpStream) {
+async fn serve_conn(shared: Arc<Shared>, stream: Stream) {
     let (mut rd, mut wr) = stream.into_split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
     let writer = async {
@@ -767,6 +778,25 @@ fn handle(shared: &Arc<Shared>, msg: Message, reply: &Reply) {
         return;
     }
     match msg {
+        Message::SetLoad {
+            threads,
+            duration_ms,
+        } => {
+            let response = match shared
+                .artificial_load
+                .set(threads, Duration::from_millis(duration_ms))
+            {
+                Ok(()) => Message::LoadAccepted {
+                    node_id: shared.cfg.node_id,
+                    threads,
+                    duration_ms,
+                },
+                Err(e) => Message::LoadRejected {
+                    reason: e.to_string(),
+                },
+            };
+            let _ = reply.send(response);
+        }
         Message::InjectFailure { duration_ms } => {
             let response = match inject_failure(shared, Duration::from_millis(duration_ms)) {
                 Ok(()) => Message::FailureAccepted {
@@ -837,7 +867,7 @@ fn handle(shared: &Arc<Shared>, msg: Message, reply: &Reply) {
             run_actions(shared, st, acts);
         }
         Message::StatusRequest => {
-            let _ = reply.send(Message::Status(status(shared)));
+            let _ = reply.send(Message::Status(Box::new(status(shared))));
         }
         Message::ProbeRequest => {
             let _ = reply.send(Message::Probe(probe(shared)));
@@ -1240,6 +1270,7 @@ fn status(shared: &Shared) -> NodeStatus {
     let (requests, results) = st.tables.len();
     let c = st.core.counters;
     NodeStatus {
+        transport: common::rr::stats(),
         node_id: shared.cfg.node_id,
         phase: st.phase,
         faults_injected: st.faults_injected,

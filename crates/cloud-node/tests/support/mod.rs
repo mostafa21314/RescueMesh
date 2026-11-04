@@ -3,8 +3,8 @@
 
 use cloud_node::{start_with_listener, NodeHandle};
 use common::config::*;
+use common::rr::Listener;
 use std::time::{Duration, Instant};
-use tokio::net::TcpListener;
 
 /// Node logs (elections, step-downs, takeovers) go to the test's captured
 /// output, which cargo prints only when the test fails.
@@ -43,7 +43,7 @@ pub async fn start_cluster_with(tweak: impl Fn(&mut NodeConfig)) -> (Vec<NodeHan
     init_logs();
     let mut listeners = Vec::new();
     for _ in 0..3 {
-        listeners.push(TcpListener::bind("127.0.0.1:0").await.unwrap());
+        listeners.push(Listener::bind("127.0.0.1:0").await.unwrap());
     }
     let addrs: Vec<String> = listeners
         .iter()

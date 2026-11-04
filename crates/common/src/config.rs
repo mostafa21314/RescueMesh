@@ -123,6 +123,7 @@ pub struct NodeConfig {
     #[serde(default)]
     pub cpu_source: CpuSource,
     /// Planner worker threads.
+    #[serde(default = "default_workers")]
     pub workers: usize,
     /// Seed for the synthetic campus; must match on every node.
     pub seed: u64,
@@ -216,6 +217,10 @@ fn default_queue_capacity() -> usize {
     64
 }
 
+pub fn default_workers() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).clamp(1, 8))
+}
+
 fn default_table_ttl_ms() -> u64 {
     1_800_000
 }
@@ -274,9 +279,9 @@ pub struct ClientConfig {
 impl ClientConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let cfg: ClientConfig = load_toml(path.as_ref())?;
-        if cfg.nodes.is_empty() || cfg.max_attempts == 0 {
+        if cfg.nodes.is_empty() || cfg.max_attempts == 0 || cfg.request_timeout_ms == 0 {
             return Err(ConfigError::Invalid(
-                "need at least one node and max_attempts >= 1".into(),
+                "need at least one node, max_attempts >= 1 and request_timeout_ms >= 1".into(),
             ));
         }
         Ok(cfg)

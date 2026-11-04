@@ -1,0 +1,8 @@
+2026-11-04T00:20:19.783636Z  INFO cloud_node::node: node started node=3 addr=127.0.0.1:7003 workers=4 mode=OnDemand policy=Composite cpu_source=Process zones=256 responders=150
+2026-11-04T00:20:21.526316Z  INFO cloud_node::peers: peer link connected peer=1 addr=127.0.0.1:7001
+2026-11-04T00:20:21.526388Z  INFO cloud_node::peers: peer link connected peer=2 addr=127.0.0.1:7002
+2026-11-04T00:20:21.526743Z  INFO cloud_node::node: election epoch 1 trigger=no_server trigger_request=cda63c74/1 bids=[(1, 24), (2, 0), (3, 0)] incumbent=[] outcome=decided winner=Some(2) duration_ms=0.88 messages_sent=2 node=3
+2026-11-04T00:20:24.220830Z  INFO cloud_node::node: now serving node=3 epoch=2 degraded=false took_over=446
+2026-11-04T00:20:24.220871Z  INFO cloud_node::node: election epoch 2 trigger=retry trigger_request=9084fc63/141 bids=[(1, 25), (3, 1)] incumbent=[2] outcome=decided winner=Some(3) duration_ms=100.90 messages_sent=2 node=3
+2026-11-04T00:20:25.233546Z  INFO cloud_node::node: stepped down node=3 epoch=2 dropped=0
+2026-11-04T00:20:25.233629Z  INFO cloud_node::node: election epoch 3 trigger=retry trigger_request=9084fc63/268 bids=[(1, 25), (2, 75), (3, 153)] incumbent=[3] outcome=decided winner=Some(1) duration_ms=0.08 messages_sent=2 node=3

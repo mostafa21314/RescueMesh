@@ -39,7 +39,7 @@ impl Drop for Cluster {
 }
 
 fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
+    std::net::UdpSocket::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
@@ -88,7 +88,7 @@ async fn served_by(cluster: &Cluster) -> Vec<u32> {
     // Wait for the listeners, then for the CPU EWMAs to settle (8+ samples).
     let deadline = Instant::now() + Duration::from_secs(30);
     for a in &cluster.addrs {
-        while tokio::net::TcpStream::connect(a).await.is_err() {
+        while common::rr::Stream::connect(a).await.is_err() {
             assert!(Instant::now() < deadline, "node at {a} did not start");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }

@@ -55,6 +55,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    anyhow::ensure!(
+        args.rate.is_finite() && args.rate >= 0.0,
+        "rate must be finite and nonnegative"
+    );
+    anyhow::ensure!(args.count > 0, "count must be positive");
     let cfg = ClientConfig::load(&args.config)?;
     if args.inject_failure {
         return run_faults(&cfg, args.failure_ms, args.fault_rounds).await;
@@ -98,12 +103,12 @@ async fn main() -> anyhow::Result<()> {
 
 fn write_csv(path: &PathBuf, outcomes: &[Outcome]) -> anyhow::Result<()> {
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
-    writeln!(f, "client_id,seq,sent_at_ms,response_at_ms,latency_ms,served_by,epoch,degraded,attempts,busy_replies,answered")?;
+    writeln!(f, "client_id,seq,sent_at_ms,response_at_ms,latency_ms,served_by,epoch,degraded,attempts,busy_replies,answered,elapsed_ms")?;
     for o in outcomes {
         let opt = |v: Option<u64>| v.map(|x| x.to_string()).unwrap_or_default();
         writeln!(
             f,
-            "{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{:.3}",
             o.request_id.client_id,
             o.request_id.seq,
             o.sent_at_ms,
@@ -116,7 +121,8 @@ fn write_csv(path: &PathBuf, outcomes: &[Outcome]) -> anyhow::Result<()> {
             o.degraded,
             o.attempts,
             o.busy_replies,
-            o.answered()
+            o.answered(),
+            o.elapsed.as_secs_f64() * 1000.0
         )?;
     }
     Ok(())
@@ -302,5 +308,13 @@ async fn print_status(cfg: &ClientConfig, settle: Option<Duration>) -> anyhow::R
             }
         );
     }
+    anyhow::ensure!(
+        digests.len() == cfg.nodes.len(),
+        "some configured nodes did not answer UDP Status"
+    );
+    anyhow::ensure!(
+        digests.windows(2).all(|w| w[0] == w[1]),
+        "results tables have not converged"
+    );
     Ok(())
 }

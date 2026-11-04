@@ -1,8 +1,8 @@
 //! Pull a bounded, fixed snapshot over a dedicated connection (not the peer backlog).
-use common::wire::{read_frame, write_frame};
+use common::rr::Stream;
+use common::rr::{read_frame, write_frame};
 use common::*;
 use std::time::Duration;
-use tokio::net::TcpStream;
 
 /// Per-transfer limits: a snapshot that takes longer or is larger is rejected.
 pub(crate) const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -24,7 +24,9 @@ pub(crate) enum Fetched {
     Snapshot(Snapshot),
     /// The peer is starting or recovering itself: nothing authoritative to
     /// give. `has_state` is false for a process that just started empty.
-    Unavailable { has_state: bool },
+    Unavailable {
+        has_state: bool,
+    },
 }
 
 pub(crate) async fn fetch(
@@ -34,8 +36,7 @@ pub(crate) async fn fetch(
     since_ms: Option<u64>,
 ) -> anyhow::Result<Fetched> {
     tokio::time::timeout(FETCH_TIMEOUT, async {
-        let mut stream = TcpStream::connect(addr).await?;
-        let _ = stream.set_nodelay(true);
+        let mut stream = Stream::connect(addr).await?;
         write_frame(
             &mut stream,
             &Message::RecoveryRequest {
@@ -79,9 +80,12 @@ pub(crate) async fn fetch(
                         bytes: bytes + n as u64,
                     }));
                 }
-                Some((Message::RecoveryUnavailable { node_id, has_state, .. }, _))
-                    if received.is_empty() =>
-                {
+                Some((
+                    Message::RecoveryUnavailable {
+                        node_id, has_state, ..
+                    },
+                    _,
+                )) if received.is_empty() => {
                     anyhow::ensure!(node_id == expected, "unexpected node in reply");
                     return Ok(Fetched::Unavailable { has_state });
                 }
@@ -95,7 +99,7 @@ pub(crate) async fn fetch(
 /// One peer's `Probe`, for the startup decision.
 pub(crate) async fn probe(addr: &str) -> anyhow::Result<NodeProbe> {
     tokio::time::timeout(STARTUP_PROBE, async {
-        let mut stream = TcpStream::connect(addr).await?;
+        let mut stream = Stream::connect(addr).await?;
         write_frame(&mut stream, &Message::ProbeRequest).await?;
         match read_frame(&mut stream).await? {
             Some((Message::Probe(p), _)) => Ok(p),

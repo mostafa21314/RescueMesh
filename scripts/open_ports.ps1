@@ -1,4 +1,4 @@
-# Allow inbound TCP to the cloud-node ports in Windows Defender Firewall.
+# Allow inbound UDP to the cloud-node ports in Windows Defender Firewall.
 # Needs an administrator PowerShell (right-click > Run as administrator):
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\open_ports.ps1            # allow 7001-7003
@@ -29,8 +29,8 @@ if ($Remove) {
     Write-Output "removed firewall rule '$name'"
     exit 0
 }
-New-NetFirewallRule -DisplayName $name -Direction Inbound -Protocol TCP -LocalPort $Ports `
+New-NetFirewallRule -DisplayName $name -Direction Inbound -Protocol UDP -LocalPort $Ports `
     -Action Allow -Profile Any | Out-Null
-Write-Output "firewall rule '$name': inbound TCP $Ports allowed on all profiles"
+Write-Output "firewall rule '$name': inbound UDP $Ports allowed on all profiles"
 Get-NetFirewallRule -DisplayName $name | Get-NetFirewallPortFilter |
     Format-Table -AutoSize Protocol, LocalPort

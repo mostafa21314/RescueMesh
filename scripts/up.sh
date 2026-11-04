@@ -36,10 +36,10 @@ bash "$here/set_ips.sh" "$ip1" "$ip3" "$ip2"
 port=700$id
 if command -v ufw >/dev/null && sudo -n true 2>/dev/null; then
   if sudo ufw status | grep -q 'Status: active'; then
-    sudo ufw allow "$port/tcp" >/dev/null && echo "ufw: allowed $port/tcp"
+    sudo ufw allow "$port/udp" >/dev/null && echo "ufw: allowed $port/udp"
   fi
 else
-  echo "note: if a firewall is active, allow inbound TCP $port (e.g. sudo ufw allow $port/tcp)"
+  echo "note: if a firewall is active, allow inbound UDP $port (e.g. sudo ufw allow $port/udp)"
 fi
 
 exec bash "$here/start_node.sh" "$id" "$@"

@@ -12,3 +12,5 @@ bin1/
 experiments/recovery/raw/
 experiments/recovery/sweep*.log
 lab.json
+.tools/
+__pycache__/

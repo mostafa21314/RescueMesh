@@ -1,5 +1,8 @@
 # Quick setup: one node per machine
 
+For current UDP setup and selectable roles on any Windows/Linux PC, follow
+[udp-phase1.md](udp-phase1.md). The topology below is a historical lab example.
+
 The short path that worked on 2026-10-31: node 1 on a Windows lab PC, nodes 2
 and 3 on Ubuntu lab PCs, the client on a Mac, all on a phone hotspot. For the
 full background (firewalls, test sequence, troubleshooting) see
@@ -77,7 +80,7 @@ From then on start node 1 with that last line (after `up.ps1` or `set_ips`
 has written the configs). `bin1/` isn't in git.
 
 Check port 7001 is held by `cloud-node`, not something else (e.g. a test
-listener), before starting: `Get-NetTCPConnection -LocalPort 7001 -State Listen`.
+listener), before starting: `Get-NetUDPEndpoint -LocalPort 7001`.
 
 ## 2. Ubuntu PCs: nodes 2 and 3
 
@@ -100,7 +103,7 @@ bash scripts/up.sh 2 IP1 IP2 IP3      # node 3 PC: bash scripts/up.sh 3 IP1 IP2 
 
 `up.sh` builds if needed, writes the configs, allows the node's port in ufw
 (when ufw is active and sudo works without a password; otherwise run
-`sudo ufw allow 7001:7003/tcp` yourself) and starts the node. It warns if this
+`sudo ufw allow 7001:7003/udp` yourself) and starts the node. It warns if this
 machine doesn't have the IP given for its node.
 
 ## 3. Mac: client

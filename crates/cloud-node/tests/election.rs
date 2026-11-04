@@ -183,14 +183,14 @@ async fn a_lone_node_serves_degraded_only_after_three_seconds() {
         // Two addresses nobody listens on, for the absent peers.
         let dead: Vec<String> = (0..2)
             .map(|_| {
-                std::net::TcpListener::bind("127.0.0.1:0")
+                std::net::UdpSocket::bind("127.0.0.1:0")
                     .unwrap()
                     .local_addr()
                     .unwrap()
                     .to_string()
             })
             .collect();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = common::rr::Listener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let peers = vec![
             common::config::PeerConfig {

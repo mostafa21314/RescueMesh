@@ -3,12 +3,12 @@
 //! Servers talk to each other only to replicate and (Part B) to elect, so a
 //! link opens on demand: its task connects when the first message is queued,
 //! and reconnects with exponential backoff after a failure. There are no
-//! heartbeats. Each direction of a node pair uses its own TCP connection;
+//! heartbeats. Each direction of a node pair uses its own UDP RR session;
 //! inbound peer messages arrive on our listener like client traffic.
 //!
 //! Delivery is at-least-once while both ends are up: a frame whose write
 //! failed is resent after reconnecting, and receivers apply messages
-//! idempotently. A frame accepted by the kernel just before the peer dies is
+//! idempotently. A frame acknowledged just before the peer dies can still be
 //! lost; catching the peer up when it returns is the recovery protocol's job.
 //! When a peer pulls a recovery snapshot from us, everything still queued for
 //! it is in that snapshot, so the queue is cleared and the link reconnects at
@@ -16,13 +16,13 @@
 
 use common::config::PeerConfig;
 use common::counters::Counters;
-use common::wire::write_frame;
+use common::rr::write_frame;
+use common::rr::Stream;
 use common::*;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
@@ -174,7 +174,7 @@ async fn link_task(
     sent: Arc<Counters>,
     control: Arc<Control>,
 ) {
-    let mut conn: Option<TcpStream> = None;
+    let mut conn: Option<Stream> = None;
     let mut backoff = BACKOFF_MIN;
     let mut failures = 0u32;
     loop {
@@ -192,17 +192,20 @@ async fn link_task(
                 break;
             }
             if envelope.resets != link.resets.load(Ordering::SeqCst) {
+                conn = None;
                 backoff = BACKOFF_MIN;
                 break;
             }
             if conn.is_none() {
-                match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
+                match tokio::time::timeout(CONNECT_TIMEOUT, Stream::connect(&addr)).await {
                     Ok(Ok(s)) => {
-                        let _ = s.set_nodelay(true);
                         tracing::info!(peer, %addr, "peer link connected");
                         conn = Some(s);
                         backoff = BACKOFF_MIN;
                         failures = 0;
+                        // A recovery reset may have happened while the UDP
+                        // handshake was awaiting its reply. Recheck the envelope.
+                        continue;
                     }
                     outcome => {
                         failures += 1;
@@ -247,13 +250,13 @@ async fn link_task(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::wire::read_frame;
-    use tokio::net::TcpListener;
+    use common::rr::read_frame;
+    use common::rr::Listener;
 
     #[tokio::test]
     async fn reset_drops_the_backlog_and_reconnects_without_waiting_out_the_backoff() {
         // A peer address that refuses connections until we bind it again.
-        let addr = TcpListener::bind("127.0.0.1:0")
+        let addr = Listener::bind("127.0.0.1:0")
             .await
             .unwrap()
             .local_addr()
@@ -273,17 +276,26 @@ mod tests {
 
         // Backoff has grown to 1.6 s by now; the peer comes back.
         tokio::time::sleep(Duration::from_millis(1_600)).await;
-        let listener = TcpListener::bind(&addr).await.unwrap();
+        let listener = Listener::bind(&addr).await.unwrap();
         let before = links.drops();
         links.reset(2);
         links.send(2, Message::ProbeRequest);
         assert_eq!(links.drops(), before, "the reset made room");
 
-        let (mut stream, _) = tokio::time::timeout(Duration::from_millis(500), listener.accept())
-            .await
-            .expect("reconnected before the backoff ran out")
-            .unwrap();
-        let (first, _) = read_frame(&mut stream).await.unwrap().unwrap();
+        let first = tokio::time::timeout(Duration::from_millis(500), async {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                // An in-progress UDP handshake can finish just as reset runs.
+                // It must carry no stale payload; skip the abandoned session.
+                if let Ok(Ok(Some((message, _)))) =
+                    tokio::time::timeout(Duration::from_millis(50), read_frame(&mut stream)).await
+                {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("fresh payload arrived before the backoff ran out");
         assert!(matches!(first, Message::ProbeRequest), "{first:?}");
         for t in tasks {
             t.abort();

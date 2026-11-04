@@ -15,14 +15,14 @@ the end.
     python3 scripts/recovery_bench.py restart       # R5: crash + restart, on_start off/on
     python3 scripts/recovery_bench.py all --reps 3  # everything, fewer repetitions
 
-Summary rows go to experiments/recovery/<experiment>.csv (appended, so an
+Summary rows go to experiments/recovery/udp/<experiment>.csv (appended, so an
 interrupted sweep can be resumed with --resume); per-request client logs go to
-experiments/recovery/raw/. Run `cargo build --release` first.
+experiments/recovery/udp/raw/. Run `cargo build --release` first.
 
 Lab mode: `--lab lab.json` runs the same experiments on real machines. Each
 lab PC runs scripts/lab_agent.py; the nodes are started, killed and restarted
 through their agents, and the workload is split over the client PCs' agents.
-Results go to experiments/recovery/lab/. See docs/lab-experiments.md.
+Results go to experiments/recovery/udp/lab/. See docs/lab-experiments.md.
 """
 
 import argparse
@@ -30,7 +30,6 @@ import csv
 import itertools
 import json
 import os
-import signal
 import socket
 import struct
 import subprocess
@@ -42,32 +41,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 BIN = ROOT / "target" / "release"
-OUT = ROOT / "experiments" / "recovery"
+OUT = ROOT / "experiments" / "recovery" / "udp"
 RAW = OUT / "raw"
 BASE_PORT = 7301
 REQUEST_TIMEOUT_MS = 1000
-MAX_ATTEMPTS = 8  # 8 attempts > 20 s outage + recovery at 1 s per attempt
+MAX_ATTEMPTS = 8  # Surviving servers serve during the outage; total loss can exhaust retries.
+EXE = ".exe" if os.name == "nt" else ""
 
 # ---------------------------------------------------------------- wire
 
-def call(addr, msg, timeout=2.0):
-    """One request/response over the node's framing: 4-byte length + JSON.
-    `addr` is (host, port)."""
-    with socket.create_connection(addr, timeout=timeout) as s:
-        body = json.dumps(msg).encode()
-        s.sendall(struct.pack(">I", len(body)) + body)
-        n = struct.unpack(">I", _read(s, 4))[0]
-        return json.loads(_read(s, n))
-
-
-def _read(s, n):
-    buf = b""
-    while len(buf) < n:
-        chunk = s.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("closed")
-        buf += chunk
-    return buf
+from udp_rr import call
 
 
 def status(addr, timeout=2.0):
@@ -80,12 +63,13 @@ def status(addr, timeout=2.0):
 # ---------------------------------------------------------------- cluster
 
 def node_toml(i, recovery, addrs, listen_host="127.0.0.1"):
+    show = lambda host, port: f'[{host}]:{port}' if ':' in host else f'{host}:{port}'
     peers = ", ".join(
-        f'{{ id = {k + 1}, addr = "{addrs[k][0]}:{addrs[k][1]}" }}' for k in range(3) if k != i
+        f'{{ id = {k + 1}, addr = "{show(*addrs[k])}" }}' for k in range(3) if k != i
     )
     rec = "\n".join(f"{k} = {json.dumps(v)}" for k, v in recovery.items())
     return f"""node_id = {i + 1}
-listen = "{listen_host}:{addrs[i][1]}"
+listen = "{show(listen_host, addrs[i][1])}"
 peers = [{peers}]
 election_mode = "on_demand"
 policy = "Composite"
@@ -104,8 +88,9 @@ table_ttl_ms = 1800000
 
 
 def client_toml(addrs):
+    show = lambda h, p: f'[{h}]:{p}' if ':' in h else f'{h}:{p}'
     return ("nodes = [%s]\nrequest_timeout_ms = %d\nmax_attempts = %d\n"
-            % (", ".join(f'"{h}:{p}"' for h, p in addrs), REQUEST_TIMEOUT_MS, MAX_ATTEMPTS))
+            % (", ".join(f'"{show(h, p)}"' for h, p in addrs), REQUEST_TIMEOUT_MS, MAX_ATTEMPTS))
 
 
 class Cluster:
@@ -125,20 +110,20 @@ class Cluster:
         log = open(self.dir / f"node{i + 1}.log", "a")
         self.logs.append(log)
         self.procs[i] = subprocess.Popen(
-            [str(BIN / "cloud-node"), "--config", str(self.dir / f"node{i + 1}.toml")],
+            [str(BIN / f"cloud-node{EXE}"), "--config", str(self.dir / f"node{i + 1}.toml")],
             stdout=log, stderr=subprocess.STDOUT, env={**os.environ, "RUST_LOG": "info"},
         )
         wait_for(lambda: status(self.addrs[i], 0.5) is not None, 10, f"node {i + 1} start")
 
     def kill(self, i):
-        self.procs[i].send_signal(signal.SIGKILL)
+        self.procs[i].kill()
         self.procs[i].wait()
         self.procs[i] = None
 
     def stop(self):
         for p in self.procs:
             if p:
-                p.send_signal(signal.SIGKILL)
+                p.kill()
                 p.wait()
         for log in self.logs:
             log.close()
@@ -151,7 +136,7 @@ class Cluster:
 
     def client(self, count, rate, complexity, out, seed):
         return subprocess.Popen(
-            [str(BIN / "client"), "--config", str(self.dir / "client.toml"),
+            [str(BIN / f"client{EXE}"), "--config", str(self.dir / "client.toml"),
              "--count", str(count), "--rate", str(rate), "--complexity", str(complexity),
              "--seed", str(seed), "--out", str(out)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -250,10 +235,7 @@ class LabClients:
 
 
 def _port_free(port):
-    with socket.socket() as s:
-        # Like the node's own bind (tokio sets SO_REUSEADDR): TIME_WAIT
-        # connections from the last run don't block it.
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         try:
             s.bind(("127.0.0.1", port))
             return True

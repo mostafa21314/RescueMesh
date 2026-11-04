@@ -7,10 +7,10 @@ mod support;
 use client::{synth_incident, Client};
 use cloud_node::{start_with_listener, NodeHandle};
 use common::config::*;
+use common::rr::Listener;
 use common::{rng::Rng, NodePhase};
 use std::time::{Duration, Instant};
 use support::*;
-use tokio::net::TcpListener;
 
 async fn ready(node: &NodeHandle, within: Duration) {
     let deadline = Instant::now() + within;
@@ -43,7 +43,7 @@ async fn submit_n(client: &Client, rng: &mut Rng, n: usize, tag: &str) {
 async fn restart(cfg: NodeConfig) -> NodeHandle {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match TcpListener::bind(&cfg.listen).await {
+        match Listener::bind(&cfg.listen).await {
             Ok(l) => return start_with_listener(cfg, l).await.unwrap(),
             Err(e) => {
                 assert!(Instant::now() < deadline, "rebind {}: {e}", cfg.listen);
@@ -122,8 +122,7 @@ async fn delta_transfer_and_chunked_snapshots_reach_the_same_state_with_less_dat
 async fn majority_rule_recovers_with_one_survivor_down_both_agree_waits() {
     limit(async {
         for rule in [ReadyRule::Majority, ReadyRule::BothAgree] {
-            let (mut nodes, addrs) =
-                start_cluster_with(|cfg| cfg.recovery.ready_rule = rule).await;
+            let (mut nodes, addrs) = start_cluster_with(|cfg| cfg.recovery.ready_rule = rule).await;
             let client = Client::new(client_cfg(&addrs, 1000, 6));
             let mut rng = Rng::new(5);
             submit_n(&client, &mut rng, 5, "warm").await;
@@ -168,21 +167,28 @@ async fn restarted_process_recovers_from_peers_before_serving() {
             .served_by
             .unwrap();
         submit_n(&client, &mut rng, 19, "before").await;
-        wait_converged(&nodes.iter().collect::<Vec<_>>(), 20, Duration::from_secs(5)).await;
+        wait_converged(
+            &nodes.iter().collect::<Vec<_>>(),
+            20,
+            Duration::from_secs(5),
+        )
+        .await;
         let epoch = nodes[0].status().epoch;
 
         // Crash a follower (its memory is lost) and start it again.
-        let i = nodes
-            .iter()
-            .position(|n| n.node_id() != server)
-            .unwrap();
+        let i = nodes.iter().position(|n| n.node_id() != server).unwrap();
         shutdown(nodes.remove(i)).await;
         submit_n(&client, &mut rng, 5, "while-down").await;
         let back = restart(cfg_of(&addrs, i, on_start)).await;
         ready(&back, Duration::from_secs(5)).await;
         let r = back.status().last_recovery.unwrap();
         assert_eq!(r.cause, "start");
-        assert_eq!(r.new_results, 25);
+        // Live replicas may arrive while the snapshots are being fetched.
+        // new_results counts snapshot inserts only; readiness must expose
+        // all results regardless of which path installed them.
+        assert_eq!(back.status().results, 25);
+        assert!(r.new_results <= 25);
+        assert_same_ledgers(&[&nodes[0], &nodes[1], &back]);
         // It adopted the current role view instead of forcing an election.
         assert_eq!(back.status().epoch, epoch);
         assert_eq!(back.status().server, Some(server));
@@ -209,7 +215,12 @@ async fn without_on_start_a_restarted_process_serves_empty() {
         let client = Client::new(client_cfg(&addrs, 500, 8));
         let mut rng = Rng::new(3);
         submit_n(&client, &mut rng, 10, "before").await;
-        wait_converged(&nodes.iter().collect::<Vec<_>>(), 10, Duration::from_secs(5)).await;
+        wait_converged(
+            &nodes.iter().collect::<Vec<_>>(),
+            10,
+            Duration::from_secs(5),
+        )
+        .await;
         shutdown(nodes.remove(2)).await;
         let back = restart(cfg_of(&addrs, 2, no_start)).await;
         let s = back.status();

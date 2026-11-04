@@ -1,7 +1,7 @@
 //! Client side of the protocol.
 //!
-//! Every request goes to all cloud nodes by unicast fan-out (one TCP
-//! connection per node; the lab network likely blocks multicast). The first
+//! Every request goes to all cloud nodes by unicast fan-out (one UDP RR
+//! session per node; the lab network likely blocks multicast). The first
 //! PlanResponse wins. On timeout or Busy the client resends the same
 //! request_id to all nodes with attempt + 1, up to `max_attempts`. Each
 //! request carries the highest epoch the client has seen in any response.
@@ -12,13 +12,13 @@ pub mod stress;
 use common::config::ClientConfig;
 use common::counters::Counters;
 use common::rng::{mix, Rng};
-use common::wire::{read_frame, write_frame};
+use common::rr::Stream;
+use common::rr::{read_frame, write_frame};
 use common::*;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -44,6 +44,8 @@ pub fn busy_pause(attempt: u32, timeout: Duration, salt: u64) -> Duration {
 /// What happened to one request.
 #[derive(Clone, Debug)]
 pub struct Outcome {
+    /// Time until success or retry exhaustion; failures are not zero latency.
+    pub elapsed: Duration,
     pub request_id: RequestId,
     /// First send, Unix ms.
     pub sent_at_ms: u64,
@@ -107,7 +109,7 @@ pub struct Client {
     cfg: ClientConfig,
     client_id: Uuid,
     seq: AtomicU64,
-    links: Vec<mpsc::UnboundedSender<Message>>,
+    links: Vec<mpsc::Sender<Message>>,
     dispatch: Arc<Dispatch>,
 }
 
@@ -119,7 +121,7 @@ impl Client {
             .nodes
             .iter()
             .map(|addr| {
-                let (tx, rx) = mpsc::unbounded_channel();
+                let (tx, rx) = mpsc::channel(4096);
                 let timeout = Duration::from_millis(cfg.request_timeout_ms);
                 tokio::spawn(link_task(addr.clone(), timeout, rx, dispatch.clone()));
                 tx
@@ -163,6 +165,7 @@ impl Client {
         let sent_at_ms = unix_ms();
         let start = Instant::now();
         let mut out = Outcome {
+            elapsed: Duration::ZERO,
             request_id,
             sent_at_ms,
             response_at_ms: None,
@@ -185,7 +188,9 @@ impl Client {
                 complexity,
             };
             for link in &self.links {
-                let _ = link.send(msg.clone());
+                if link.try_send(msg.clone()).is_err() {
+                    self.dispatch.unsent.fetch_add(1, Ordering::Relaxed);
+                }
             }
             let deadline = tokio::time::Instant::now() + timeout;
             let busy = loop {
@@ -222,6 +227,7 @@ impl Client {
                 tokio::time::sleep(busy_pause(attempt, timeout, salt)).await;
             }
         }
+        out.elapsed = start.elapsed();
         self.dispatch.pending.lock().unwrap().remove(&request_id);
         tracing::debug!(
             %request_id,
@@ -242,31 +248,37 @@ impl Client {
 async fn link_task(
     addr: String,
     timeout: Duration,
-    mut rx: mpsc::UnboundedReceiver<Message>,
+    mut rx: mpsc::Receiver<Message>,
     dispatch: Arc<Dispatch>,
 ) {
     let mut writer: Option<(
-        tokio::net::tcp::OwnedWriteHalf,
+        common::rr::WriteHalf,
         Arc<AtomicBool>,
         tokio::task::JoinHandle<()>,
     )> = None;
     let mut backoff = BACKOFF_MIN;
     let mut next_try = Instant::now();
     while let Some(msg) = rx.recv().await {
+        if let Message::SubmitIncident { request_id, .. } = &msg {
+            if !dispatch.pending.lock().unwrap().contains_key(request_id) {
+                continue;
+            }
+        }
         if writer
             .as_ref()
             .is_some_and(|(_, alive, _)| !alive.load(Ordering::Relaxed))
         {
-            writer = None;
+            if let Some((_, _, reader)) = writer.take() {
+                reader.abort();
+            }
         }
         if writer.is_none() {
             if Instant::now() < next_try {
                 dispatch.unsent.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            match tokio::time::timeout(timeout, TcpStream::connect(&addr)).await {
+            match tokio::time::timeout(timeout, Stream::connect(&addr)).await {
                 Ok(Ok(stream)) => {
-                    let _ = stream.set_nodelay(true);
                     let (rd, wr) = stream.into_split();
                     let alive = Arc::new(AtomicBool::new(true));
                     let reader = tokio::spawn(read_loop(rd, alive.clone(), dispatch.clone()));
@@ -283,12 +295,14 @@ async fn link_task(
             }
         }
         let (wr, _, _) = writer.as_mut().expect("connected above");
-        match write_frame(wr, &msg).await {
-            Ok(n) => dispatch.sent.add(msg.kind(), n),
-            Err(e) => {
-                tracing::debug!(%addr, %e, "write failed; will reconnect");
+        match tokio::time::timeout(timeout, write_frame(wr, &msg)).await {
+            Ok(Ok(n)) => dispatch.sent.add(msg.kind(), n),
+            error => {
+                tracing::debug!(%addr, ?error, "write failed; will reconnect");
                 dispatch.unsent.fetch_add(1, Ordering::Relaxed);
-                writer = None;
+                if let Some((_, _, reader)) = writer.take() {
+                    reader.abort();
+                }
             }
         }
     }
@@ -297,11 +311,7 @@ async fn link_task(
     }
 }
 
-async fn read_loop(
-    mut rd: tokio::net::tcp::OwnedReadHalf,
-    alive: Arc<AtomicBool>,
-    dispatch: Arc<Dispatch>,
-) {
+async fn read_loop(mut rd: common::rr::ReadHalf, alive: Arc<AtomicBool>, dispatch: Arc<Dispatch>) {
     while let Ok(Some((msg, n))) = read_frame(&mut rd).await {
         dispatch.received.add(msg.kind(), n);
         dispatch.deliver(msg);
@@ -312,11 +322,11 @@ async fn read_loop(
 /// Asks one node for its status over a short-lived connection.
 pub async fn query_status(addr: &str, timeout: Duration) -> anyhow::Result<NodeStatus> {
     let fut = async {
-        let mut s = TcpStream::connect(addr).await?;
+        let mut s = Stream::connect(addr).await?;
         write_frame(&mut s, &Message::StatusRequest).await?;
         loop {
             match read_frame(&mut s).await? {
-                Some((Message::Status(st), _)) => return Ok(st),
+                Some((Message::Status(st), _)) => return Ok(*st),
                 Some(_) => continue,
                 None => anyhow::bail!("connection closed before Status"),
             }
@@ -329,7 +339,7 @@ pub async fn query_status(addr: &str, timeout: Duration) -> anyhow::Result<NodeS
 /// harness polls this during runs.
 pub async fn query_probe(addr: &str, timeout: Duration) -> anyhow::Result<NodeProbe> {
     let fut = async {
-        let mut s = TcpStream::connect(addr).await?;
+        let mut s = Stream::connect(addr).await?;
         write_frame(&mut s, &Message::ProbeRequest).await?;
         loop {
             match read_frame(&mut s).await? {
@@ -353,7 +363,7 @@ pub async fn inject_failure(
         "failure duration must be 1..=20,000 ms"
     );
     tokio::time::timeout(timeout, async {
-        let mut stream = TcpStream::connect(addr).await?;
+        let mut stream = Stream::connect(addr).await?;
         write_frame(&mut stream, &Message::InjectFailure { duration_ms }).await?;
         match read_frame(&mut stream).await? {
             Some((
@@ -365,6 +375,39 @@ pub async fn inject_failure(
             )) if accepted == duration_ms => Ok(node_id),
             Some((Message::FailureRejected { reason }, _)) => anyhow::bail!(reason),
             _ => anyhow::bail!("failure was not acknowledged"),
+        }
+    })
+    .await?
+}
+
+/// Set or stop artificial CPU load on a configured lab server.
+pub async fn set_load(
+    addr: &str,
+    threads: usize,
+    duration_ms: u64,
+    timeout: Duration,
+) -> anyhow::Result<NodeId> {
+    tokio::time::timeout(timeout, async {
+        let mut stream = Stream::connect(addr).await?;
+        write_frame(
+            &mut stream,
+            &Message::SetLoad {
+                threads,
+                duration_ms,
+            },
+        )
+        .await?;
+        match read_frame(&mut stream).await? {
+            Some((
+                Message::LoadAccepted {
+                    node_id,
+                    threads: got,
+                    duration_ms: duration,
+                },
+                _,
+            )) if got == threads && duration == duration_ms => Ok(node_id),
+            Some((Message::LoadRejected { reason }, _)) => anyhow::bail!(reason),
+            _ => anyhow::bail!("load was not acknowledged"),
         }
     })
     .await?

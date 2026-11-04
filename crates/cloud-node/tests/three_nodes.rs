@@ -113,7 +113,7 @@ async fn retry_is_answered_from_results_table_by_any_node() {
         let idx = nodes.iter().position(|n| n.node_id() == server).unwrap();
         shutdown(nodes.remove(idx)).await;
 
-        let mut s = tokio::net::TcpStream::connect(&peer_addr).await.unwrap();
+        let mut s = common::rr::Stream::connect(&peer_addr).await.unwrap();
         let retry = common::Message::SubmitIncident {
             request_id: first.request_id,
             attempt: 2,
@@ -121,9 +121,9 @@ async fn retry_is_answered_from_results_table_by_any_node() {
             incident: synth_incident(&mut rng, 256, "it"),
             complexity: 1,
         };
-        common::wire::write_frame(&mut s, &retry).await.unwrap();
+        common::rr::write_frame(&mut s, &retry).await.unwrap();
         let (reply, _) =
-            tokio::time::timeout(Duration::from_secs(5), common::wire::read_frame(&mut s))
+            tokio::time::timeout(Duration::from_secs(5), common::rr::read_frame(&mut s))
                 .await
                 .unwrap()
                 .unwrap()
@@ -165,7 +165,7 @@ async fn full_queue_replies_busy() {
         let warm = client.submit(synth_incident(&mut rng, 256, "it"), 1).await;
         let server = warm.served_by.expect("warm-up answered");
 
-        let mut s = tokio::net::TcpStream::connect(&addrs[server as usize - 1])
+        let mut s = common::rr::Stream::connect(&addrs[server as usize - 1])
             .await
             .unwrap();
         let client_id = uuid::Uuid::new_v4();
@@ -177,13 +177,13 @@ async fn full_queue_replies_busy() {
                 incident: synth_incident(&mut rng, 256, "it"),
                 complexity: 200,
             };
-            common::wire::write_frame(&mut s, &msg).await.unwrap();
+            common::rr::write_frame(&mut s, &msg).await.unwrap();
         }
         // One running + two queued fit; the rest are refused.
         let (mut busy, mut plans) = (0, 0);
         while busy + plans < 10 {
             let (m, _) =
-                tokio::time::timeout(Duration::from_secs(60), common::wire::read_frame(&mut s))
+                tokio::time::timeout(Duration::from_secs(60), common::rr::read_frame(&mut s))
                     .await
                     .unwrap()
                     .unwrap()

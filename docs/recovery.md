@@ -1,5 +1,9 @@
 # Server recovery: design, decisions and measurements
 
+The measured study below used TCP. Recovery now runs over UDP Request–Reply;
+new benchmark data goes under `experiments/recovery/udp/` and must be evaluated
+separately. See [udp-phase1.md](udp-phase1.md) for current setup and experiments.
+
 This is the recovery part of Phase 1: a cloud node that was unreachable comes
 back, makes its state consistent with its peers, and only then takes part again.
 It covers what state must be recovered and how, the protocol, every decision

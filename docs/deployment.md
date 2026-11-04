@@ -1,5 +1,9 @@
 # Running RescueMesh on physical machines
 
+For the current OS-independent role launcher and UDP experiments, start with
+[udp-phase1.md](udp-phase1.md). The machine examples below describe the earlier
+lab layout; roles can now be selected on any supported Windows/Linux machine.
+
 This guide takes you from a USB stick (or a fresh clone) to a running three-node
 cloud with clients on laptops. Find your role in the list below, follow its
 section from top to bottom, then go to [Lab day](#lab-day).
@@ -16,7 +20,7 @@ For the short version with one node per machine (`scripts/up.sh` /
 
 ## The setup
 
-| Machine | Runs | Listens on (TCP, inbound) |
+| Machine | Runs | Listens on (UDP, inbound) |
 |---|---|---|
 | A (lab PC) | node 1 and node 2 | 7001, 7002 |
 | B (lab PC) | node 3 | 7003 |
@@ -25,7 +29,7 @@ For the short version with one node per machine (`scripts/up.sh` /
 
 - Node *N* listens on port 700*N*.
 - Every node connects to the other two, and every client connects to all three
-  nodes. So every node machine must accept inbound TCP on its nodes' ports.
+  nodes. So every node machine must accept inbound UDP on its nodes' ports.
   Laptops need no open ports.
 - The configs ship with placeholders (`MACHINE_A_IP`, `MACHINE_B_IP`).
   `set_ips` replaces them with real addresses.
@@ -142,7 +146,7 @@ the USB stick.
    - *With admin rights:* in an administrator PowerShell (right-click
      PowerShell > Run as administrator), run
      `powershell -ExecutionPolicy Bypass -File scripts\open_ports.ps1`. It allows
-     inbound TCP 7001-7003 on all network profiles. `-Remove` deletes the rule
+     inbound UDP 7001-7003 on all network profiles. `-Remove` deletes the rule
      after the lab.
    - *Without admin rights:* see
      [Windows firewall without admin](#windows-firewall-without-admin).
@@ -199,9 +203,9 @@ connect out, which the firewall allows.
    ```
    | Firewall | Allow 7001-7003 |
    |---|---|
-   | ufw | `sudo ufw allow 7001:7003/tcp` |
-   | firewalld | `sudo firewall-cmd --add-port=7001-7003/tcp` (until reboot); add `--permanent` and run `sudo firewall-cmd --reload` to keep it |
-   | plain iptables | `sudo iptables -I INPUT -p tcp --dport 7001:7003 -j ACCEPT` |
+   | ufw | `sudo ufw allow 7001:7003/udp` |
+   | firewalld | `sudo firewall-cmd --add-port=7001-7003/udp` (until reboot); add `--permanent` and run `sudo firewall-cmd --reload` to keep it |
+   | plain iptables | `sudo iptables -I INPUT -p udp --dport 7001:7003 -j ACCEPT` |
    | none active | nothing to do |
 
    Without sudo you can't change the firewall. `check_cluster` from another
@@ -249,33 +253,13 @@ connect out, which the firewall allows.
 
 ## Checking the cluster
 
-`check_cluster` reads the node addresses from `config/client.toml` and tries a
-TCP connection to each, then runs `client --status`. It prints one verdict per
-node:
-
-| Verdict | Meaning |
-|---|---|
-| `reachable` | something accepts connections there: the node, if the address is right |
-| `refused` | the machine answered, but nothing listens on that port: the node isn't running, or the port is wrong |
-| `timeout` | no answer within 3 s: a firewall or the network drops the connection |
-| `unreachable` | no route to the host: wrong IP, a different network, or a firewall that rejects (firewalld's default) |
-| `not set` | `client.toml` still has placeholders: run `set_ips` |
-
-Example (node 2 stopped):
-
-```
-TCP check (limit 3s per node), from .../config/client.toml:
-  node 1  10.40.12.7:7001       reachable
-  node 2  10.40.12.7:7002       refused (node not running, or wrong port)
-  node 3  10.40.12.8:7003       reachable
-2 of 3 nodes reachable
-
-client --status:
-10.40.12.7:7001: node 1 epoch 1 server Some(1) requests 200 results 200 digest 6bdddb34e273cc0b queue 0 running 0 ...
-10.40.12.7:7002: unreachable (Connection refused ...)
-10.40.12.8:7003: node 3 epoch 1 server Some(1) requests 200 results 200 digest 6bdddb34e273cc0b queue 0 running 0 ...
-results tables IDENTICAL on all reachable nodes
-```
+`check_cluster` runs `client --status` against `config/client.toml`, using actual
+UDP request/reply exchanges. A node must answer at the application level to be
+reachable. Missing replies can mean a stopped node, an incorrect address,
+overload, a firewall or network loss; UDP cannot reliably distinguish these
+from one failed probe. The check exits unsuccessfully if any configured node
+is unreachable or the result digests differ. For the newer role launcher and
+shared LAN setup, see [udp-phase1.md](udp-phase1.md).
 
 Use `--settle` (`-Settle` in PowerShell) after a run: `client --status` then
 waits, for up to 10 s, until no node has queued or running jobs before it

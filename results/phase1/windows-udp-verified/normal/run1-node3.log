@@ -1,0 +1,4 @@
+2026-11-04T00:17:20.196151Z  INFO cloud_node::node: node started node=3 addr=127.0.0.1:7003 workers=4 mode=OnDemand policy=Composite cpu_source=Process zones=256 responders=150
+2026-11-04T00:17:20.426685Z  INFO cloud_node::peers: peer link connected peer=2 addr=127.0.0.1:7002
+2026-11-04T00:17:20.426771Z  INFO cloud_node::peers: peer link connected peer=1 addr=127.0.0.1:7001
+2026-11-04T00:17:20.426885Z  INFO cloud_node::node: election epoch 1 trigger=no_server trigger_request=f671a364/0 bids=[(1, 0), (2, 0), (3, 0)] incumbent=[] outcome=decided winner=Some(1) duration_ms=0.47 messages_sent=2 node=3

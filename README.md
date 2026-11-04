@@ -2,6 +2,23 @@
 
 CSCE 4411 Distributed Systems term project (Group 7), in Rust.
 
+**Current transport: UDP Request–Reply.** Any Windows/Linux PC can be a server,
+client or test controller. Start with the
+[Windows/Linux Phase 1 guide](docs/udp-phase1.md) for machine roles, LAN setup,
+normal/imbalance/fault controls, severity presets and reliability limits.
+
+```text
+cargo build --release
+python -m pip install -r scripts/requirements-report.txt
+python scripts/phase1.py test --local --scenario all --severity 2 --duration 30 --reps 5
+```
+
+The test writes raw CSVs and an offline HTML report with PNG/PDF figures under
+`results/phase1/`. Use `server --node N` or `client` in the same launcher to
+select this PC's role; add `--config-dir config/site` for a shared LAN config.
+The older stress/recovery studies below describe TCP measurements and must not
+be presented as measurements of the new UDP transport.
+
 Phase 1 status:
 
 | Bullet | State |

@@ -1,0 +1,21 @@
+2026-11-04T00:19:48.027277Z  INFO cloud_node::node: node started node=3 addr=127.0.0.1:7003 workers=4 mode=OnDemand policy=Composite cpu_source=Process zones=256 responders=150
+2026-11-04T00:19:49.759492Z  INFO cloud_node::peers: peer link connected peer=1 addr=127.0.0.1:7001
+2026-11-04T00:19:49.759921Z  INFO cloud_node::peers: peer link connected peer=2 addr=127.0.0.1:7002
+2026-11-04T00:19:49.760134Z  INFO cloud_node::node: election epoch 1 trigger=no_server trigger_request=c79a21b6/0 bids=[(1, 24), (2, 0), (3, 0)] incumbent=[] outcome=decided winner=Some(2) duration_ms=0.96 messages_sent=2 node=3
+2026-11-04T00:19:50.970136Z  INFO cloud_node::node: now serving node=3 epoch=2 degraded=false took_over=106
+2026-11-04T00:19:50.970176Z  INFO cloud_node::node: election epoch 2 trigger=retry trigger_request=b31e3ba9/8 bids=[(1, 26), (2, 542), (3, 1)] incumbent=[2] outcome=decided winner=Some(3) duration_ms=10.21 messages_sent=2 node=3
+2026-11-04T00:19:51.371906Z  WARN cloud_node::node: temporary failure started node=3 duration_ms=2000
+2026-11-04T00:19:53.372837Z  INFO cloud_node::node: recovery started; election participation disabled node=3 cause="mute" rp=RecoveryParams { transfer: Delta, snapshot: Chunked, ready_rule: Majority, on_start: true, delta_margin_ms: 2000, majority_wait_ms: 500 }
+2026-11-04T00:19:53.442144Z  INFO cloud_node::node: recovery complete; node ready node=3 cause="mute" total_ms=69 drain_ms=0 fetch_ms=63 install_ms=5 rounds=1 records=9126 bytes=4626454 new_results=836 republished=64 results=1843 epoch=3
+2026-11-04T00:19:54.506724Z  INFO cloud_node::node: now serving node=3 epoch=5 degraded=false took_over=3665
+2026-11-04T00:19:54.506763Z  INFO cloud_node::node: election epoch 5 trigger=peer_bid trigger_request=- bids=[(1, 109), (2, 601), (3, 76)] incumbent=[2] outcome=decided winner=Some(3) duration_ms=0.31 messages_sent=2 node=3
+2026-11-04T00:19:55.505378Z  INFO cloud_node::node: stepped down node=3 epoch=5 dropped=2830
+2026-11-04T00:19:55.505838Z  INFO cloud_node::node: election epoch 6 trigger=retry trigger_request=fda14edc/484 bids=[(1, 101), (2, 84), (3, 601)] incumbent=[3] outcome=decided winner=Some(2) duration_ms=0.76 messages_sent=2 node=3
+2026-11-04T00:19:56.508987Z  INFO cloud_node::node: now serving node=3 epoch=7 degraded=false took_over=4967
+2026-11-04T00:19:56.509012Z  INFO cloud_node::node: election epoch 7 trigger=retry trigger_request=ac0129bf/405 bids=[(1, 100), (2, 615), (3, 79)] incumbent=[2] outcome=decided winner=Some(3) duration_ms=0.51 messages_sent=2 node=3
+2026-11-04T00:19:57.510502Z  INFO cloud_node::node: stepped down node=3 epoch=7 dropped=4098
+2026-11-04T00:19:57.510630Z  INFO cloud_node::node: election epoch 8 trigger=retry trigger_request=96b6de29/594 bids=[(1, 97), (2, 84), (3, 599)] incumbent=[3] outcome=decided winner=Some(2) duration_ms=0.25 messages_sent=2 node=3
+2026-11-04T00:19:58.521545Z  INFO cloud_node::node: now serving node=3 epoch=9 degraded=false took_over=3502
+2026-11-04T00:19:58.521575Z  INFO cloud_node::node: election epoch 9 trigger=retry trigger_request=12d984f9/518 bids=[(1, 96), (2, 604), (3, 81)] incumbent=[2] outcome=decided winner=Some(3) duration_ms=0.33 messages_sent=2 node=3
+2026-11-04T00:19:59.536706Z  INFO cloud_node::node: stepped down node=3 epoch=9 dropped=2617
+2026-11-04T00:19:59.536878Z  INFO cloud_node::node: election epoch 10 trigger=retry trigger_request=b31e3ba9/564 bids=[(1, 95), (2, 76), (3, 592)] incumbent=[3] outcome=decided winner=Some(2) duration_ms=0.36 messages_sent=2 node=3

@@ -8,10 +8,10 @@ use client::{synth_incident, Client};
 use cloud_node::{start_with_listener, NodeHandle};
 use common::config::{PeerConfig, ReadyRule};
 use common::rng::Rng;
+use common::rr::Listener;
 use common::{unix_ms, NodePhase};
 use std::time::{Duration, Instant};
 use support::*;
-use tokio::net::TcpListener;
 
 /// Starts node `id` again on its old address with a fresh process state.
 async fn restart(id: u32, addrs: &[String]) -> NodeHandle {
@@ -29,7 +29,7 @@ async fn restart_with(id: u32, addrs: &[String], rule: ReadyRule) -> NodeHandle 
         .collect();
     let deadline = Instant::now() + Duration::from_secs(5);
     let listener = loop {
-        match TcpListener::bind(addr).await {
+        match Listener::bind(addr).await {
             Ok(l) => break l,
             Err(e) if Instant::now() < deadline => {
                 let _ = e;
@@ -210,7 +210,10 @@ async fn majority_rule_restarts_from_the_one_ready_peer() {
         let r = one.status().last_recovery.unwrap();
         assert_eq!((r.cause.as_str(), r.snapshots_used), ("start", 1));
         let s = survivor.status();
-        assert_eq!((one.status().epoch, one.status().server), (s.epoch, s.server));
+        assert_eq!(
+            (one.status().epoch, one.status().server),
+            (s.epoch, s.server)
+        );
         shutdown(one).await;
         shutdown(nodes.remove(0)).await;
     })

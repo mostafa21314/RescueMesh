@@ -1,5 +1,9 @@
 # Part B summary: on-demand, load-aware election (Phase 1, bullet 2)
 
+Historical Part B notes. For the current UDP transport, selectable Windows/Linux
+roles, severity controls and generated reliability reports, use
+[the Phase 1 UDP guide](docs/udp-phase1.md).
+
 Branch `phase1/load-election`, on top of the Part A commit `87de5e8`. Nothing is
 committed: all changes are in the working tree.
 

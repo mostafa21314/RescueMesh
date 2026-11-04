@@ -1,5 +1,10 @@
 # Running the experiments on the six lab PCs
 
+Application and control requests now use UDP RR; the optional management agent
+continues to use HTTP/TCP. New measurements go under `experiments/recovery/udp/lab/`.
+For choosing roles without agents and running the normal/imbalance/fault sweep,
+see [udp-phase1.md](udp-phase1.md).
+
 The recovery experiments (docs/recovery.md) were first run on one Mac. This is
 how to run the same experiments on the real setup: three PCs with one cloud
 node each, three PCs running the client workload. One command on the
@@ -41,7 +46,7 @@ PCs (it measures each agent's clock offset), so latency windows line up.
    - every PC: **7400** (agent);
    - node PCs also **7001–7003** (nodes).
 
-   Ubuntu: `sudo ufw allow 7400/tcp && sudo ufw allow 7001:7003/tcp`.
+   Ubuntu: `sudo ufw allow 7400/tcp && sudo ufw allow 7001:7003/udp`.
    Windows: when the security alert appears for `python.exe` (and later
    `cloud-node.exe`), tick **Private and Public**, then **Allow**.
 

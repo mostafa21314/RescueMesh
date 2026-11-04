@@ -422,7 +422,12 @@ mod tests {
         let t0 = Instant::now();
         let mut t = Tables::default();
         t.offer(r(1), response(1, 1), &incident(), t0);
-        t.offer(r(2), response(2, 1), &incident(), t0 + Duration::from_secs(5));
+        t.offer(
+            r(2),
+            response(2, 1),
+            &incident(),
+            t0 + Duration::from_secs(5),
+        );
         t.offer(r(1), response(1, 1), &incident(), t0); // kept
         t.offer(r(1), response(3, 2), &incident(), t0); // replaced
         assert_eq!(t.results_digest(), recount(&t));

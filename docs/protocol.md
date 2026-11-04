@@ -7,12 +7,30 @@ write-up, demo commands, and the limits of the recovery model.
 
 ## Transport and framing
 
-- TCP. One listening port per node (`listen` in its config) serves clients and peers
-  alike; a node tells messages apart by their `type`, not by who connected.
-- Each frame is a 4-byte big-endian body length followed by the body. The body is
-  one JSON object: a `Message`, with its variant in the `type` field
-  (`{"type":"Busy","request_id":{...}}`).
-- A body larger than 16 MiB (`wire::MAX_FRAME`) is rejected and the connection closed.
+- UDP Request–Reply (`common::rr`). One UDP port per node (`listen` in its
+  config) serves clients, peers and diagnostics. JSON messages retain the same
+  `type` field (`{"type":"Busy","request_id":{...}}`).
+- Each datagram has a 37-byte header: `RMR1` (4 bytes), kind (1 byte), session
+  UUID (16 bytes), message sequence (u64), fragment index (u32), and total JSON
+  message length (u32). Integers in the header are big-endian. Kinds are DATA=0,
+  ACK=1, HELLO=2, WELCOME=3, RESET=4. Control packets have no body.
+- A datagram is at most 1,200 bytes (1,163 payload); a complete JSON message is
+  at most 1 MiB. Sequence numbers start at zero independently in each direction.
+  HELLO/WELCOME establishes a session associated with the source address and
+  UUID. Unknown DATA receives RESET; reconnecting creates a new session.
+- Each fragment is acknowledged; duplicates are suppressed and reordered
+  fragments reassembled. Only the expected complete message is delivered.
+  A 32-fragment window is retried up to six transmissions, with waits starting
+  at 30 ms and doubling to 500 ms plus jitter. The final fragment is acknowledged
+  only after the decoded message enters the bounded application queue (64).
+  ACK means queued for processing, not committed to a replica or disk.
+- Handshake retries wait 30, 60, 120, 240 and 480 ms. There are at most 1,024
+  listener sessions and 128 pending accepts. A read idle for 60 seconds closes
+  the session; links reconnect as needed. Higher-layer deadlines can terminate
+  a transfer before the transport's retry budget is exhausted.
+- `common::wire` retains the old length-prefix codec for historical compatibility
+  tests; the application no longer opens TCP sockets. The optional lab-agent
+  HTTP management API remains separate from this application transport.
 - Every number inside a plan is an integer, so a plan survives a JSON round trip
   unchanged, and replicas holding the same plans compare equal byte for byte. Load
   scores are integers too (milli-units).
@@ -185,6 +203,20 @@ and running 0 on two polls in a row, then compares.
 node logged, any outcome, and their summed duration), `cpu_load` (the score's
 CPU EWMA, 0–1), `rss_bytes` (the node's resident memory) and `load_score`. All
 five default to 0 when absent, like `phase` and the other fields added later.
+
+`transport` reports process-wide UDP datagrams/bytes sent, datagrams received,
+retransmissions, duplicate fragments, invalid datagrams and delivery timeouts.
+Unlike logical message counters, these include acknowledgements and diagnostic
+traffic. `client --status` exits unsuccessfully if a configured node is unreachable
+or the result digests differ, so a partial cluster cannot appear healthy.
+
+### `SetLoad` / `LoadAccepted` / `LoadRejected` (lab controller)
+
+`SetLoad {threads, duration_ms}` replaces artificial CPU load. Zero threads stops
+it; positive values require a duration of 1..=3,600,000 ms and at most twice the
+logical CPU count. A successful reply echoes the node ID and settings. This is
+independent of fault injection: a muted node remains unavailable until its timer
+expires. These controls, like `InjectFailure`, assume a trusted lab network.
 
 ### `ProbeRequest` / `Probe` (diagnostic, client ↔ node)
 

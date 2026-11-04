@@ -177,6 +177,64 @@ pub fn burn(n: usize) {
     }
 }
 
+/// Reversible CPU load for demonstrations, bounded in duration and thread count.
+#[derive(Default)]
+pub struct LoadGenerator {
+    active: Mutex<Option<BurnRun>>,
+}
+
+type BurnRun = (Arc<AtomicBool>, Vec<std::thread::JoinHandle<()>>);
+
+impl LoadGenerator {
+    pub fn set(&self, threads: usize, duration: Duration) -> anyhow::Result<()> {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        anyhow::ensure!(
+            threads <= cores * 2,
+            "load threads must be <= twice the logical CPU count ({})",
+            cores * 2
+        );
+        anyhow::ensure!(
+            threads == 0 || (!duration.is_zero() && duration <= Duration::from_secs(3600)),
+            "load duration must be 1..=3,600,000 ms"
+        );
+        let mut active = self.active.lock().unwrap();
+        if let Some((stop, handles)) = active.take() {
+            stop.store(true, Ordering::Relaxed);
+            for handle in handles {
+                let _ = handle.join();
+            }
+        }
+        if threads == 0 {
+            return Ok(());
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let until = std::time::Instant::now() + duration;
+        let handles = (0..threads)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut x = 1u64;
+                    while !stop.load(Ordering::Relaxed) && std::time::Instant::now() < until {
+                        for _ in 0..1000 {
+                            x = std::hint::black_box(
+                                x.wrapping_mul(6364136223846793005).wrapping_add(1),
+                            );
+                        }
+                    }
+                })
+            })
+            .collect();
+        *active = Some((stop, handles));
+        Ok(())
+    }
+}
+
+impl Drop for LoadGenerator {
+    fn drop(&mut self) {
+        let _ = self.set(0, Duration::ZERO);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

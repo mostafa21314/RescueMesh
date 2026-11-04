@@ -8,7 +8,7 @@ response before submitting the next incident. `--rate` controls the offered
 arrival rate, while `--rate 0` submits the whole burst immediately.
 
 Requests share one outbound link task per cloud node. Each link serializes frames
-on its own TCP connection; links to different nodes operate independently. A
+on its own UDP RR session; links to different nodes operate independently. A
 dispatcher routes replies to the task waiting for that request ID. Each task has
 its own timeout and attempt counter. Retries reuse the request ID, increase the
 attempt number, and fan out to all nodes. A Busy response uses exponential backoff

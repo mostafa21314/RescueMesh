@@ -1,0 +1,6 @@
+label: faulty; severity=1; UDP RR; Windows-10-10.0.26200-SP0
+started_unix_ms: 1793750553914
+harness_machine: windows x86_64, 24 logical cores
+nodes: ["127.0.0.1:7001", "127.0.0.1:7002", "127.0.0.1:7003"]
+request_timeout_ms: 1000 max_attempts: 5
+args: Args { config: "E:\\RescueMesh\\config\\local\\client.toml", clients: [1, 4], reps: 2, requests: 120, rate: 20.0, complexity: 2, fault_ms: Some(2000), fault_at_ms: 1500, sample_ms: 250, pause_ms: 1000, seed: 42, out: "results\\phase1\\windows-udp-smoke\\faulty", client_bin: None, client_threads: 2, settle_secs: 15, label: "faulty; severity=1; UDP RR; Windows-10-10.0.26200-SP0", before_run: None, fault_cmd: None, local_nodes: Some("E:\\RescueMesh\\config\\local"), load_node: None, load_threads: 2 }

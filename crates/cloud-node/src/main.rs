@@ -11,6 +11,9 @@ struct Args {
     /// Start N busy-loop threads: CPU load that only the score's CPU term sees.
     #[arg(long, default_value_t = 0)]
     burn_threads: usize,
+    /// Planner threads; omitted uses config, zero chooses for this machine.
+    #[arg(long)]
+    workers: Option<usize>,
 }
 
 #[tokio::main]
@@ -21,7 +24,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
-    let cfg = NodeConfig::load(&args.config)?;
+    let mut cfg = NodeConfig::load(&args.config)?;
+    if let Some(workers) = args.workers {
+        cfg.workers = if workers == 0 {
+            common::config::default_workers()
+        } else {
+            workers
+        };
+    }
     if args.burn_threads > 0 {
         tracing::warn!(threads = args.burn_threads, "burning CPU");
         cloud_node::load::burn(args.burn_threads);

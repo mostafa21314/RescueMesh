@@ -746,3 +746,32 @@ c. **A restarted node loses the results it served before crashing.** Tables and
    the ledger are in memory only. Its peers hold the results it replicated; any
    it computed but hadn't yet replicated are gone, and it gets nothing back
    except what limitation a happens to redeliver.
+
+## November 4, 2026: UDP RR and cross-platform Phase 1 experiments
+
+The requested transport is Request–Reply over UDP, not round-robin scheduling.
+`common::rr` now supplies bounded message sessions, fragment ACKs, retransmission
+with backoff, reassembly and duplicate suppression. All application sockets use
+UDP; the optional remote process agent retains its HTTP management interface.
+The election and deterministic replica merge policies remain application logic.
+
+`scripts/phase1.py` selects server/client/test/control mode on Windows or Linux.
+Native executables are required for each OS/CPU architecture. Severity controls
+client processes, request rate and planner cost; artificial CPU load and bounded
+temporary failure are independent controls. Local experiments own and restart
+their three server processes each repetition. Reports retain failure denominators,
+export latency distributions and timelines, and separate client success from
+state convergence. Older TCP measurements are preserved and labeled historical.
+
+A UDP handshake introduced a peer-reset race: a connection established while
+recovery cleared the peer backlog could still send the obsolete envelope. The
+link now checks the reset generation again after handshake completion. A restart
+test also incorrectly equated snapshot inserts with recovered results even when
+live replicas arrived first; it now checks the complete result table and ledger.
+
+Transport tests pass messages through a relay that loses data/ACKs, duplicates and
+reorders datagrams. Further checks cover malformed/oversized messages, bounded
+failure, real subprocess stress, load controls and Python/Rust interoperability.
+See [udp-phase1.md](udp-phase1.md) for the wire limits and remaining reliability
+constraints: bounded retries, volatile state, reply-before-replication and
+eventual consistency do not establish exactly-once execution or durable commits.

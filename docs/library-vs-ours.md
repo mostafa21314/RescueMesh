@@ -7,7 +7,7 @@ and conflict resolution are our code.
 
 | Crate | Used for | Not used for |
 |---|---|---|
-| `tokio` | Async runtime, TCP sockets, timers, channels, Ctrl-C | Any protocol logic |
+| `tokio` | Async runtime, UDP sockets, timers, channels, Ctrl-C | Any protocol logic |
 | `serde`, `serde_json` | Deriving and encoding messages as JSON | Framing (ours, below) |
 | `toml` | Parsing config files | |
 | `uuid` | Client ids (v4) and incident ids | |
@@ -15,14 +15,14 @@ and conflict resolution are our code.
 | `tracing`, `tracing-subscriber` | Structured logs, `RUST_LOG` filtering | |
 | `anyhow`, `thiserror` | Error plumbing | |
 | `sysinfo` | Reading CPU usage (whole machine or this process) for the load score's CPU term | Sampling schedule, EWMA, normalization (ours) |
-| `matplotlib` (Python, outside the Rust build) | Drawing the stress plots (`scripts/plot_stress.py`) | Any statistic: the harness computes them in Rust |
-| `tokio-util` | Allowed, not used: its length-delimited codec needs `futures` stream/sink extension traits, which aren't on the allowed list, and the 4-byte length prefix takes 30 lines (`common::wire`) | |
+| `matplotlib` (Python, outside the Rust build) | Drawing stress plots and exporting PDF/PNG reports | The new report's statistics are computed by `phase1_report.py`; run metrics by the Rust harness |
+| `tokio-util` | Allowed, not used | UDP RR protocol is implemented in `common::rr` |
 
 ## Ours
 
 | Area | Where |
 |---|---|
-| Wire protocol: message set, framing, size limit | `common::msg`, `common::wire`, docs/protocol.md |
+| Wire protocol: message set, UDP sessions, ACKs, retransmission, fragmentation, ordering, duplicate suppression and size limits | `common::msg`, `common::rr`, `scripts/udp_rr.py`, docs/protocol.md |
 | Seeded PRNG (SplitMix64) so every node builds the same campus on any platform | `common::rng` |
 | Synthetic campus: zone graph, responders, resource offers | `cloud-node::campus` |
 | Dijkstra | `cloud-node::graph` |

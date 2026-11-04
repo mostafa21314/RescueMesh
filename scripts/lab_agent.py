@@ -22,7 +22,7 @@ Endpoints (all JSON):
 import argparse
 import json
 import os
-import socket
+from udp_rr import call
 import subprocess
 import sys
 import tempfile
@@ -43,8 +43,7 @@ jobs = {}
 
 def reachable(port):
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-            return True
+        return call(("127.0.0.1", port), {"type": "ProbeRequest"}, timeout=0.5)["type"] == "Probe"
     except OSError:
         return False
 

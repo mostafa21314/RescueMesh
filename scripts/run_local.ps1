@@ -35,7 +35,7 @@ foreach ($i in 1..3) {
     $proc = Start-Process -FilePath "target\release\cloud-node.exe" `
         -ArgumentList (@("--config", "config\local\node$i.toml") + $(if ($i -eq $BurnNode) { @("--burn-threads", "$BurnThreads") } else { @() })) `
         -RedirectStandardOutput "logs\node$i.log" -RedirectStandardError "logs\node$i.err.log" `
-        -NoNewWindow -PassThru
+        -WindowStyle Hidden -PassThru
     $proc.Id | Out-File -Encoding ascii "logs\node$i.pid"
     Write-Host "node $i started (pid $($proc.Id)), log logs\node$i.log"
 }

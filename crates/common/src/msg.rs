@@ -127,6 +127,19 @@ pub enum Message {
     FailureRejected {
         reason: String,
     },
+    /// Lab control: replace this node's artificial CPU load; zero stops it.
+    SetLoad {
+        threads: usize,
+        duration_ms: u64,
+    },
+    LoadAccepted {
+        node_id: NodeId,
+        threads: usize,
+        duration_ms: u64,
+    },
+    LoadRejected {
+        reason: String,
+    },
     /// Returning node pulls a fixed snapshot from each ready survivor.
     ///
     /// `since_ms`: send only entries changed in the last `since_ms` ms, as
@@ -159,7 +172,7 @@ pub enum Message {
     /// Diagnostic: client → node. Not part of request processing.
     StatusRequest,
     /// Diagnostic: node → client.
-    Status(NodeStatus),
+    Status(Box<NodeStatus>),
     /// Diagnostic: client → node. A cheap load sample for the stress
     /// harness's sampler: unlike `StatusRequest` it skips the results digest,
     /// which serializes the whole results table under the state lock.
@@ -184,6 +197,9 @@ impl Message {
             Message::InjectFailure { .. } => "InjectFailure",
             Message::FailureAccepted { .. } => "FailureAccepted",
             Message::FailureRejected { .. } => "FailureRejected",
+            Message::SetLoad { .. } => "SetLoad",
+            Message::LoadAccepted { .. } => "LoadAccepted",
+            Message::LoadRejected { .. } => "LoadRejected",
             Message::RecoveryRequest { .. } => "RecoveryRequest",
             Message::RecoveryChunk { .. } => "RecoveryChunk",
             Message::RecoveryComplete { .. } => "RecoveryComplete",
@@ -194,6 +210,8 @@ impl Message {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeStatus {
+    #[serde(default)]
+    pub transport: crate::rr::TransportStats,
     pub node_id: NodeId,
     #[serde(default)]
     pub phase: NodePhase,
@@ -283,6 +301,7 @@ mod tests {
     #[test]
     fn status_round_trips_through_json() {
         let st = NodeStatus {
+            transport: crate::rr::TransportStats::default(),
             node_id: 1,
             phase: NodePhase::Ready,
             faults_injected: 0,
@@ -320,7 +339,7 @@ mod tests {
             rss_bytes: 1 << 20,
             load_score: 120,
         };
-        let msg = Message::Status(st);
+        let msg = Message::Status(Box::new(st));
         let back: Message = serde_json::from_slice(&serde_json::to_vec(&msg).unwrap()).unwrap();
         assert_eq!(back, msg);
     }

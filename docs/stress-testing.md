@@ -1,5 +1,9 @@
 # Stress testing (Phase 1, bullet 6)
 
+The measurements in this document predate the UDP migration and used TCP.
+Current scenario/severity controls and UDP reports are described in
+[udp-phase1.md](udp-phase1.md); new results go under `results/phase1/`.
+
 How the cloud behaves as the number of concurrent clients grows, with and without
 an injected failure of the elected server: the harness, what each figure means,
 the local results, and what they say about the design. Decisions behind the
@@ -12,7 +16,7 @@ method are in the [design log](design-log.md) (November 3).
 invocation is one *sweep*: a list of load levels, each run `--reps` times.
 
 - **A level** is a number of concurrent client *processes*. Each one is the
-  normal `client` binary (own client id, own TCP connections to all three nodes,
+  normal `client` binary (own client id, own UDP RR sessions to all three nodes,
   own retries), sending `--requests` incidents open loop at `--rate` per second.
   Offered load = processes × rate.
 - **Run order:** rep 1 runs every level once in a shuffled order, then rep 2 in
