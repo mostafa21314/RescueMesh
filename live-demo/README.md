@@ -16,54 +16,48 @@ dashboard you can switch election mode, set the load, mute a node for up to
 
 ## 1. Network
 
-All six PCs must reach each other (same lab subnet, one hotspot, or ZeroTier).
-On each PC, note its IP:
+All six PCs must be on the same network (same lab subnet, one hotspot, or one
+ZeroTier network). The PCs find each other by broadcast, so there are no IPs to
+type.
+
+## 2. One command on each PC
+
+Open a terminal and paste this, with the PC's number at the end
+(1, 2, 3 = nodes; 4, 5, 6 = clients). Each PC gets a different number:
 
 ```bash
-hostname -I
+curl -fsSL https://raw.githubusercontent.com/mostafa21314/RescueMesh/demo/six-pc-live/live-demo/oneclick.sh | bash -s 1
 ```
 
-Write down the six IPs in order: `IP1` (PC 1) … `IP6` (PC 6).
+That's it. It installs what's missing (Rust into your home folder; it asks for
+sudo only if `git`, `curl`, `python3` or a C compiler are missing), downloads the
+code to `~/RescueMesh-demo`, builds (a few minutes the first time), finds the
+other PCs, starts this PC's part and opens the dashboard. Leave the terminal
+open; Ctrl+C stops that PC. Nodes start as soon as PCs 1, 2 and 3 have all
+found each other.
 
-## 2. First time on each PC
+**Next time:** double-click **RescueMesh PC N** on the Desktop (it updates the
+code and starts again). If Ubuntu asks, choose "Trust and Launch". Or run
+`bash ~/RescueMesh-demo/live-demo/oneclick.sh N`.
+
+If the firewall is on (`sudo ufw status` says active) and the script could not
+open it, run once:
 
 ```bash
-sudo apt install -y build-essential curl git python3
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-source ~/.cargo/env
-git clone -b demo/six-pc-live https://github.com/mostafa21314/RescueMesh.git
-cd RescueMesh
+sudo ufw allow 7500 && sudo ufw allow 7001:7003/udp
 ```
 
-No sudo? Skip the `apt` line if `gcc`, `curl` and `python3` are already there;
-rustup installs into your home folder.
+### If broadcast is blocked: give the IPs instead
 
-## 3. Start each PC
-
-Same six IPs, same order, on every PC; only the first number changes:
+Some networks drop broadcasts, and then the cards stay "not found yet". Get each
+PC's IP with `hostname -I`, then on every PC (inside `~/RescueMesh-demo`), with
+the same six IPs in PC order and only the first number changing:
 
 ```bash
-bash live-demo/start.sh 1 IP1 IP2 IP3 IP4 IP5 IP6     # on PC 1
-bash live-demo/start.sh 2 IP1 IP2 IP3 IP4 IP5 IP6     # on PC 2
-bash live-demo/start.sh 3 IP1 IP2 IP3 IP4 IP5 IP6     # on PC 3
-bash live-demo/start.sh 4 IP1 IP2 IP3 IP4 IP5 IP6     # on PC 4
-bash live-demo/start.sh 5 IP1 IP2 IP3 IP4 IP5 IP6     # on PC 5
-bash live-demo/start.sh 6 IP1 IP2 IP3 IP4 IP5 IP6     # on PC 6
+bash live-demo/start.sh 1 IP1 IP2 IP3 IP4 IP5 IP6
 ```
 
-The first run builds the Rust binaries (a few minutes) and saves the IPs to
-`live-demo/lab.json`; after that `bash live-demo/start.sh N` is enough. Leave the
-terminal open. Ctrl+C stops that PC (and its node).
-
-If the firewall is on and the script could not open it (it only does so when
-`sudo` works without a password), run once:
-
-```bash
-sudo ufw allow 7500/tcp
-sudo ufw allow 7001:7003/udp
-```
-
-## 4. Open the dashboard
+## 3. Open the dashboard
 
 On any of the six PCs open **http://localhost:7500** in the browser (Firefox is
 fine). From a laptop on the same network: `http://IP4:7500` (any PC's IP works).
@@ -84,13 +78,16 @@ fine). From a laptop on the same network: `http://IP4:7500` (any PC's IP works).
 
 ## Troubleshooting
 
-- A card says **agent down**: that PC's `start.sh` isn't running, the IP in
-  `lab.json` is wrong, or TCP 7500 is blocked. Test from another PC:
-  `curl http://IPn:7500/api/state`.
+- A card says **not found yet**: that PC isn't running, or broadcasts don't get
+  through (use `start.sh` with IPs, above).
+- A card says **agent down**: that PC stopped, or TCP 7500 is blocked. Test from
+  another PC: `curl http://IPn:7500/api/state`.
+- Red banner **two PCs claim the same number**: two PCs were given the same
+  number; stop one and start it with the right number.
 - Nodes **disagree on server** or `results` differ for long: the nodes can't
   reach each other on UDP 7001–7003; check the firewall and the IPs.
-- `WARNING: this PC has ... but lab.json says ...`: wrong PC number or IP order.
-- Wrong IPs saved: run `start.sh N` again with all six IPs.
+- With `start.sh`: `WARNING: this PC has ... but lab.json says ...` means a wrong
+  PC number or IP order; run it again with all six IPs to fix them.
 - Logs: `live-demo/run/pcN/nodeN.log` on PCs 1–3.
 
 ## Rehearse on one machine
@@ -109,5 +106,7 @@ state over the UDP control protocol (`ProbeRequest`, `StatusRequest`) and sends
 `InjectFailure` / `SetLoad` for mute and CPU load. On PCs 4–6 it runs the real
 `client` binary in overlapping 2-second batches and reads each batch's
 per-request CSV. The agent that serves the dashboard asks the other five for
-their state every second and forwards button presses to them. The agent has no
+their state every second and forwards button presses to them. With
+`oneclick.sh` each agent broadcasts "I am PC N" on UDP 7500 every second and
+learns the other PCs' IPs from theirs. The agent has no
 authentication: run it only on the lab network.

@@ -17,6 +17,7 @@ import os
 import random
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -81,19 +82,109 @@ def now_ms():
 
 
 class Lab:
-    def __init__(self, path):
+    """The six PCs' IPs: fixed (lab.json) or found by LAN broadcast (--discover)."""
+
+    def __init__(self, pcs=None, agent_ports=None, discover=False):
+        self.pcs = list(pcs) if pcs else [None] * 6
+        self.agent_ports = agent_ports or [7500] * 6
+        self.discover = discover
+        self.ids = [None] * 6
+        self.seen = [0.0] * 6
+        self.conflicts = {}
+        self.lock = threading.Lock()
+
+    @classmethod
+    def load(cls, path):
         data = json.loads(Path(path).read_text())
-        self.pcs = data['pcs']
-        if len(self.pcs) != 6:
+        if len(data['pcs']) != 6:
             raise SystemExit(f'{path}: "pcs" must list six IPs (PC 1..6)')
         port = int(data.get('agent_port', 7500))
-        self.agent_ports = data.get('agent_ports') or [port] * 6
+        return cls(data['pcs'], data.get('agent_ports') or [port] * 6)
+
+    def saw(self, pc, ip, iid):
+        """A beacon from PC `pc` (instance `iid`) arrived from `ip`."""
+        now, i = time.time(), pc - 1
+        with self.lock:
+            same_owner = self.ids[i] in (None, iid) or self.pcs[i] == ip
+            if same_owner or now - self.seen[i] > 6:
+                # A new owner (or the old one gone quiet for 6 s) takes the slot;
+                # the same owner beaconing from a second interface keeps its first IP.
+                if self.pcs[i] is None or (self.ids[i] != iid and self.pcs[i] != ip):
+                    print(f'found PC {pc} at {ip}' + (f' (was {self.pcs[i]})' if self.pcs[i] else ''), flush=True)
+                    self.pcs[i] = ip
+                self.ids[i] = iid
+                self.seen[i] = now
+                self.conflicts.pop(pc, None)
+            else:
+                if pc not in self.conflicts:
+                    print(f'WARNING: two machines say they are PC {pc}: {self.pcs[i]} and {ip}', flush=True)
+                self.conflicts[pc] = [self.pcs[i], ip]
+
+    def view(self):
+        return {'pcs': self.pcs, 'discover': self.discover,
+                'conflicts': {str(k): v for k, v in self.conflicts.items()}}
 
     def agent(self, pc):
-        return f'{self.pcs[pc - 1]}:{self.agent_ports[pc - 1]}'
+        ip = self.pcs[pc - 1]
+        return None if ip is None else f'{ip}:{self.agent_ports[pc - 1]}'
 
     def node(self, n):
-        return (self.pcs[n - 1], NODE_PORT[n])
+        ip = self.pcs[n - 1]
+        if ip is None:
+            raise LookupError(f'PC {n} (node {n}) not found yet: is its oneclick.sh running?')
+        return (ip, NODE_PORT[n])
+
+    def nodes_known(self):
+        return all(self.pcs[:3])
+
+
+def broadcast_addrs():
+    out = {'255.255.255.255'}
+    try:
+        txt = subprocess.run(['ip', '-o', '-4', 'addr', 'show'], capture_output=True,
+                             text=True, timeout=2).stdout
+        out.update(re.findall(r'\bbrd (\d+\.\d+\.\d+\.\d+)', txt))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return sorted(out)
+
+
+class Beacon:
+    """Every second, broadcast 'I am PC n' on UDP agent_port; record everyone else's."""
+
+    def __init__(self, lab, pc, port):
+        self.lab, self.pc, self.port = lab, pc, port
+        self.iid = '%016x' % random.getrandbits(64)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        self.sock.bind(('', port))
+        threading.Thread(target=self.send_loop, daemon=True).start()
+        threading.Thread(target=self.recv_loop, daemon=True).start()
+
+    def send_loop(self):
+        msg = json.dumps({'rescuemesh_demo': 1, 'pc': self.pc, 'id': self.iid}).encode()
+        addrs, k = broadcast_addrs(), 0
+        while True:
+            k += 1
+            if k % 10 == 0:
+                addrs = broadcast_addrs()
+            for a in addrs:
+                try:
+                    self.sock.sendto(msg, (a, self.port))
+                except OSError:
+                    pass
+            time.sleep(1)
+
+    def recv_loop(self):
+        while True:
+            try:
+                data, (ip, _) = self.sock.recvfrom(2048)
+                m = json.loads(data)
+                if m.get('rescuemesh_demo') == 1 and 1 <= int(m['pc']) <= 6 and not ip.startswith('127.'):
+                    self.lab.saw(int(m['pc']), ip, str(m.get('id')))
+            except (OSError, ValueError, KeyError, TypeError):
+                time.sleep(.1)
 
 
 class Node:
@@ -191,8 +282,6 @@ class Load:
     def __init__(self, pc, lab, run_dir):
         self.pc, self.lab, self.run = pc, lab, run_dir
         self.cfg = run_dir / 'client.toml'
-        nodes = ', '.join('"{}:{}"'.format(*lab.node(n)) for n in (1, 2, 3))
-        self.cfg.write_text(CLIENT_TOML.format(nodes=nodes))
         self.rate, self.complexity = 50.0, 5
         self.active = False
         self.lock = threading.Lock()
@@ -208,6 +297,8 @@ class Load:
         exe = BIN / 'client'
         if not exe.exists():
             raise FileNotFoundError(f'{exe} missing: run cargo build --release')
+        nodes = ', '.join('"{}:{}"'.format(*self.lab.node(n)) for n in (1, 2, 3))
+        self.cfg.write_text(CLIENT_TOML.format(nodes=nodes))
         with self.lock:
             if rate is not None:
                 self.rate = max(1.0, min(2000.0, float(rate)))
@@ -324,9 +415,22 @@ class Agent:
         self.load = Load(pc, lab, self.run) if pc >= 4 else None
         self.pool = ThreadPoolExecutor(12)
 
+    def autostart(self, mode):
+        """Start the node once PCs 1-3 are all known (at once with lab.json)."""
+        if not self.lab.nodes_known():
+            print('waiting to find PCs 1-3 on the network...', flush=True)
+        while not self.lab.nodes_known():
+            time.sleep(.5)
+        try:
+            self.node.start(mode)
+            print(f'node {self.pc} started ({mode})', flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f'could not start node {self.pc}: {e}', flush=True)
+            self.node.note = str(e)
+
     def state(self):
         st = {'pc': self.pc, 'ip': self.lab.pcs[self.pc - 1], 'role': 'node' if self.node else 'client',
-              'time_ms': now_ms()}
+              'time_ms': now_ms(), 'lab': self.lab.view()}
         if self.node:
             st['node_id'] = self.pc
             st['node'] = self.node.state()
@@ -338,6 +442,9 @@ class Agent:
         def one(pc):
             if pc == self.pc:
                 return self.state()
+            if self.lab.agent(pc) is None:
+                return {'pc': pc, 'ip': None, 'role': 'node' if pc <= 3 else 'client',
+                        'unreachable': f'not found yet: run oneclick.sh {pc} on PC {pc}'}
             try:
                 return http_json(f'http://{self.lab.agent(pc)}/api/state', timeout=1.5)
             except Exception as e:  # noqa: BLE001
@@ -348,6 +455,8 @@ class Agent:
     def act(self, body):
         pc = int(body.get('pc', self.pc))
         if pc != self.pc:
+            if self.lab.agent(pc) is None:
+                raise LookupError(f'PC {pc} not found yet')
             return http_json(f'http://{self.lab.agent(pc)}/api/act', body, timeout=6)
         a = body.get('action')
         if self.node:
@@ -434,21 +543,26 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--pc', type=int, required=True, choices=range(1, 7), help='this PC: 1-3 node, 4-6 client')
     ap.add_argument('--lab', default=str(HERE / 'lab.json'), help='six IPs (written by start.sh)')
+    ap.add_argument('--discover', action='store_true',
+                    help='find the other PCs by LAN broadcast instead of reading --lab (oneclick.sh does this)')
     ap.add_argument('--mode', choices=MODES, default='on_demand', help='election mode for the first start')
     ap.add_argument('--no-autostart', action='store_true', help="don't start the node at launch")
     args = ap.parse_args()
 
-    lab = Lab(args.lab)
+    discover = args.discover or not Path(args.lab).exists()
+    lab = Lab(discover=True) if discover else Lab.load(args.lab)
     agent = Agent(args.pc, lab)
     port = lab.agent_ports[args.pc - 1]
     server = ThreadingHTTPServer(('0.0.0.0', port), make_handler(agent))
     server.daemon_threads = True
+    if discover:
+        Beacon(lab, args.pc, port)
     if agent.node and not args.no_autostart:
-        agent.node.start(args.mode)
+        threading.Thread(target=agent.autostart, args=(args.mode,), daemon=True).start()
     role = f'node {args.pc} (UDP {NODE_PORT[args.pc]})' if agent.node else 'client (load generator)'
-    print(f'PC {args.pc}: {role}; agent on TCP {port}')
-    print(f'Dashboard: http://localhost:{port}   (from another machine: http://{lab.pcs[args.pc - 1]}:{port})')
-    print('Ctrl+C stops this PC.')
+    print(f'PC {args.pc}: {role}; agent on TCP {port}' + ('; finding the other PCs by broadcast' if discover else ''))
+    print(f'Dashboard: http://localhost:{port}')
+    print('Ctrl+C stops this PC.', flush=True)
 
     def bye(*_):
         raise KeyboardInterrupt

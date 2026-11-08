@@ -119,7 +119,7 @@ function nodeCard(p) {
     <div><b>${pr.requests}</b><i>requests</i></div><div><b>${pr.results}</b><i>results</i></div>` : '';
   return `<div class="card ${p.unreachable || !n.running ? 'off' : ''}" style="border-top-color:${NC[p.pc]}">
     <h2><span>PC ${p.pc} · node ${p.pc} ${isServer ? '<span class="pill server">SERVER</span>' : ''}</span>
-      <span><span class="pill ${phase[1]}">${phase[0]}</span> <span class="ip">${p.ip}:${7000 + p.pc}</span></span></h2>
+      <span><span class="pill ${phase[1]}">${phase[0]}</span> <span class="ip">${p.ip || '?'}:${7000 + p.pc}</span></span></h2>
     <div class="legend">mode ${n.mode || '–'}${n.pid ? ' · pid ' + n.pid : ''}</div>
     <div class="kv">${kv}</div>
     <div class="btns">
@@ -140,7 +140,7 @@ function clientCard(p) {
   const share = [1, 2, 3].map(i => served[i] ? `<span style="width:${100 * served[i] / sum}%;background:${NC[i]}"></span>` : '').join('');
   const st = p.unreachable ? ['agent down', 'bad'] : c.active ? ['sending', 'good'] : ['idle', ''];
   return `<div class="card ${p.unreachable ? 'off' : ''}" style="border-top-color:${CC[p.pc]}">
-    <h2><span>PC ${p.pc} · client</span><span><span class="pill ${st[1]}">${st[0]}</span> <span class="ip">${p.ip}</span></span></h2>
+    <h2><span>PC ${p.pc} · client</span><span><span class="pill ${st[1]}">${st[0]}</span> <span class="ip">${p.ip || '?'}</span></span></h2>
     <div class="legend">${c.rate ? fmt(c.rate) + ' req/s offered · complexity ' + c.complexity : ''} · last ${w.seconds || 10} s:</div>
     <div class="kv">
       <div><b>${fmt(okRate, 1)}</b><i>done / s</i></div><div><b>${fmt(w.p50, 1)}</b><i>p50 ms</i></div>
@@ -187,7 +187,9 @@ function charts(clients) {
 
 function render(c) {
   const nodes = c.pcs.filter(p => p.role === 'node'), clients = c.pcs.filter(p => p.role === 'client');
-  $('#from').textContent = `served by PC ${c.served_from}`;
+  const me = c.pcs.find(p => p.pc === c.served_from) || {}, cf = Object.entries(me.lab?.conflicts || {});
+  $('#from').innerHTML = cf.length ? `<span class="pill bad">two PCs claim the same number: ${cf.map(([pc, ips]) => 'PC ' + pc + ' = ' + ips.join(' and ')).join('; ')}</span>`
+    : `dashboard on PC ${c.served_from}${me.lab?.discover ? ' · PCs found by broadcast' : ''}`;
   if (!busy) {
     $('#nodes').innerHTML = nodes.map(nodeCard).join('');
     const focus = document.activeElement?.id;
