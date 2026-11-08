@@ -26,7 +26,7 @@ from pathlib import Path
 
 from recovery_bench import client_toml, node_toml
 from study_agent import source_id, stamp
-from study_metrics import analyze_requests, node_deltas, write_rows
+from study_metrics import ALLOCATION_POLICY, PROTOCOL_VERSION, analyze_requests, node_deltas, resource_verdict, write_rows
 from udp_rr import call
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -89,6 +89,11 @@ def idle_agreed(states, mode, minimum=0, drained=True):
         return False
     if not all(s['phase'] == 'ready' and not s['degraded'] and s['queue_len'] == 0 and s['running'] == 0 for s in states):
         return False
+    if any(not s.get('allocation') or s['allocation']['policy'] != ALLOCATION_POLICY or
+           s['allocation'].get('members') != sorted(p['node_id'] for p in states) or
+           any(s['allocation'].get(k, 0) for k in ('capacity_violations', 'responder_violations', 'rejected_plans', 'quarantine_remaining_ms')) or
+           s.get('resource_overcommits', 0) or s.get('replicate_conflicts', 0) for s in states):
+        return False
     if drained and any(q['control_queued'] or q['replication_queued'] for s in states for q in s.get('peer_queues', [])):
         return False
     if len({(s['epoch'], s['server'], s['results'], s['results_digest']) for s in states}) != 1:
@@ -100,8 +105,10 @@ def wait_baseline(lab, mode, minimum, seconds):
     deadline, last = time.monotonic() + seconds, None
     while time.monotonic() < deadline:
         last = statuses(lab)
+        if any(s and s.get('protocol_version') != PROTOCOL_VERSION for s in last):
+            raise RuntimeError('All server/client PCs must be rebuilt for allocation protocol 3')
         if idle_agreed(last, mode, minimum):
-            if any(s.get('protocol_version') != 2 or s.get('configuration', {}).get('election_mode') != mode for s in last):
+            if any(s.get('configuration', {}).get('election_mode') != mode for s in last):
                 raise RuntimeError('Server version or election mode mismatch')
             return last
         time.sleep(.25)
@@ -176,7 +183,7 @@ def select_points(results, args):
     if not ordered:
         raise ValueError('Run the normal stage first, or supply --points processes:rate,...')
     stable = [p for p in ordered if len(groups[p]) == 2 * args.reps and all(
-        r.get('measurement_valid') and r['success_pct'] >= 99 and r['converged'] for r in groups[p])]
+        r.get('measurement_valid') and r.get('resource_correctness_pass') and r['success_pct'] >= 99 and r['converged'] for r in groups[p])]
     low = stable[0] if stable else ordered[0]
     near = stable[-1] if stable else ordered[len(ordered) // 2]
     return list(dict.fromkeys([low, near, ordered[-1]]))
@@ -420,7 +427,7 @@ def run_case(lab, case, args, manifest):
         incarnation_valid = all(a and b['incarnation'] == a['incarnation'] for b, a in zip(before, after))
         clock_shift = max(abs(clock_after[a]['offset_ms'] - clock_before[a]['offset_ms']) for a in addresses)
         clock_uncertainty = max(v['uncertainty_ms'] for v in clock_before.values())
-        row = {**case, **metrics, **node_deltas(before, after, [s for s in samples if s['t_ms'] >= 0]),
+        row = {**case, **metrics, **node_deltas(before, after, [s for s in samples if s['t_ms'] >= 0]), **resource_verdict(before, after),
                'artifacts': str(directory.relative_to(args.out)).replace('\\', '/'), 'baseline_agreed': True,
                'converged': success, 'convergence_ms': max(0, observed_convergence - clients_done_ms) if success else None,
                'client_exit_failures': sum(c != 0 for c in codes), 'intervention_valid': intervention_valid,
@@ -430,7 +437,8 @@ def run_case(lab, case, args, manifest):
                'recovery_ms': max(0, event['ready_ms'] - event['at_ms'] - event['duration_ms'])
                     if event.get('kind') == 'fault' and event.get('ready_ms') else None}
         row['measurement_valid'] = (row['missing_records'] == 0 and row['uuid_valid'] and row['load_generation_valid']
-            and row['client_exit_failures'] == 0 and intervention_valid and incarnation_valid)
+            and row['client_exit_failures'] == 0 and intervention_valid and incarnation_valid and row['allocation_fields_present'])
+        row['correctness_pass'] = row['converged'] and row['resource_correctness_pass']
         row['electbid_messages_per_request'] = row['electbid_messages'] / row['requests']
         save(parent / 'result.json', row)
         return row
@@ -479,7 +487,7 @@ def execute(args, lab):
         if any(args.out.iterdir()):
             raise ValueError('Output directory is not empty')
         manifest = {'campaign': uuid.uuid4().hex, 'source_id': source_id(), 'settings': settings,
-                    'lab': lab, 'created_ms': stamp(), 'protocol_version': 2}
+                    'lab': lab, 'created_ms': stamp(), 'protocol_version': PROTOCOL_VERSION, 'allocation_policy': ALLOCATION_POLICY}
         save(path, manifest)
     args.health = preflight(lab, args.allow_local)
     save(args.out / 'preflight.json', args.health)
@@ -490,7 +498,7 @@ def execute(args, lab):
             points = select_points(results, args)
             normal = [r for r in results if r['stage'] == 'normal']
             stable = [p for p in points if len([r for r in normal if (r['processes'], r['rate']) == p]) == 2 * args.reps and
-                all(r['measurement_valid'] and r['success_pct'] >= 99 and r['converged'] for r in normal
+                all(r['measurement_valid'] and r.get('resource_correctness_pass') and r['success_pct'] >= 99 and r['converged'] for r in normal
                     if (r['processes'], r['rate']) == p)]
             if not stable:
                 raise RuntimeError('No verified common sustainable point for a soak; inspect the normal-stage results')
@@ -513,7 +521,14 @@ def execute(args, lab):
             row = run_case(lab, case, args, manifest)
             write_rows(args.out / 'runs.csv', all_results(args.out))
             print(f'  answered {row["answered"]}/{row["requests"]}; p50/p95/p99={row["lat_p50_ms"]}/{row["lat_p95_ms"]}/{row["lat_p99_ms"]} ms; '
-                  f'SD={row["lat_sd_ms"]}; valid={row["measurement_valid"]}; converged={row["converged"]}', flush=True)
+                  f'SD={row["lat_sd_ms"]}; valid={row["measurement_valid"]}; converged={row["converged"]}; '
+                  f'resources={row["resource_correctness_pass"] if row["resource_correctness_known"] else "unknown"}; '
+                  f'shortfall_pct={row["shortfall_pct"]}', flush=True)
+            if row['resource_correctness_known'] and not row['resource_correctness_pass']:
+                if not args.no_report:
+                    from phase1_study_report import generate
+                    generate(args.out)
+                raise RuntimeError(f'Resource correctness failed; saved {row["id"]}. Stop and investigate: {row["resource_correctness_reasons"]}')
             # A nonconvergent measurement is retained; the next run must still
             # pass its fresh empty baseline. Infrastructure errors stop the study.
     if not args.no_report:

@@ -26,3 +26,4 @@ mod recovery;
 pub mod tables;
 
 pub use node::{start, start_with_listener, NodeHandle};
+pub mod allocation;

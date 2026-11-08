@@ -7,6 +7,11 @@ write-up, demo commands, and the limits of the recovery model.
 
 ## Transport and framing
 
+Application protocol **3** adds exclusive asset partitions, bounded reservation
+leases, allocation diagnostics, explicit shortfall CSV metrics and election-bid
+batching. See [allocation-v3.md](allocation-v3.md) for its guarantees and limits.
+Rebuild every peer and client together. The `RMR1` datagram framing is unchanged.
+
 Application protocol 2 adds batched replication, revision-based repair,
 per-request subscription cleanup, worker scheduling diagnostics and scoped
 result comparisons. All peers should be upgraded together. The complete

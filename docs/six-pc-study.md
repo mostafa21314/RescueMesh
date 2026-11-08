@@ -1,6 +1,9 @@
 # Six-PC comparison: on-demand and per-request
 
-Application traffic uses protocol 2 over UDP Request–Reply. Python agents use
+Application traffic uses protocol 3 over UDP Request–Reply. Read the
+[allocation safety update](allocation-v3.md) before repeating the study: both
+modes now use exclusive asset partitions and a separate resource-correctness gate.
+Python agents use
 HTTP/TCP 7400 for process management and file collection. No dashboard is involved.
 
 | Role | ZeroTier IP | Application port |
@@ -19,7 +22,7 @@ seventh PC that reaches all six addresses.
 ## Prepare every PC
 
 Copy the same updated source to **all six PCs**. The source bundle is
-`dist/six-pc-study-source.zip`; extract into a new directory. Python 3.11+ is
+`dist/six-pc-study-v3-source.zip`; extract into a new directory. Python 3.11+ is
 required. From the project directory on every PC:
 
 ```bash
@@ -88,7 +91,7 @@ source .venv/bin/activate
 python -m pip install -r scripts/requirements-report.txt
 python scripts/phase1_study.py check --lab config/study-lab.json
 python scripts/phase1_study.py plan --lab config/study-lab.json
-python scripts/phase1_study.py run --lab config/study-lab.json --profile smoke --out results/phase1/six-pc-smoke
+python scripts/phase1_study.py run --lab config/study-lab.json --profile smoke --out results/phase1/six-pc-smoke-v3
 ```
 
 `check` is read-only. Smoke runs both modes, both load targets, five- and
@@ -101,7 +104,7 @@ and the logs before the long study. Windows controllers use
 ## Main comparison
 
 ```bash
-python scripts/phase1_study.py run --lab config/study-lab.json --out results/phase1/six-pc-study-1
+python scripts/phase1_study.py run --lab config/study-lab.json --out results/phase1/six-pc-study-v3
 ```
 
 | Stage | Conditions | Runs |
@@ -118,9 +121,9 @@ settling and collection add to wall time. Deduplicated points reduce run count.
 To run stages separately, use this sequence instead of the all-stage command:
 
 ```bash
-python scripts/phase1_study.py run --lab config/study-lab.json --stage normal --out results/phase1/six-pc-study-1
-python scripts/phase1_study.py run --lab config/study-lab.json --stage resilience --resume --out results/phase1/six-pc-study-1
-python scripts/phase1_study.py run --lab config/study-lab.json --stage soak --resume --out results/phase1/six-pc-study-1
+python scripts/phase1_study.py run --lab config/study-lab.json --stage normal --out results/phase1/six-pc-study-v3
+python scripts/phase1_study.py run --lab config/study-lab.json --stage resilience --resume --out results/phase1/six-pc-study-v3
+python scripts/phase1_study.py run --lab config/study-lab.json --stage soak --resume --out results/phase1/six-pc-study-v3
 ```
 
 Resume an interrupted all-stage run by repeating its command with `--resume`.
@@ -178,6 +181,8 @@ change, rebuild/copy everywhere and use a new study directory.
 - `runs.csv`: mean, sample latency SD, p50/p95/p99/max, success/failure/missing,
   failed elapsed, goodput, achieved rate, dispatch lag, load shares, election
   overhead, queues, repair, resource conflicts, recovery, convergence and validity.
+  Resource correctness is independent of measurement validity. Shortfalls and
+  assignment counts expose asset availability; confirmed violations stop the study.
 - `summary.csv`: mean, sample SD and 95% Student-t CI **between repetitions**.
   Means of run percentiles are distinguished from pooled request percentiles.
 - `paired-differences.csv`: `per_request − on_demand`, with SD/CI, using valid pairs.
@@ -202,7 +207,7 @@ instead of loading all 33.8 million raw requests.
 Regenerate reports after at least one run completes:
 
 ```bash
-python scripts/phase1_study.py report --out results/phase1/six-pc-study-1
+python scripts/phase1_study.py report --out results/phase1/six-pc-study-v3
 ```
 
 ## Verification

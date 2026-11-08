@@ -16,13 +16,24 @@ from pathlib import Path
 
 from phase1_study import arguments, api, case_id, idle_agreed, make_cases, preflight
 from study_agent import Agent, Handler, Server
-from study_metrics import analyze_requests, ci95, distribution
+from study_metrics import analyze_requests, ci95, distribution, resource_verdict, ALLOCATION_POLICY
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = Path(os.environ.get('RESCUEMESH_BIN_DIR', ROOT / 'target/release'))
 
 
 class Statistics(unittest.TestCase):
+    def test_resource_safety_is_not_implied_by_measurement_validity(self):
+        import copy
+        before = [{'node_id': i, 'protocol_version': 3, 'resource_overcommits': 0, 'replicate_conflicts': 0,
+            'allocation': {'policy': ALLOCATION_POLICY, 'members': [1,2,3], 'rejected_plans': 0,
+                           'capacity_violations': 0, 'responder_violations': 0}} for i in range(1,4)]
+        after = copy.deepcopy(before)
+        self.assertTrue(resource_verdict(before, after)['resource_correctness_pass'])
+        after[0]['resource_overcommits'] = 1
+        self.assertFalse(resource_verdict(before, after)['resource_correctness_pass'])
+        self.assertTrue(resource_verdict(before, after)['resource_correctness_known'])
+        self.assertFalse(resource_verdict(before, [None,None,None])['resource_correctness_known'])
     def test_sample_sd_and_independent_run_ci(self):
         self.assertAlmostEqual(distribution([2, 4, 4, 4, 5, 5, 7, 9])['sd_ms'], 2.138089935, places=8)
         self.assertIsNone(distribution([4])['sd_ms'])
@@ -117,6 +128,7 @@ class SixAgentRehearsal(unittest.TestCase):
                 self.assertEqual(len(results), 12)
                 self.assertEqual({r['mode'] for r in results}, {'on_demand', 'per_request'})
                 self.assertTrue(all(r['baseline_agreed'] and r['converged'] and r['intervention_valid'] for r in results), results)
+                self.assertTrue(all(r['resource_correctness_pass'] and r['correctness_pass'] and r['resource_overcommits'] == 0 and r['replicate_conflicts'] == 0 for r in results), results)
                 for result in results:
                     self.assertEqual(result['answered'], result['requests'], result)
                     self.assertIsNotNone(result['lat_sd_ms'])
@@ -132,7 +144,7 @@ class SixAgentRehearsal(unittest.TestCase):
                 multiple = out.with_name(out.name + '-multiple')
                 command = [sys.executable, str(ROOT / 'scripts/phase1_study.py'), 'run', '--lab', str(cfg),
                            '--out', str(multiple), '--allow-local', '--stage', 'normal', '--processes', '2',
-                           '--rates', '30', '--reps', '2', '--duration', '4', '--complexity', '1',
+                           '--rates', '30', '--reps', '2', '--duration', '4', '--complexity', '5',
                            '--at-seconds', '1', '--lead-seconds', '1', '--settle-seconds', '15']
                 with (log_path.with_name('six-pc-multiple.log')).open('w', encoding='utf-8') as log:
                     completed = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=180)
@@ -140,6 +152,7 @@ class SixAgentRehearsal(unittest.TestCase):
                 more = [json.loads(p.read_text()) for p in (multiple / 'cases').glob('*/result.json')]
                 self.assertEqual(len(more), 4)
                 self.assertTrue(all(r['measurement_valid'] and r['converged'] and r['requests'] == 720 and r['answered'] == 720 for r in more), more)
+                self.assertTrue(all(r['resource_correctness_pass'] and r['replicate_conflicts'] == 0 for r in more), more)
                 with (multiple / 'summary.csv').open(newline='', encoding='utf-8') as stream:
                     summary = list(csv.DictReader(stream))
                 self.assertTrue(all(r['goodput_rps_sd'] != '' and r['lat_p99_ms_ci95_half'] != '' for r in summary))

@@ -14,7 +14,9 @@ METRICS = ['success_pct', 'goodput_rps', 'throughput_rps', 'achieved_send_rps', 
            'election_mean_ms', 'max_service_gap_ms', 'first_survivor_reply_ms', 'recovery_ms', 'convergence_ms',
            'dispatch_lag_p95_ms', 'worker_queue_wait_mean_ms', 'node_sent_bytes', 'peer_queue_drops',
            'resource_overcommits', 'replicate_conflicts', 'queue_len_max', 'rss_bytes_max', 'cpu_load_max',
-           'repaired_results', 'dropped_control', 'dropped_replication', 'peer_replication_queued_max', 'sync_lag_max']
+           'repaired_results', 'dropped_control', 'dropped_replication', 'peer_replication_queued_max', 'sync_lag_max',
+           'shortfall_pct', 'resource_assignments', 'responder_assignments', 'plans_without_assignments',
+           'udp_datagrams_sent', 'udp_bytes_sent', 'udp_retransmissions', 'udp_delivery_timeouts']
 
 
 def summarize(results):
@@ -30,6 +32,10 @@ def summarize(results):
                'failed': sum(r['failed'] for r in runs), 'missing_records': sum(r['missing_records'] for r in runs),
                'generator_invalid_runs': sum(not r['load_generation_valid'] for r in runs),
                'intervention_invalid_runs': sum(not r['intervention_valid'] for r in runs)}
+        row['resource_pass_runs'] = sum(r.get('resource_correctness_pass') is True for r in runs)
+        row['resource_fail_runs'] = sum(r.get('resource_correctness_known') is True and not r.get('resource_correctness_pass')
+                                      or (r.get('resource_overcommits') or 0) > 0 or (r.get('replicate_conflicts') or 0) > 0 for r in runs)
+        row['resource_unknown_runs'] = len(runs) - row['resource_pass_runs'] - row['resource_fail_runs']
         for metric in METRICS:
             summary = ci95([r.get(metric) for r in runs])
             row.update({f'{metric}_{k}': v for k, v in summary.items()})
@@ -45,7 +51,7 @@ def paired(results):
         blocks[(row['stage'], row['scenario'], row['processes'], row['rate'], row['rep'])][row['mode']] = row
     groups = defaultdict(list)
     for key, modes in blocks.items():
-        if len(modes) != 2 or not all(r['measurement_valid'] for r in modes.values()):
+        if len(modes) != 2 or not all(r['measurement_valid'] and r.get('resource_correctness_pass') for r in modes.values()):
             continue
         for metric in METRICS:
             a, b = modes['on_demand'].get(metric), modes['per_request'].get(metric)
@@ -233,13 +239,15 @@ def generate(root):
                 ax.legend(fontsize=8, ncol=2)
             export(fig, f'{scenario}-{mode}-host-cpu')
     notes = [
+        'Protocol 3 uses fixed exclusive asset partitions in BOTH modes. This changes resource availability from protocol 2. It avoids distributed double booking without adding synchronous reservation RPCs; failed-node assets remain unavailable. Shortfalls are measured explicitly.',
+        'Measurement validity, resource correctness and result convergence are separate checks. Missing allocation diagnostics mean resource safety is unknown. Confirmed capacity/ownership violations stop the campaign after saving its result.',
         'Rates are per process; processes are per client PC. Total offered load = 3 × processes/PC × rate/process.',
         'Latency describes successful requests. Failed and missing requests remain in the availability denominator; failed elapsed times are recorded separately.',
         'lat_sd_ms is sample SD within a run (n−1). Summary SD/CI describe independent repetitions; p50/p95/p99 means are means of run percentiles, not pooled percentiles. Fewer than two observations/runs gives N/A for SD/CI.',
         'Percentiles use the nearest sorted index round((n−1)×p), matching the existing Rust client. CDF figures use histogram bins; exact run percentiles are in runs.csv.',
         'CI uses conservative two-sided Student-t 95% intervals. Shared machines/network still limit generalization beyond this experiment.',
         'A measurement-invalid run is retained and shown. Generator-invalid means missing scheduled sends, <95% dispatched within the workload window, or dispatch p95 >100 ms. Inspect achieved_send_rps before interpreting server capacity.',
-        'Paired differences use only measurement-valid pairs with the same condition, seed and repetition. Positive differences mean per_request minus on_demand.',
+        'Paired differences use only measurement-valid and resource-correct pairs with the same condition, seed and repetition. Positive differences mean per_request minus on_demand.',
         'Every independent run restarts all servers and requires an empty healthy baseline, then converged warm-up. Nonconvergent runs remain failures; the next run must establish a fresh baseline.',
         'Soak observations are continuous operation and are analyzed separately. A common sustainable normal point is required before soak execution.',
         'Election decisions/durations are summed across node decisions, not unique logical elections. Per-request elections do not change the persistent-server epoch.',
@@ -249,15 +257,16 @@ def generate(root):
         'Repair lag uses the latest peer revision observed, so zero known lag while disconnected does not prove convergence. Host network counters can include both virtual and physical interfaces.',
         'Server logging defaults to warn in both modes to avoid per-request election log I/O dominating the comparison. Node counters, full snapshots, warnings and raw samples are retained.',
     ]
-    headers = ['Stage / scenario', 'Mode', 'Processes/PC', 'Rate/process', 'Runs valid / total', 'Success %',
+    headers = ['Stage / scenario', 'Mode', 'Processes/PC', 'Rate/process', 'Runs valid / total', 'Resources pass / fail / unknown', 'Success %',
                'p50 / p95 / p99 ms', 'Mean within-run latency SD ms', 'Goodput mean ± SD', 'Converged']
     cells = [[f'{r["stage"]}/{r["scenario"]}', r['mode'], r['processes_per_pc'], f'{r["rate_per_process"]:g}',
-              f'{r["valid_runs"]}/{r["runs"]}', value(r['success_pct_mean']),
+              f'{r["valid_runs"]}/{r["runs"]}', f'{r["resource_pass_runs"]}/{r["resource_fail_runs"]}/{r["resource_unknown_runs"]}', value(r['success_pct_mean']),
               ' / '.join(value(r[f'lat_p{p}_ms_mean']) for p in [50, 95, 99]), value(r['lat_sd_ms_mean']),
               f'{value(r["goodput_rps_mean"])} ± {value(r["goodput_rps_sd"])}', f'{r["converged_runs"]}/{r["runs"]}'] for r in summary]
     document = '<!doctype html><html lang="en"><meta charset="utf-8"><title>Six-PC election comparison</title>'
     document += '<style>body{font:16px system-ui;margin:32px;color:#17212b}table{border-collapse:collapse;font-size:13px}th,td{padding:8px;border:1px solid #cbd5df}th{background:#edf4fa}.scroll{overflow:auto}img{max-width:100%;display:block;margin:24px 0}li{margin:10px 0}</style>'
-    document += f'<h1>RescueMesh · Six-PC election comparison</h1><p>{len(results)} completed runs; three server PCs and three client PCs. UDP Request–Reply, application protocol 2.</p>'
+    protocol = json.loads((root / 'experiment.json').read_text()).get('protocol_version', 'unknown') if (root / 'experiment.json').exists() else 'unknown'
+    document += f'<h1>RescueMesh · Six-PC election comparison</h1><p>{len(results)} completed runs; three server PCs and three client PCs. UDP Request–Reply, application protocol {protocol}.</p>'
     document += table(headers, cells) + '<h2>Interpretation and measurement definitions</h2><ul>' + ''.join(f'<li>{html.escape(n)}</li>' for n in notes) + '</ul>'
     diagnostic_headers = ['Scenario', 'Mode', 'Processes/PC', 'Rate', 'Generator-invalid runs', 'Invalid interventions',
                           'Mean peer drops', 'Mean overcommit detections', 'Mean resource conflicts', 'Missing rows']
@@ -266,6 +275,8 @@ def generate(root):
                     value(r['replicate_conflicts_mean']), r['missing_records']] for r in summary]
     document += '<h2>Validity and resource correctness diagnostics</h2>' + table(diagnostic_headers, diagnostics)
     document += '<p>Availability, state convergence and resource-allocation correctness are separate findings. Conflict/overcommit counters are per-node detections, not unique incidents.</p>'
+    document += '<h2>Reservation availability</h2>' + table(['Scenario', 'Mode', 'Processes/PC', 'Rate', 'Plans with shortfalls %', 'Resource assignments/run', 'Responder assignments/run'],
+        [[r['scenario'], r['mode'], r['processes_per_pc'], r['rate_per_process'], value(r['shortfall_pct_mean']), value(r['resource_assignments_mean']), value(r['responder_assignments_mean'])] for r in summary])
     document += '<p>Exact tables: <a href="runs.csv">runs.csv</a>, <a href="summary.csv">summary.csv</a>, <a href="paired-differences.csv">paired differences</a>, clients.csv, processes.csv, windows.csv. Raw compressed requests and logs are under cases/.</p>'
     document += ''.join(f'<a href="plots/{name}.pdf"><img src="plots/{name}.png" alt="{html.escape(name)}"></a>' for name in figures)
     (root / 'report.html').write_text(document + '</html>', encoding='utf-8')

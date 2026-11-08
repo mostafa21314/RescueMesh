@@ -233,6 +233,10 @@ async fn link_task(
         let mut envelopes = Vec::new();
         {
             let mut queue = lane.queue.lock().unwrap();
+            let can_batch = data
+                || queue
+                    .front()
+                    .is_some_and(|e| matches!(e.message, Message::ElectBid { .. }));
             let mut bytes = 0;
             while let Some(e) = queue.pop_front() {
                 if e.generation != control.generation.load(Ordering::SeqCst)
@@ -240,11 +244,16 @@ async fn link_task(
                 {
                     continue;
                 }
+                if !data && !envelopes.is_empty() && !matches!(e.message, Message::ElectBid { .. })
+                {
+                    queue.push_front(e);
+                    break;
+                }
                 bytes += serde_json::to_vec(&e.message)
                     .expect("serialize peer message")
                     .len();
                 envelopes.push(e);
-                if !data || envelopes.len() >= 64 || bytes >= 192 * 1024 {
+                if !can_batch || envelopes.len() >= 64 || bytes >= 192 * 1024 {
                     break;
                 }
             }
@@ -256,6 +265,10 @@ async fn link_task(
         lane.inflight.store(envelopes.len(), Ordering::Relaxed);
         let message = if data {
             batch(&envelopes)
+        } else if envelopes.len() > 1 {
+            Message::ElectBidBatch {
+                bids: envelopes.iter().map(|e| e.message.clone()).collect(),
+            }
         } else {
             envelopes[0].message.clone()
         };

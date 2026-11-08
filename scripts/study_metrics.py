@@ -6,6 +6,32 @@ import statistics
 import uuid
 from collections import Counter, defaultdict
 
+ALLOCATION_POLICY = 'exclusive_asset_partitions_v1'
+PROTOCOL_VERSION = 3
+
+
+def resource_verdict(before, after):
+    reasons = []
+    known = len(before) == len(after) == 3 and all(s and s.get('allocation') for s in before + after)
+    if not known:
+        return {'resource_correctness_known': False, 'resource_correctness_pass': False,
+                'resource_correctness_reasons': ['Missing allocation diagnostics; safety was not assessed']}
+    for b, a in zip(before, after):
+        for s in (b, a):
+            allocation = s['allocation']
+            if s.get('protocol_version') != PROTOCOL_VERSION or allocation['policy'] != ALLOCATION_POLICY:
+                reasons.append(f'node {s["node_id"]}: incompatible allocation protocol/policy')
+            if allocation.get('members') != [1, 2, 3]:
+                reasons.append(f'node {s["node_id"]}: inconsistent allocation membership')
+            for key in ('rejected_plans', 'capacity_violations', 'responder_violations'):
+                if allocation.get(key, 0):
+                    reasons.append(f'node {s["node_id"]}: {key}={allocation[key]}')
+        for key in ('resource_overcommits', 'replicate_conflicts'):
+            if a.get(key, 0) > b.get(key, 0):
+                reasons.append(f'node {a["node_id"]}: {key} increased')
+    return {'resource_correctness_known': True, 'resource_correctness_pass': not reasons,
+            'resource_correctness_reasons': sorted(set(reasons))}
+
 
 def quantile_sorted(values, p):
     return values[int((len(values) - 1) * p + .5)] if values else None
@@ -64,10 +90,13 @@ def analyze_requests(directory, case, parts, start_ms, event):
     retried = busy = observed = in_window = 0
     first_sends, ends, first_survivor, after_fault_success = [], [start_ms + case['duration'] * 1000], [], 0
     uuid_valid, launch_by_pc = True, defaultdict(list)
+    allocation_fields_present = True
+    assignment_totals = Counter()
     before = event.get('at_ms')
     after = event.get('ready_ms') if event.get('kind') == 'fault' else event.get('end_ms')
+    allocation_fields = ['allocation_policy', 'assignments', 'resource_assignments', 'responder_assignments', 'resource_shortfalls', 'responder_shortfalls']
     header = ['pc', 'process', 'client_id', 'seq', 'sent_at_ms', 'response_at_ms', 'latency_ms', 'served_by',
-              'epoch', 'degraded', 'attempts', 'busy_replies', 'answered', 'elapsed_ms', 'scheduled_at_ms', 'dispatch_lag_ms']
+              'epoch', 'degraded', 'attempts', 'busy_replies', 'answered', 'elapsed_ms', 'scheduled_at_ms', 'dispatch_lag_ms'] + allocation_fields
     with gzip.open(directory / 'requests.csv.gz', 'wt', newline='', encoding='utf-8') as merged:
         writer = csv.DictWriter(merged, fieldnames=header)
         writer.writeheader()
@@ -105,6 +134,13 @@ def analyze_requests(directory, case, parts, start_ms, event):
                     phase = 'whole' if before is None else 'before' if sent < before else 'during' if after is None or sent < after else 'after'
                     windows[phase]['requests'] += 1
                     if answered:
+                        policy_ok = row.get('allocation_policy') == ALLOCATION_POLICY and all(row.get(k, '') != '' for k in allocation_fields)
+                        allocation_fields_present &= policy_ok
+                        if policy_ok:
+                            for k in allocation_fields[1:]:
+                                assignment_totals[k] += int(row[k])
+                            assignment_totals['plans_with_shortfall'] += int(int(row['resource_shortfalls']) + int(row['responder_shortfalls']) > 0)
+                            assignment_totals['plans_without_assignments'] += int(row['assignments'] == '0')
                         latency = float(row['latency_ms'])
                         if not math.isfinite(latency) or latency < 0:
                             raise ValueError(f'Invalid latency in {path}')
@@ -166,6 +202,9 @@ def analyze_requests(directory, case, parts, start_ms, event):
               'first_survivor_reply_ms': min(first_survivor) - before if first_survivor else None}
     result['load_generation_valid'] = (observed == expected and in_window >= .95 * expected and
         result['dispatch_lag_p95_ms'] is not None and result['dispatch_lag_p95_ms'] <= 100)
+    result['allocation_fields_present'] = allocation_fields_present
+    result.update({k: assignment_totals[k] if allocation_fields_present else None for k in allocation_fields[1:] + ['plans_with_shortfall', 'plans_without_assignments']})
+    result['shortfall_pct'] = 100 * assignment_totals['plans_with_shortfall'] / answered if answered and allocation_fields_present else None
     write_rows(directory / 'windows.csv', [{'window': phase, **counts, **distribution(phases[phase])}
                                           for phase, counts in sorted(windows.items())])
     write_rows(directory / 'clients.csv', [{'pc': pc, 'requests': expected // 3,
@@ -204,6 +243,9 @@ def node_deltas(before, after, samples):
     result['worker_queue_wait_mean_ms'] = waits / started / 1000 if started else None
     result['worker_expired'] = sum(max(0, a.get('workers', {}).get('expired_before_start', 0) -
         b.get('workers', {}).get('expired_before_start', 0)) for b, a in zip(before, after) if b and a)
+    for key in ['datagrams_sent', 'bytes_sent', 'retransmissions', 'delivery_timeouts']:
+        result['udp_' + key] = sum(max(0, a.get('transport', {}).get(key, 0) - b.get('transport', {}).get(key, 0))
+                                  for b, a in zip(before, after) if b and a)
     for key in ['queue_len', 'peer_control_queued', 'peer_replication_queued', 'sync_lag', 'rss_bytes', 'cpu_load']:
         values = [s[key] for s in samples if s.get('reachable') and key in s]
         result[f'{key}_max'] = max(values) if values else None

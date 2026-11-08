@@ -1,0 +1,169 @@
+{
+  "at_ms": 1793820304246,
+  "agents": {
+    "127.0.0.1:65508": {
+      "api_version": 1,
+      "role": "server",
+      "ms": 1793820304165,
+      "source_id": "d1d8272d756dae5cb7442ab8a1f5687ec52876c21f50d8957a0b72b7d86b8bf4",
+      "os": "Windows-10-10.0.26200-SP0",
+      "cpu_model": "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+      "logical_cpus": 24,
+      "binary": {
+        "path": "E:\\RescueMesh\\target\\reliability-v2\\release\\cloud-node.exe",
+        "bytes": 67573241,
+        "sha256": "32a9514b8a41a2f9f62e372802d498fc3c329c80b448f27a23d54093c300974d"
+      },
+      "node_pid": null,
+      "metrics": {
+        "at_ms": 1793820304165,
+        "cpu_total": 21283329375000,
+        "cpu_idle": 20145299218750,
+        "memory_available_bytes": null,
+        "network_rx_bytes": null,
+        "network_tx_bytes": null
+      }
+    },
+    "127.0.0.1:65509": {
+      "api_version": 1,
+      "role": "server",
+      "ms": 1793820304165,
+      "source_id": "d1d8272d756dae5cb7442ab8a1f5687ec52876c21f50d8957a0b72b7d86b8bf4",
+      "os": "Windows-10-10.0.26200-SP0",
+      "cpu_model": "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+      "logical_cpus": 24,
+      "binary": {
+        "path": "E:\\RescueMesh\\target\\reliability-v2\\release\\cloud-node.exe",
+        "bytes": 67573241,
+        "sha256": "32a9514b8a41a2f9f62e372802d498fc3c329c80b448f27a23d54093c300974d"
+      },
+      "node_pid": null,
+      "metrics": {
+        "at_ms": 1793820304165,
+        "cpu_total": 21283329375000,
+        "cpu_idle": 20145299218750,
+        "memory_available_bytes": null,
+        "network_rx_bytes": null,
+        "network_tx_bytes": null
+      }
+    },
+    "127.0.0.1:65510": {
+      "api_version": 1,
+      "role": "server",
+      "ms": 1793820304165,
+      "source_id": "d1d8272d756dae5cb7442ab8a1f5687ec52876c21f50d8957a0b72b7d86b8bf4",
+      "os": "Windows-10-10.0.26200-SP0",
+      "cpu_model": "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+      "logical_cpus": 24,
+      "binary": {
+        "path": "E:\\RescueMesh\\target\\reliability-v2\\release\\cloud-node.exe",
+        "bytes": 67573241,
+        "sha256": "32a9514b8a41a2f9f62e372802d498fc3c329c80b448f27a23d54093c300974d"
+      },
+      "node_pid": null,
+      "metrics": {
+        "at_ms": 1793820304165,
+        "cpu_total": 21283329375000,
+        "cpu_idle": 20145299218750,
+        "memory_available_bytes": null,
+        "network_rx_bytes": null,
+        "network_tx_bytes": null
+      }
+    },
+    "127.0.0.1:65511": {
+      "api_version": 1,
+      "role": "client",
+      "ms": 1793820304165,
+      "source_id": "d1d8272d756dae5cb7442ab8a1f5687ec52876c21f50d8957a0b72b7d86b8bf4",
+      "os": "Windows-10-10.0.26200-SP0",
+      "cpu_model": "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+      "logical_cpus": 24,
+      "binary": {
+        "path": "E:\\RescueMesh\\target\\reliability-v2\\release\\client.exe",
+        "bytes": 49349850,
+        "sha256": "f6be36b40887d18a4441dd2d30926ecf6f23d0463523ff1ea4c41da9299b4ceb"
+      },
+      "node_pid": null,
+      "metrics": {
+        "at_ms": 1793820304165,
+        "cpu_total": 21283329375000,
+        "cpu_idle": 20145299218750,
+        "memory_available_bytes": null,
+        "network_rx_bytes": null,
+        "network_tx_bytes": null
+      }
+    },
+    "127.0.0.1:65512": {
+      "api_version": 1,
+      "role": "client",
+      "ms": 1793820304165,
+      "source_id": "d1d8272d756dae5cb7442ab8a1f5687ec52876c21f50d8957a0b72b7d86b8bf4",
+      "os": "Windows-10-10.0.26200-SP0",
+      "cpu_model": "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+      "logical_cpus": 24,
+      "binary": {
+        "path": "E:\\RescueMesh\\target\\reliability-v2\\release\\client.exe",
+        "bytes": 49349850,
+        "sha256": "f6be36b40887d18a4441dd2d30926ecf6f23d0463523ff1ea4c41da9299b4ceb"
+      },
+      "node_pid": null,
+      "metrics": {
+        "at_ms": 1793820304165,
+        "cpu_total": 21283329375000,
+        "cpu_idle": 20145299218750,
+        "memory_available_bytes": null,
+        "network_rx_bytes": null,
+        "network_tx_bytes": null
+      }
+    },
+    "127.0.0.1:65513": {
+      "api_version": 1,
+      "role": "client",
+      "ms": 1793820304165,
+      "source_id": "d1d8272d756dae5cb7442ab8a1f5687ec52876c21f50d8957a0b72b7d86b8bf4",
+      "os": "Windows-10-10.0.26200-SP0",
+      "cpu_model": "Intel64 Family 6 Model 151 Stepping 2, GenuineIntel",
+      "logical_cpus": 24,
+      "binary": {
+        "path": "E:\\RescueMesh\\target\\reliability-v2\\release\\client.exe",
+        "bytes": 49349850,
+        "sha256": "f6be36b40887d18a4441dd2d30926ecf6f23d0463523ff1ea4c41da9299b4ceb"
+      },
+      "node_pid": null,
+      "metrics": {
+        "at_ms": 1793820304165,
+        "cpu_total": 21283329375000,
+        "cpu_idle": 20145299218750,
+        "memory_available_bytes": null,
+        "network_rx_bytes": null,
+        "network_tx_bytes": null
+      }
+    }
+  },
+  "clocks": {
+    "127.0.0.1:65508": {
+      "offset_ms": -0.412841796875,
+      "uncertainty_ms": 0.499755859375
+    },
+    "127.0.0.1:65509": {
+      "offset_ms": -0.1435546875,
+      "uncertainty_ms": 0.0
+    },
+    "127.0.0.1:65510": {
+      "offset_ms": -0.41259765625,
+      "uncertainty_ms": 0.5
+    },
+    "127.0.0.1:65511": {
+      "offset_ms": -0.4130859375,
+      "uncertainty_ms": 0.5003662109375
+    },
+    "127.0.0.1:65512": {
+      "offset_ms": -0.033203125,
+      "uncertainty_ms": 0.8798828125
+    },
+    "127.0.0.1:65513": {
+      "offset_ms": -0.033203125,
+      "uncertainty_ms": 0.8798828125
+    }
+  }
+}

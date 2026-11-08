@@ -1,0 +1,12 @@
+{
+  "stage": "normal",
+  "scenario": "normal",
+  "processes": 2,
+  "rate": 30.0,
+  "duration": 4.0,
+  "rep": 1,
+  "mode": "per_request",
+  "seed": 3339646417705682,
+  "complexity": 5,
+  "id": "normal-normal-p2-r30-rep1-per_request"
+}

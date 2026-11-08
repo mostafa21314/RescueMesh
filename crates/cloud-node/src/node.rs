@@ -2,6 +2,7 @@
 //! every request, runs elections (see `election`), plans the requests it
 //! serves on the worker pool, replies, and replicates results to its peers.
 
+use crate::allocation::Allocator;
 use crate::campus::Campus;
 use crate::election::{self, Action, Bid, Core, Outcome, Record};
 use crate::ledger::Ledger;
@@ -98,6 +99,7 @@ struct Shared {
     stopped: AtomicBool,
     cfg: NodeConfig,
     ledger: Arc<Mutex<Ledger>>,
+    allocation: Arc<Mutex<Allocator>>,
     state: Mutex<State>,
     pool: Pool<Job>,
     load: Arc<LoadMonitor>,
@@ -183,6 +185,13 @@ pub async fn start_with_listener(
     let addr = listener.local_addr()?;
     let campus = Arc::new(Campus::generate(cfg.seed, cfg.campus));
     let ledger = Arc::new(Mutex::new(Ledger::new(&campus)));
+    let allocation = Arc::new(Mutex::new(Allocator::new(
+        &campus,
+        cfg.node_id,
+        std::iter::once(cfg.node_id)
+            .chain(cfg.peers.iter().map(|p| p.id))
+            .collect(),
+    )));
     let load = Arc::new(LoadMonitor::start(cfg.cpu_source));
     let stats = Stats::default();
     let (peers, mut tasks) = PeerLinks::spawn(&cfg.peers, stats.sent.clone());
@@ -190,7 +199,7 @@ pub async fn start_with_listener(
     let generation = Arc::new(AtomicU64::new(0));
 
     let pool = {
-        let (campus, ledger, load) = (campus.clone(), ledger.clone(), load.clone());
+        let (campus, allocation, load) = (campus.clone(), allocation.clone(), load.clone());
         let replans = stats.local_replans.clone();
         let generation = generation.clone();
         let expired = stats.expired_jobs.clone();
@@ -204,7 +213,7 @@ pub async fn start_with_listener(
                     expired.fetch_add(1, Ordering::Relaxed);
                     None
                 } else {
-                    plan_and_commit(&campus, &ledger, &replans, &job, &generation)
+                    plan_and_commit(&campus, &allocation, &replans, &job, &generation)
                 };
                 if plan.is_some() {
                     load.record_service(started.elapsed(), planner::expected_cost(job.complexity));
@@ -250,6 +259,7 @@ pub async fn start_with_listener(
         }),
         cfg,
         ledger,
+        allocation,
         pool,
         load,
         artificial_load: crate::load::LoadGenerator::default(),
@@ -559,15 +569,41 @@ async fn recover(shared: Arc<Shared>, cause: Cause) {
                 })
                 .collect();
             peer_versions.push((snap.peer, versions));
-            report.new_results += st.tables.merge_recovery(snap.records, now).stored;
+            let records = snap
+                .records
+                .into_iter()
+                .filter(|r| {
+                    let valid = r.result.as_ref().is_none_or(|result| {
+                        shared
+                            .allocation
+                            .lock()
+                            .unwrap()
+                            .validate(result.served_by, &result.plan)
+                    });
+                    if !valid {
+                        shared.allocation.lock().unwrap().reject();
+                    }
+                    valid
+                })
+                .collect();
+            report.new_results += st.tables.merge_recovery(records, now).stored;
         }
         report.new_results += st.recovery_inserted;
         st.recovery_inserted = 0;
         let mut ledger = Ledger::new(&shared.campus);
         for (id, result) in st.tables.iter_results() {
             ledger.apply(id, &result.plan, unix_ms());
+            shared.allocation.lock().unwrap().restore_known(
+                id,
+                result.served_by,
+                &result.plan,
+                unix_ms(),
+            );
         }
         *shared.ledger.lock().unwrap() = ledger;
+        if matches!(cause, Cause::Start) {
+            shared.allocation.lock().unwrap().cold_rejoin();
+        }
         st.core.recover_view(now, epoch, server);
         st.inflight.clear();
         st.phase = NodePhase::Ready;
@@ -727,36 +763,45 @@ fn serve_snapshot(shared: &Shared, node_id: NodeId, since_ms: Option<u64>, reply
 /// same responder.
 fn plan_and_commit(
     campus: &Campus,
-    ledger: &Mutex<Ledger>,
+    allocation: &Mutex<Allocator>,
     replans: &AtomicU64,
     job: &Job,
     generation: &AtomicU64,
 ) -> Option<Plan> {
     for _ in 0..OPTIMISTIC_PLANS {
         let now = unix_ms();
-        let snap = ledger.lock().unwrap().snapshot(now);
-        let plan = planner::plan(campus, &snap, &job.incident, job.complexity, now);
-        let mut l = ledger.lock().unwrap();
+        let snap = allocation.lock().unwrap().snapshot(now);
+        let mut plan = planner::plan(campus, &snap, &job.incident, job.complexity, now);
+        let mut l = allocation.lock().unwrap();
         if generation.load(Ordering::SeqCst) != job.generation {
             return None;
         }
-        if l.can_commit(job.request_id, &plan, now) {
-            l.apply(job.request_id, &plan, now);
+        let commit_at = unix_ms();
+        stamp_reservations(&mut plan, commit_at, job.incident.ttl_ms);
+        if l.reserve(job.request_id, &plan, commit_at) {
             return Some(plan);
         }
         replans.fetch_add(1, Ordering::Relaxed);
     }
     let now = unix_ms();
-    let mut l = ledger.lock().unwrap();
+    let mut l = allocation.lock().unwrap();
     if generation.load(Ordering::SeqCst) != job.generation {
         return None;
     }
-    let plan = planner::plan(campus, &l.snapshot(now), &job.incident, job.complexity, now);
+    let mut plan = planner::plan(campus, &l.snapshot(now), &job.incident, job.complexity, now);
     if generation.load(Ordering::SeqCst) != job.generation {
         return None;
     }
-    l.apply(job.request_id, &plan, now);
-    Some(plan)
+    let commit_at = unix_ms();
+    stamp_reservations(&mut plan, commit_at, job.incident.ttl_ms);
+    l.reserve(job.request_id, &plan, commit_at).then_some(plan)
+}
+
+fn stamp_reservations(plan: &mut Plan, now: u64, ttl: u64) {
+    for assignment in &mut plan.assignments {
+        assignment.created_at_ms = now;
+        assignment.expires_at_ms = now.saturating_add(ttl.min(MAX_ASSIGNMENT_LEASE_MS));
+    }
 }
 
 /// This node's load score, computed fresh.
@@ -1022,6 +1067,19 @@ fn handle(shared: &Arc<Shared>, msg: Message, reply: &Reply) {
                 },
             );
         }
+        Message::ElectBidBatch { bids } => {
+            if bids.len() > 64
+                || bids
+                    .iter()
+                    .any(|bid| !matches!(bid, Message::ElectBid { .. }))
+            {
+                return;
+            }
+            for bid in bids {
+                shared.stats.received.add("ElectBid", 0);
+                handle(shared, bid, reply);
+            }
+        }
         Message::ElectBid {
             target_epoch,
             node_id,
@@ -1126,7 +1184,7 @@ fn submit(shared: &Shared, st: &mut State, request_id: RequestId) -> bool {
     let now_ms = unix_ms();
     let priority = planner::priority(
         &shared.campus,
-        &shared.ledger.lock().unwrap().snapshot(now_ms),
+        &shared.allocation.lock().unwrap().snapshot(now_ms),
         &e.incident,
         now_ms,
     );
@@ -1360,6 +1418,12 @@ async fn completion_loop(shared: Arc<Shared>, mut done_rx: mpsc::UnboundedReceiv
                     let mut l = shared.ledger.lock().unwrap();
                     l.release(request_id, &old.plan, unix_ms());
                     l.apply(request_id, &response.plan, unix_ms());
+                } else {
+                    shared
+                        .ledger
+                        .lock()
+                        .unwrap()
+                        .apply(request_id, &response.plan, unix_ms());
                 }
                 if let Some(r) = st.reply_to.remove(&request_id) {
                     if !late {
@@ -1401,6 +1465,16 @@ fn on_replicate(
     }
     if origin != shared.cfg.node_id && !shared.cfg.peers.iter().any(|p| p.id == origin) {
         return false;
+    }
+    {
+        let mut allocation = shared.allocation.lock().unwrap();
+        if incident.incident_id != response.plan.incident_id
+            || !allocation.validate(origin, &response.plan)
+        {
+            allocation.reject();
+            tracing::warn!(%request_id, origin, "rejected plan outside its issuer's asset partition or lease bounds");
+            return false;
+        }
     }
     st.recovery_epoch = st.recovery_epoch.max(epoch);
     if st.phase == NodePhase::Ready {
@@ -1488,6 +1562,13 @@ fn status(shared: &Shared) -> NodeStatus {
     let (requests, results) = st.tables.len();
     let c = st.core.counters;
     NodeStatus {
+        allocation: Some(
+            shared
+                .allocation
+                .lock()
+                .unwrap()
+                .status(unix_ms(), &shared.ledger.lock().unwrap()),
+        ),
         server_unix_ms: unix_ms(),
         protocol_version: PROTOCOL_VERSION,
         configuration: Some(shared.cfg.clone()),

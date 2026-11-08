@@ -1,0 +1,49 @@
+{
+  "start_ms": 1793820295617,
+  "jobs": [
+    {
+      "pc": 1,
+      "address": "127.0.0.1:65511",
+      "job": "1bb04feadb8c40c8b212aac7853282f2",
+      "processes": 1
+    },
+    {
+      "pc": 2,
+      "address": "127.0.0.1:65512",
+      "job": "1ebba86345cc40d6b19ac5b33d198674",
+      "processes": 1
+    },
+    {
+      "pc": 3,
+      "address": "127.0.0.1:65513",
+      "job": "3f16966b9711458b966ac643db376dc9",
+      "processes": 1
+    }
+  ],
+  "clocks": {
+    "127.0.0.1:65508": {
+      "offset_ms": -0.710693359375,
+      "uncertainty_ms": 0.0
+    },
+    "127.0.0.1:65509": {
+      "offset_ms": -0.710693359375,
+      "uncertainty_ms": 0.0
+    },
+    "127.0.0.1:65510": {
+      "offset_ms": -0.710693359375,
+      "uncertainty_ms": 0.0
+    },
+    "127.0.0.1:65511": {
+      "offset_ms": -0.710693359375,
+      "uncertainty_ms": 0.0
+    },
+    "127.0.0.1:65512": {
+      "offset_ms": -0.710693359375,
+      "uncertainty_ms": 0.0
+    },
+    "127.0.0.1:65513": {
+      "offset_ms": -0.710693359375,
+      "uncertainty_ms": 0.0
+    }
+  }
+}

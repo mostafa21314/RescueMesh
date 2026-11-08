@@ -1,0 +1,3 @@
+case,mode,window,requests,answered,failed,n,mean_ms,sd_ms,p50_ms,p95_ms,p99_ms,max_ms
+normal-normal-p1-r30-rep1-on_demand,on_demand,whole,450,450,0,450,1.47006,0.38832641706628296,1.395,2.071,2.714,4.624
+normal-normal-p1-r30-rep1-per_request,per_request,whole,450,450,0,450,2.1250466666666665,1.2378818247600494,1.721,5.565,6.51,9.396

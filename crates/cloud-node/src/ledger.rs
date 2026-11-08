@@ -16,6 +16,7 @@ use std::collections::{HashMap, HashSet};
 pub struct Hold {
     pub request_id: RequestId,
     pub priority: u32,
+    pub created_at_ms: u64,
     pub expires_at_ms: u64,
 }
 
@@ -23,6 +24,7 @@ pub struct Hold {
 struct ResourceHold {
     request_id: RequestId,
     quantity: u32,
+    created_at_ms: u64,
     expires_at_ms: u64,
 }
 
@@ -31,6 +33,8 @@ struct ResourceHold {
 pub struct Snapshot {
     pub busy: HashSet<ResponderId>,
     pub remaining: HashMap<ResourceId, u32>,
+    /// Restricted candidate set for the local node's exclusive asset partition.
+    pub eligible_responders: Option<HashSet<ResponderId>>,
 }
 
 /// A responder claimed by two requests; `kept` holds it, `dropped` lost it.
@@ -80,7 +84,11 @@ impl Ledger {
         let busy = self
             .claims
             .iter()
-            .filter(|(_, claims)| claims.values().any(|h| h.expires_at_ms > now_ms))
+            .filter(|(_, claims)| {
+                claims
+                    .values()
+                    .any(|h| h.created_at_ms <= now_ms && h.expires_at_ms > now_ms)
+            })
             .map(|(id, _)| *id)
             .collect();
         let remaining = self
@@ -88,13 +96,17 @@ impl Ledger {
             .iter()
             .map(|(id, cap)| (*id, cap.saturating_sub(self.used(*id, now_ms))))
             .collect();
-        Snapshot { busy, remaining }
+        Snapshot {
+            busy,
+            remaining,
+            eligible_responders: None,
+        }
     }
 
     fn used(&self, id: ResourceId, now_ms: u64) -> u32 {
         self.resources.get(&id).map_or(0, |hs| {
             hs.iter()
-                .filter(|h| h.expires_at_ms > now_ms)
+                .filter(|h| h.created_at_ms <= now_ms && h.expires_at_ms > now_ms)
                 .map(|h| h.quantity)
                 .sum()
         })
@@ -103,23 +115,48 @@ impl Ledger {
     /// True if every responder and resource unit in `plan` is still free (or
     /// already held by this same request).
     pub fn can_commit(&self, request_id: RequestId, plan: &Plan, now_ms: u64) -> bool {
-        plan.assignments.iter().all(|a| match a.assignee {
-            Assignee::Responder { responder_id, .. } => match self.winner(responder_id, now_ms) {
-                Some(h) => h.expires_at_ms <= now_ms || h.request_id == request_id,
-                None => true,
-            },
+        let mut responders = HashSet::new();
+        let mut resources = HashSet::new();
+        if plan.assignments.iter().any(|a| match a.assignee {
+            Assignee::Responder { responder_id, .. } => !responders.insert(responder_id),
             Assignee::Resource {
                 resource_id,
                 quantity,
                 ..
-            } => {
-                let held = self
-                    .resources
-                    .get(&resource_id)
-                    .is_some_and(|hs| hs.iter().any(|h| h.request_id == request_id));
-                held || self.capacity.get(&resource_id).copied().unwrap_or(0)
-                    >= self.used(resource_id, now_ms) + quantity
-            }
+            } => quantity == 0 || !resources.insert(resource_id),
+        }) {
+            return false;
+        }
+        plan.assignments.iter().all(|a| {
+            a.expires_at_ms <= now_ms
+                || match a.assignee {
+                    Assignee::Responder { responder_id, .. } => {
+                        self.claims.get(&responder_id).is_none_or(|claims| {
+                            claims.values().all(|h| {
+                                h.request_id == request_id
+                                    || !overlap(
+                                        h.created_at_ms,
+                                        h.expires_at_ms,
+                                        a.created_at_ms.max(now_ms),
+                                        a.expires_at_ms,
+                                    )
+                            })
+                        })
+                    }
+                    Assignee::Resource {
+                        resource_id,
+                        quantity,
+                        ..
+                    } => {
+                        self.capacity.get(&resource_id).copied().unwrap_or(0) as u64
+                            >= self.resource_peak_until(
+                                resource_id,
+                                Some(request_id),
+                                a.created_at_ms.max(now_ms),
+                                a.expires_at_ms,
+                            ) + quantity as u64
+                    }
+                }
         })
     }
 
@@ -132,12 +169,38 @@ impl Ledger {
             }
             match a.assignee {
                 Assignee::Responder { responder_id, .. } => {
-                    let new = Hold {
+                    let mut new = Hold {
                         request_id,
                         priority: plan.priority,
+                        created_at_ms: a.created_at_ms,
                         expires_at_ms: a.expires_at_ms,
                     };
-                    let old = self.winner(responder_id, now_ms).cloned();
+                    let old = self
+                        .claims
+                        .get(&responder_id)
+                        .and_then(|claims| {
+                            claims
+                                .values()
+                                .filter(|h| {
+                                    h.request_id != request_id
+                                        && overlap(
+                                            h.created_at_ms,
+                                            h.expires_at_ms,
+                                            new.created_at_ms,
+                                            new.expires_at_ms,
+                                        )
+                                })
+                                .max_by_key(|h| (h.priority, std::cmp::Reverse(h.request_id)))
+                        })
+                        .cloned();
+                    if let Some(existing) = self
+                        .claims
+                        .get(&responder_id)
+                        .and_then(|claims| claims.get(&request_id))
+                    {
+                        new.created_at_ms = new.created_at_ms.min(existing.created_at_ms);
+                        new.expires_at_ms = new.expires_at_ms.max(existing.expires_at_ms);
+                    }
                     self.claims
                         .entry(responder_id)
                         .or_default()
@@ -163,19 +226,28 @@ impl Ledger {
                     quantity,
                     ..
                 } => {
-                    let used = self.used(resource_id, now_ms);
+                    let used = self.resource_peak_until(
+                        resource_id,
+                        Some(request_id),
+                        a.created_at_ms,
+                        a.expires_at_ms,
+                    );
                     let cap = self.capacity.get(&resource_id).copied().unwrap_or(0);
                     let holds = self.resources.entry(resource_id).or_default();
                     holds.retain(|h| h.expires_at_ms > now_ms);
-                    if holds.iter().any(|h| h.request_id == request_id) {
+                    if let Some(held) = holds.iter_mut().find(|h| h.request_id == request_id) {
+                        held.quantity = held.quantity.max(quantity);
+                        held.created_at_ms = held.created_at_ms.min(a.created_at_ms);
+                        held.expires_at_ms = held.expires_at_ms.max(a.expires_at_ms);
                         continue;
                     }
-                    if used + quantity > cap {
+                    if used + quantity as u64 > cap as u64 {
                         out.resource_overcommits += 1;
                     }
                     holds.push(ResourceHold {
                         request_id,
                         quantity,
+                        created_at_ms: a.created_at_ms,
                         expires_at_ms: a.expires_at_ms,
                     });
                 }
@@ -208,11 +280,56 @@ impl Ledger {
         self.responders.get(&responder_id)
     }
 
+    /// Reservation interval audit; replica receipt time cannot create a false
+    /// overlap when one issuer's adjacent leases arrive at a slower clock.
+    pub fn resource_peak(&self, id: ResourceId, exclude: Option<RequestId>, from: u64) -> u64 {
+        self.resource_peak_until(id, exclude, from, u64::MAX)
+    }
+
+    fn resource_peak_until(
+        &self,
+        id: ResourceId,
+        exclude: Option<RequestId>,
+        from: u64,
+        until: u64,
+    ) -> u64 {
+        peak(
+            self.resources
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .filter(|h| Some(h.request_id) != exclude)
+                .map(|h| (h.created_at_ms, h.expires_at_ms.min(until), h.quantity)),
+            from,
+        )
+    }
+
+    pub fn violations(&self, from: u64) -> (u64, u64) {
+        let resources = self
+            .capacity
+            .iter()
+            .filter(|(id, cap)| self.resource_peak(**id, None, from) > **cap as u64)
+            .count() as u64;
+        let responders = self
+            .claims
+            .values()
+            .filter(|claims| {
+                peak(
+                    claims
+                        .values()
+                        .map(|h| (h.created_at_ms, h.expires_at_ms, 1)),
+                    from,
+                ) > 1
+            })
+            .count() as u64;
+        (resources, responders)
+    }
+
     fn winner(&self, responder: ResponderId, now_ms: u64) -> Option<&Hold> {
         self.claims
             .get(&responder)?
             .values()
-            .filter(|h| h.expires_at_ms > now_ms)
+            .filter(|h| h.created_at_ms <= now_ms && h.expires_at_ms > now_ms)
             .max_by_key(|h| (h.priority, std::cmp::Reverse(h.request_id)))
     }
 
@@ -229,6 +346,28 @@ impl Ledger {
             }
         }
     }
+}
+
+fn overlap(a: u64, b: u64, c: u64, d: u64) -> bool {
+    a < d && c < b
+}
+
+fn peak(spans: impl Iterator<Item = (u64, u64, u32)>, from: u64) -> u64 {
+    let mut events = Vec::new();
+    for (start, end, quantity) in spans {
+        let start = start.max(from);
+        if start < end {
+            events.push((start, quantity as i64));
+            events.push((end, -(quantity as i64)));
+        }
+    }
+    events.sort_unstable(); // Expirations precede starts at an equal timestamp.
+    let (mut used, mut maximum) = (0i64, 0i64);
+    for (_, delta) in events {
+        used += delta;
+        maximum = maximum.max(used);
+    }
+    maximum as u64
 }
 
 #[cfg(test)]

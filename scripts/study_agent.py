@@ -86,7 +86,7 @@ class Agent:
             raise ValueError(f'{binary} missing; run cargo build --release')
         if role == 'client':
             help_text = subprocess.check_output([str(binary), '--help'], text=True, encoding='utf-8')
-            if '--start-at-ms' not in help_text:
+            if '--start-at-ms' not in help_text or '--require-protocol-version' not in help_text:
                 raise ValueError('Client binary is outdated; rebuild before starting the agent')
         self.binary_metadata = {'path': str(binary), 'bytes': binary.stat().st_size,
                                 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest()}
@@ -164,6 +164,7 @@ class Agent:
                         proc = self.spawn([str(self.bin / f'client{EXE}'), '--config', str(cfg), '--count', str(count),
                             '--rate', str(rate), '--complexity', str(complexity), '--seed', str(int(req['seed']) + i),
                             '--reporter', f"study-pc{req.get('pc', 1)}-process{i}", '--start-at-ms', str(start),
+                            '--require-protocol-version', '3',
                             '--out', str(out)], stream,
                             env={**os.environ, 'RUST_LOG': 'warn', 'TOKIO_WORKER_THREADS': '2'})
                     parts.append({'proc': proc, 'csv': out, 'log': log})

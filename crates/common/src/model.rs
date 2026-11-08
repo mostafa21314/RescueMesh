@@ -14,6 +14,10 @@ pub type ZoneId = u32;
 pub type ResponderId = u32;
 pub type ResourceId = u32;
 
+/// Maximum reservation lifetime, including after an issuing process restarts.
+pub const MAX_ASSIGNMENT_LEASE_MS: u64 = 30_000;
+pub const ALLOCATION_POLICY: &str = "exclusive_asset_partitions_v1";
+
 /// Identifies one logical client request. Retries reuse it; only the attempt
 /// number changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

@@ -56,6 +56,11 @@ pub fn priority(campus: &Campus, snap: &Snapshot, incident: &Incident, now_ms: u
     let capable: Vec<_> = campus
         .responders
         .iter()
+        .filter(|r| {
+            snap.eligible_responders
+                .as_ref()
+                .is_none_or(|ids| ids.contains(&r.id))
+        })
         .filter(|r| r.capabilities.iter().any(|c| caps.contains(c)))
         .collect();
     let busy_share = if capable.is_empty() {
@@ -129,7 +134,7 @@ pub fn plan(
     let roles = roles_for(incident);
     let scenarios = complexity.clamp(1, MAX_COMPLEXITY);
     let created = now_ms;
-    let expires = now_ms + incident.ttl_ms;
+    let expires = now_ms.saturating_add(incident.ttl_ms.min(MAX_ASSIGNMENT_LEASE_MS));
 
     // Dijkstra once per distinct responder zone: responders in the same zone
     // share an ETA.

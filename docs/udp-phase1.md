@@ -1,6 +1,7 @@
 # Phase 1: Windows/Linux roles, UDP Request–Reply and reliability experiments
 
-The current implementation uses application protocol 2. Read
+The current implementation uses application protocol 3. Read
+[the allocation safety update](allocation-v3.md) and
 [the reliability and scheduling update](reliability-v2.md) before upgrading the
 three-server setup; it includes the new baseline checks and decay scheduler.
 The historical UDP measurements at the end of this guide predate that update.

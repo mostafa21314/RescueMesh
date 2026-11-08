@@ -56,8 +56,8 @@ class Interoperability(unittest.TestCase):
                                    check=True, timeout=20, stdout=subprocess.DEVNULL)
                     status = call(addrs[0], {'type': 'StatusRequest'}, 3)
                     self.assertEqual(status['type'], 'Status')
-                    self.assertEqual(status['protocol_version'], 2)
-                    self.assertIn('protocol_version=2', (directory / 'node1.log').read_text(encoding='utf-8'))
+                    self.assertEqual(status['protocol_version'], 3)
+                    self.assertIn('protocol_version=3', (directory / 'node1.log').read_text(encoding='utf-8'))
                     self.assertEqual(call(addrs[0], {'type': 'SetLoad', 'threads': 1,
                                                    'duration_ms': 100}, 3)['type'], 'LoadAccepted')
                     self.assertEqual(call(addrs[0], {'type': 'SetLoad', 'threads': 0,

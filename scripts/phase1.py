@@ -114,7 +114,7 @@ def test(args):
     args.out.mkdir(parents=True, exist_ok=True)
     config = args.config_dir / 'client.toml'
     metadata = {**vars(args), 'os': platform.platform(), 'cpu': platform.processor(),
-                'logical_cpus': os.cpu_count(), 'transport': 'UDP-RR RMR1', 'protocol_version': 2,
+                'logical_cpus': os.cpu_count(), 'transport': 'UDP-RR RMR1', 'protocol_version': 3,
                 'clients': clients, 'rate_per_client': rate, 'complexity': complexity,
                 'started_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
                 'isolated_runs': args.local}

@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
-    destination = ROOT / 'dist/six-pc-study-source.zip'
+    destination = ROOT / 'dist/six-pc-study-v3-source.zip'
     destination.parent.mkdir(exist_ok=True)
     files = [ROOT / name for name in ['Cargo.toml', 'Cargo.lock', 'README.md', 'LICENSE', '.gitignore', '.gitattributes']]
     for directory, extensions in {'crates': {'.rs', '.toml'}, 'scripts': {'.py', '.sh', '.ps1', '.txt'},
@@ -26,7 +26,7 @@ def main():
             entry.compress_type = zipfile.ZIP_DEFLATED
             entry.external_attr = (0o100755 if path.suffix == '.sh' else 0o100644) << 16
             archive.writestr(entry, content)
-        archive.writestr('RescueMesh-six-pc-study/START-HERE.txt', '''Six-PC study: read docs/six-pc-study.md.
+        archive.writestr('RescueMesh-six-pc-study/START-HERE.txt', '''Protocol 3 update: read docs/allocation-v3.md and docs/six-pc-study.md.
 
 Copy this same source to ALL SIX PCs and run cargo build --release on each.
 Stop old manual servers. Python 3.11+ is required.
@@ -35,6 +35,8 @@ Start study_agent.py --role server/client --bind THIS_PC_IP on each PC.
 All agents and controller need the same RESCUEMESH_LAB_TOKEN environment value.
 The coordinator starts/restarts servers automatically; do not separately start them.
 Run the smoke profile before the long study. Exact commands are in the guide.
+Use NEW output directories (e.g. six-pc-smoke-v3). Old studies cannot be resumed across versions.
+Resource availability is partitioned; shortfalls are reported and correctness failures stop the study.
 The bundle contains source, not Linux/Windows executables or old results.
 ''')
     with zipfile.ZipFile(destination) as archive:

@@ -1,5 +1,9 @@
 # RescueMesh — Phase 1
 
+**Protocol 3 allocation update:** [exclusive reservations and correctness
+gating](docs/allocation-v3.md) fix cross-node resource double booking. Rebuild
+all six PCs and rerun smoke/pilot tests in new result directories.
+
 CSCE 4411 Distributed Systems term project (Group 7), in Rust.
 
 **Current transport: UDP Request–Reply.** Any Windows/Linux PC can be a server,

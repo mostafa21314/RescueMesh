@@ -1,0 +1,98 @@
+[
+  {
+    "stage": "resilience",
+    "scenario": "fault5",
+    "processes": 1,
+    "rate": 30.0,
+    "duration": 9,
+    "rep": 1,
+    "mode": "on_demand",
+    "seed": 3024826796098850,
+    "complexity": 1,
+    "id": "resilience-fault5-p1-r30-rep1-on_demand"
+  },
+  {
+    "stage": "resilience",
+    "scenario": "fault5",
+    "processes": 1,
+    "rate": 30.0,
+    "duration": 9,
+    "rep": 1,
+    "mode": "per_request",
+    "seed": 3024826796098850,
+    "complexity": 1,
+    "id": "resilience-fault5-p1-r30-rep1-per_request"
+  },
+  {
+    "stage": "resilience",
+    "scenario": "fault20",
+    "processes": 1,
+    "rate": 30.0,
+    "duration": 24,
+    "rep": 1,
+    "mode": "per_request",
+    "seed": 2696790436754833,
+    "complexity": 1,
+    "id": "resilience-fault20-p1-r30-rep1-per_request"
+  },
+  {
+    "stage": "resilience",
+    "scenario": "fault20",
+    "processes": 1,
+    "rate": 30.0,
+    "duration": 24,
+    "rep": 1,
+    "mode": "on_demand",
+    "seed": 2696790436754833,
+    "complexity": 1,
+    "id": "resilience-fault20-p1-r30-rep1-on_demand"
+  },
+  {
+    "stage": "resilience",
+    "scenario": "load_idle",
+    "processes": 1,
+    "rate": 30.0,
+    "duration": 5,
+    "rep": 1,
+    "mode": "on_demand",
+    "seed": 86275623659755,
+    "complexity": 1,
+    "id": "resilience-load_idle-p1-r30-rep1-on_demand"
+  },
+  {
+    "stage": "resilience",
+    "scenario": "load_idle",
+    "processes": 1,
+    "rate": 30.0,
+    "duration": 5,
+    "rep": 1,
+    "mode": "per_request",
+    "seed": 86275623659755,
+    "complexity": 1,
+    "id": "resilience-load_idle-p1-r30-rep1-per_request"
+  },
+  {
+    "stage": "resilience",
+    "scenario": "load_busy",
+    "processes": 1,
+    "rate": 30.0,
+    "duration": 5,
+    "rep": 1,
+    "mode": "on_demand",
+    "seed": 1677028291863005,
+    "complexity": 1,
+    "id": "resilience-load_busy-p1-r30-rep1-on_demand"
+  },
+  {
+    "stage": "resilience",
+    "scenario": "load_busy",
+    "processes": 1,
+    "rate": 30.0,
+    "duration": 5,
+    "rep": 1,
+    "mode": "per_request",
+    "seed": 1677028291863005,
+    "complexity": 1,
+    "id": "resilience-load_busy-p1-r30-rep1-per_request"
+  }
+]

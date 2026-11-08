@@ -1,0 +1,55 @@
+{
+  "campaign": "3174b12505304d36aafc391bb09d2e04",
+  "source_id": "6a5ce20d1e2e1019ce1b9638cd4d1d56a5357e5a1ac464aa693966c36b3d4afd",
+  "settings": {
+    "profile": "standard",
+    "rates": [
+      30.0
+    ],
+    "processes": [
+      2
+    ],
+    "reps": 2,
+    "duration": 4.0,
+    "complexity": 5,
+    "workers": 3,
+    "queue_capacity": 64,
+    "seed": 42,
+    "at_seconds": 1.0,
+    "load_seconds": 25,
+    "load_fraction": 0.5,
+    "soak_seconds": 1800,
+    "node_log_level": "warn",
+    "settle_seconds": 15.0,
+    "sample_ms": 500,
+    "lead_seconds": 1.0,
+    "points": null
+  },
+  "lab": {
+    "nodes": [
+      {
+        "host": "127.0.0.1",
+        "port": 55416,
+        "agent": "127.0.0.1:56423"
+      },
+      {
+        "host": "127.0.0.1",
+        "port": 55417,
+        "agent": "127.0.0.1:56424"
+      },
+      {
+        "host": "127.0.0.1",
+        "port": 55418,
+        "agent": "127.0.0.1:56425"
+      }
+    ],
+    "clients": [
+      "127.0.0.1:56426",
+      "127.0.0.1:56427",
+      "127.0.0.1:56428"
+    ]
+  },
+  "created_ms": 1793820051164,
+  "protocol_version": 3,
+  "allocation_policy": "exclusive_asset_partitions_v1"
+}

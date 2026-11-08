@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 /// RescueMesh client: submits synthetic incidents to every cloud node.
 #[derive(Parser)]
 struct Args {
+    /// Refuse to run a client binary from a different application protocol.
+    #[arg(long, default_value_t = common::PROTOCOL_VERSION)]
+    require_protocol_version: u32,
     /// Client config, e.g. config/client.toml or config/local/client.toml.
     #[arg(long)]
     config: PathBuf,
@@ -61,6 +64,12 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    anyhow::ensure!(
+        args.require_protocol_version == common::PROTOCOL_VERSION,
+        "client protocol {} does not satisfy required protocol {}",
+        common::PROTOCOL_VERSION,
+        args.require_protocol_version
+    );
     anyhow::ensure!(
         args.rate.is_finite() && args.rate >= 0.0,
         "rate must be finite and nonnegative"
@@ -137,12 +146,12 @@ async fn main() -> anyhow::Result<()> {
 
 fn write_csv(path: &PathBuf, outcomes: &[(Outcome, u64, f64)]) -> anyhow::Result<()> {
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
-    writeln!(f, "client_id,seq,sent_at_ms,response_at_ms,latency_ms,served_by,epoch,degraded,attempts,busy_replies,answered,elapsed_ms,scheduled_at_ms,dispatch_lag_ms")?;
+    writeln!(f, "client_id,seq,sent_at_ms,response_at_ms,latency_ms,served_by,epoch,degraded,attempts,busy_replies,answered,elapsed_ms,scheduled_at_ms,dispatch_lag_ms,allocation_policy,assignments,resource_assignments,responder_assignments,resource_shortfalls,responder_shortfalls")?;
     for (o, scheduled_at_ms, dispatch_lag_ms) in outcomes {
         let opt = |v: Option<u64>| v.map(|x| x.to_string()).unwrap_or_default();
         writeln!(
             f,
-            "{},{},{},{},{},{},{},{},{},{},{},{:.3},{},{:.3}",
+            "{},{},{},{},{},{},{},{},{},{},{},{:.3},{},{:.3},{},{},{},{},{},{}",
             o.request_id.client_id,
             o.request_id.seq,
             o.sent_at_ms,
@@ -158,7 +167,29 @@ fn write_csv(path: &PathBuf, outcomes: &[(Outcome, u64, f64)]) -> anyhow::Result
             o.answered(),
             o.elapsed.as_secs_f64() * 1000.0,
             scheduled_at_ms,
-            dispatch_lag_ms
+            dispatch_lag_ms,
+            common::ALLOCATION_POLICY,
+            o.plan.as_ref().map_or(0, |p| p.assignments.len()),
+            o.plan.as_ref().map_or(0, |p| p
+                .assignments
+                .iter()
+                .filter(|a| matches!(a.assignee, common::Assignee::Resource { .. }))
+                .count()),
+            o.plan.as_ref().map_or(0, |p| p
+                .assignments
+                .iter()
+                .filter(|a| matches!(a.assignee, common::Assignee::Responder { .. }))
+                .count()),
+            o.plan.as_ref().map_or(0, |p| p
+                .shortfall
+                .iter()
+                .filter(|s| matches!(s, common::Shortfall::Resource { .. }))
+                .count()),
+            o.plan.as_ref().map_or(0, |p| p
+                .shortfall
+                .iter()
+                .filter(|s| matches!(s, common::Shortfall::Responder { .. }))
+                .count())
         )?;
     }
     Ok(())

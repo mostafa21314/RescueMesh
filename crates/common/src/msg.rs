@@ -7,7 +7,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocationStatus {
+    pub policy: String,
+    pub members: Vec<NodeId>,
+    pub rejected_plans: u64,
+    pub capacity_violations: u64,
+    pub responder_violations: u64,
+    pub quarantine_remaining_ms: u64,
+    pub owned_responders: usize,
+    pub owned_resource_offers: usize,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -165,6 +177,10 @@ pub enum Message {
     ReplicateBatch {
         records: Vec<RecoveryRecord>,
     },
+    /// At most 64 ElectBid messages, and no nested/control operations.
+    ElectBidBatch {
+        bids: Vec<Message>,
+    },
     /// Incremental anti-entropy. A different incarnation restarts the cursor.
     SyncRequest {
         node_id: NodeId,
@@ -282,6 +298,7 @@ impl Message {
             Message::ResultsDigest(_) => "ResultsDigest",
             Message::Busy { .. } => "Busy",
             Message::ElectBid { .. } => "ElectBid",
+            Message::ElectBidBatch { .. } => "ElectBidBatch",
             Message::StatusRequest => "StatusRequest",
             Message::Status(_) => "Status",
             Message::ProbeRequest => "ProbeRequest",
@@ -302,6 +319,8 @@ impl Message {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeStatus {
+    #[serde(default)]
+    pub allocation: Option<AllocationStatus>,
     #[serde(default)]
     pub server_unix_ms: u64,
     #[serde(default)]
@@ -417,6 +436,7 @@ mod tests {
     #[test]
     fn status_round_trips_through_json() {
         let st = NodeStatus {
+            allocation: None,
             server_unix_ms: 0,
             protocol_version: PROTOCOL_VERSION,
             configuration: None,
