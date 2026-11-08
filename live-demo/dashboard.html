@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RescueMesh Live Lab</title>
+<style>
+:root{--bg:#f1f4f7;--surface:#fff;--sunken:#e8edf2;--ink:#0f2130;--muted:#5b6b78;--line:#d5dee6;
+--n1:#6250d6;--n2:#e0658f;--n3:#1a9e8f;--bad:#d03b3b;--warn:#c98a00;--good:#0c8a0c;
+--body:"Barlow",system-ui,-apple-system,"Segoe UI",Ubuntu,sans-serif;--mono:"IBM Plex Mono",ui-monospace,"DejaVu Sans Mono",monospace}
+@media (prefers-color-scheme:dark){:root{--bg:#0c141b;--surface:#131e27;--sunken:#0f1820;--ink:#e7eff5;--muted:#91a2b0;--line:#26343f;--n1:#9085e9;--n2:#e3779d;--n3:#3cc2b2}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.4 var(--body)}
+header{display:flex;flex-wrap:wrap;gap:12px 24px;align-items:center;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--surface)}
+h1{font-size:19px;margin:0;font-weight:700;letter-spacing:.2px}
+h1 small{font-weight:400;color:var(--muted);font-size:14px}
+.pill{display:inline-block;padding:2px 9px;border-radius:99px;font:600 12px var(--mono);background:var(--sunken);color:var(--muted)}
+.pill.good{background:color-mix(in srgb,var(--good) 16%,transparent);color:var(--good)}
+.pill.bad{background:color-mix(in srgb,var(--bad) 16%,transparent);color:var(--bad)}
+.pill.warn{background:color-mix(in srgb,var(--warn) 18%,transparent);color:var(--warn)}
+.pill.server{background:var(--ink);color:var(--surface)}
+main{padding:16px 20px;max-width:1400px;margin:0 auto}
+.bar{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;margin-bottom:14px}
+.bar label{font-size:13px;color:var(--muted)}
+input,select,button{font:inherit;font-size:14px;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:5px 9px}
+input[type=number]{width:80px}
+button{cursor:pointer;font-weight:600}
+button:hover{border-color:var(--ink)}
+button.primary{background:var(--ink);color:var(--surface);border-color:var(--ink)}
+button.danger{color:var(--bad)}
+button:disabled{opacity:.45;cursor:default}
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:12px}
+@media (max-width:900px){.grid{grid-template-columns:1fr}}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:12px 14px;border-top:4px solid var(--line)}
+.card.off{opacity:.6}
+.card h2{margin:0 0 6px;font-size:16px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+.card h2 span.ip{font:12px var(--mono);color:var(--muted);font-weight:400}
+.kv{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin:8px 0}
+.kv div{background:var(--sunken);border-radius:6px;padding:4px 7px}
+.kv b{display:block;font:600 16px var(--mono)}
+.kv i{font-style:normal;font-size:11px;color:var(--muted)}
+.btns{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.btns button{font-size:13px;padding:4px 8px}
+.err{color:var(--bad);font:12px var(--mono);margin-top:6px;word-break:break-word}
+.share{display:flex;height:10px;border-radius:5px;overflow:hidden;background:var(--sunken);margin:6px 0 2px}
+.legend{font:12px var(--mono);color:var(--muted)}
+.row2{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,1fr);gap:12px}
+@media (max-width:900px){.row2{grid-template-columns:1fr}}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.panel h3{margin:0 0 8px;font-size:14px;color:var(--muted);font-weight:600}
+svg{width:100%;height:150px;display:block}
+#log{font:12px/1.5 var(--mono);height:330px;overflow:auto;white-space:pre-wrap;word-break:break-word}
+#log .n1{color:var(--n1)}#log .n2{color:var(--n2)}#log .n3{color:var(--n3)}
+#toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);background:var(--ink);color:var(--surface);padding:8px 14px;border-radius:8px;font-size:14px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:90vw}
+#toast.on{opacity:1}
+</style>
+</head>
+<body>
+<header>
+  <h1>RescueMesh <small>live on six PCs</small></h1>
+  <span id="summary" class="pill">connecting…</span>
+  <span id="conv" class="pill">tables …</span>
+  <span id="from" class="legend"></span>
+</header>
+<main>
+  <div class="bar">
+    <label>Election mode <select id="mode"><option value="on_demand">on_demand</option><option value="per_request">per_request</option></select></label>
+    <button id="restartAll" title="Restart nodes 1-3 in the chosen mode (empties their tables)">Restart nodes in this mode</button>
+    <span style="width:12px"></span>
+    <label>Load per client PC <input id="rate" type="number" min="1" max="2000" value="50"> req/s</label>
+    <label>complexity <input id="cx" type="number" min="1" max="50" value="5"></label>
+    <button id="goAll" class="primary">Start all clients</button>
+    <button id="stopAll">Stop all</button>
+    <button id="resetAll">Reset stats</button>
+    <button id="verify">Verify convergence</button>
+  </div>
+  <div class="grid" id="nodes"></div>
+  <div class="grid" id="clients"></div>
+  <div class="row2">
+    <div class="panel">
+      <h3>Completed requests per second, all clients</h3>
+      <svg id="tput" viewBox="0 0 600 150" preserveAspectRatio="none"></svg>
+      <h3 style="margin-top:10px">p95 latency per client PC (ms, log scale)</h3>
+      <svg id="lat" viewBox="0 0 600 150" preserveAspectRatio="none"></svg>
+      <div class="legend" id="latLegend"></div>
+    </div>
+    <div class="panel"><h3>Node events (from each node's log)</h3><div id="log"></div></div>
+  </div>
+</main>
+<div id="toast"></div>
+<script>
+const $ = s => document.querySelector(s);
+const NC = ['', 'var(--n1)', 'var(--n2)', 'var(--n3)'];
+const CC = ['', '', '', '', 'var(--n1)', 'var(--n2)', 'var(--n3)'];
+let last = null, busy = false;
+
+function toast(msg) { const t = $('#toast'); t.textContent = msg; t.classList.add('on'); clearTimeout(toast.h); toast.h = setTimeout(() => t.classList.remove('on'), 3500); }
+async function act(pc, action, extra = {}) {
+  const r = await fetch('/api/act', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({pc, action, ...extra})});
+  const j = await r.json().catch(() => ({error: 'bad reply'}));
+  if (!r.ok || j.error || j.type === 'FailureRejected' || j.type === 'LoadRejected') throw new Error(j.error || j.reason || JSON.stringify(j));
+  return j;
+}
+async function run(label, fn) {
+  try { const out = await fn(); toast(label + ' ✓'); refresh(); return out; }
+  catch (e) { toast(label + ' failed: ' + e.message); }
+}
+const fmt = (v, d = 0) => v == null ? '–' : Number(v).toFixed(d);
+
+function nodeCard(p) {
+  const n = p.node || {}, pr = n.probe;
+  const isServer = pr && pr.server === p.pc && pr.phase === 'ready';
+  let phase = p.unreachable ? ['agent down', 'bad'] : !n.running ? ['stopped', 'bad'] : !pr ? ['no reply', 'warn']
+    : pr.phase === 'ready' ? ['ready', 'good'] : [pr.phase, 'warn'];
+  const kv = pr ? `
+    <div><b>${pr.epoch}</b><i>epoch</i></div><div><b>${pr.server ?? '–'}</b><i>sees server</i></div>
+    <div><b>${pr.queue_len}</b><i>queue</i></div><div><b>${pr.running}</b><i>running</i></div>
+    <div><b>${pr.load_score}</b><i>load score</i></div><div><b>${fmt(pr.cpu_load * 100)}%</b><i>CPU</i></div>
+    <div><b>${pr.requests}</b><i>requests</i></div><div><b>${pr.results}</b><i>results</i></div>` : '';
+  return `<div class="card ${p.unreachable || !n.running ? 'off' : ''}" style="border-top-color:${NC[p.pc]}">
+    <h2><span>PC ${p.pc} · node ${p.pc} ${isServer ? '<span class="pill server">SERVER</span>' : ''}</span>
+      <span><span class="pill ${phase[1]}">${phase[0]}</span> <span class="ip">${p.ip}:${7000 + p.pc}</span></span></h2>
+    <div class="legend">mode ${n.mode || '–'}${n.pid ? ' · pid ' + n.pid : ''}</div>
+    <div class="kv">${kv}</div>
+    <div class="btns">
+      <button data-a="mute" data-ms="5000" data-pc="${p.pc}">Mute 5 s</button>
+      <button data-a="mute" data-ms="20000" data-pc="${p.pc}">Mute 20 s</button>
+      <button data-a="cpu" data-pc="${p.pc}" title="Burn half the CPU threads for 25 s">CPU load 25 s</button>
+      <button data-a="kill" data-pc="${p.pc}" class="danger">Kill</button>
+      <button data-a="start" data-pc="${p.pc}">${n.running ? 'Restart' : 'Start'}</button>
+    </div>
+    ${p.unreachable ? `<div class="err">${p.unreachable}</div>` : n.error ? `<div class="err">${n.error}</div>` : ''}
+  </div>`;
+}
+
+function clientCard(p) {
+  const c = p.client || {}, w = c.window || {}, tot = c.totals || {};
+  const okRate = w.seconds ? w.ok / w.seconds : 0;
+  const served = w.served_by || {}, sum = Object.values(served).reduce((a, b) => a + b, 0) || 1;
+  const share = [1, 2, 3].map(i => served[i] ? `<span style="width:${100 * served[i] / sum}%;background:${NC[i]}"></span>` : '').join('');
+  const st = p.unreachable ? ['agent down', 'bad'] : c.active ? ['sending', 'good'] : ['idle', ''];
+  return `<div class="card ${p.unreachable ? 'off' : ''}" style="border-top-color:${CC[p.pc]}">
+    <h2><span>PC ${p.pc} · client</span><span><span class="pill ${st[1]}">${st[0]}</span> <span class="ip">${p.ip}</span></span></h2>
+    <div class="legend">${c.rate ? fmt(c.rate) + ' req/s offered · complexity ' + c.complexity : ''} · last ${w.seconds || 10} s:</div>
+    <div class="kv">
+      <div><b>${fmt(okRate, 1)}</b><i>done / s</i></div><div><b>${fmt(w.p50, 1)}</b><i>p50 ms</i></div>
+      <div><b>${fmt(w.p95, 1)}</b><i>p95 ms</i></div><div><b style="color:${w.failed ? 'var(--bad)' : 'inherit'}">${w.failed ?? '–'}</b><i>failed</i></div>
+      <div><b>${w.retried ?? '–'}</b><i>retried</i></div><div><b>${w.epoch ?? '–'}</b><i>max epoch</i></div>
+      <div><b>${tot.ok ?? 0}</b><i>total ok</i></div><div><b>${tot.failed ?? 0}</b><i>total failed</i></div>
+    </div>
+    <div class="share">${share}</div>
+    <div class="legend">served by: ${[1, 2, 3].map(i => `node ${i} ${fmt(100 * (served[i] || 0) / sum)}%`).join(' · ')}</div>
+    <div class="btns">
+      <input type="number" min="1" max="2000" value="${c.rate || 50}" id="r${p.pc}" title="req/s">
+      <button data-a="cstart" data-pc="${p.pc}">${c.active ? 'Set rate' : 'Start'}</button>
+      <button data-a="stop" data-pc="${p.pc}">Stop</button>
+    </div>
+    ${p.unreachable ? `<div class="err">${p.unreachable}</div>` : c.error ? `<div class="err">client: ${c.error}</div>` : ''}
+  </div>`;
+}
+
+function line(points, x0, x1, y0, y1, color, log) {
+  if (points.length < 2) return '';
+  const ty = v => log ? Math.log10(Math.max(1, v)) : v;
+  const Y0 = ty(y0), Y1 = ty(y1);
+  const d = points.map(([x, y]) => `${(600 * (x - x0) / (x1 - x0)).toFixed(1)},${(145 - 140 * (ty(y) - Y0) / ((Y1 - Y0) || 1)).toFixed(1)}`).join(' ');
+  return `<polyline points="${d}" fill="none" stroke="${color}" stroke-width="2" vector-effect="non-scaling-stroke"/>`;
+}
+function axis(label, top) { return `<text x="4" y="12" font-size="11" fill="var(--muted)" font-family="monospace">${label}</text><line x1="0" x2="600" y1="145" y2="145" stroke="var(--line)"/>`; }
+
+function charts(clients) {
+  const t1 = Date.now(), t0 = t1 - 120000;
+  const bins = new Map();
+  let lat = '', maxLat = 10, all = [];
+  clients.forEach(p => (p.client?.batches || []).forEach(b => { if (b.t >= t0) all.push([p.pc, b]); }));
+  all.forEach(([, b]) => { const k = Math.floor(b.t / 2000) * 2000; bins.set(k, (bins.get(k) || 0) + b.ok / 2); if (b.p95) maxLat = Math.max(maxLat, b.p95); });
+  const tp = [...bins.entries()].sort((a, b) => a[0] - b[0]);
+  const maxT = Math.max(10, ...tp.map(x => x[1]));
+  $('#tput').innerHTML = axis(`max ${fmt(maxT)} req/s · last 2 min`) + line(tp, t0, t1, 0, maxT * 1.1, 'var(--ink)');
+  clients.forEach(p => {
+    const pts = (p.client?.batches || []).filter(b => b.t >= t0 && b.p95).map(b => [b.t, b.p95]);
+    lat += line(pts, t0, t1, 1, maxLat * 1.2, CC[p.pc], true);
+  });
+  $('#lat').innerHTML = axis(`max ${fmt(maxLat)} ms`) + lat;
+  $('#latLegend').innerHTML = [4, 5, 6].map(i => `<span style="color:${CC[i]}">■</span> PC ${i}`).join(' &nbsp; ');
+}
+
+function render(c) {
+  const nodes = c.pcs.filter(p => p.role === 'node'), clients = c.pcs.filter(p => p.role === 'client');
+  $('#from').textContent = `served by PC ${c.served_from}`;
+  if (!busy) {
+    $('#nodes').innerHTML = nodes.map(nodeCard).join('');
+    const focus = document.activeElement?.id;
+    if (!/^r[456]$/.test(focus || '')) $('#clients').innerHTML = clients.map(clientCard).join('');
+  }
+  const probes = nodes.map(p => p.node?.probe).filter(Boolean);
+  const ready = probes.filter(p => p.phase === 'ready');
+  const servers = [...new Set(ready.map(p => p.server).filter(s => s != null))];
+  const epoch = Math.max(0, ...probes.map(p => p.epoch));
+  const mode = nodes.map(p => p.node?.mode).filter(Boolean);
+  const modeTxt = [...new Set(mode)].join('/') || '–';
+  const s = $('#summary');
+  if (servers.length === 1) { s.className = 'pill good'; s.textContent = `server: node ${servers[0]} · epoch ${epoch} · ${ready.length}/3 ready · ${modeTxt}`; }
+  else if (servers.length > 1) { s.className = 'pill warn'; s.textContent = `nodes disagree on server (${servers.join(', ')}) · epoch ${epoch} · ${modeTxt}`; }
+  else { s.className = 'pill warn'; s.textContent = `no server elected yet · ${ready.length}/3 ready · ${modeTxt}${modeTxt === 'per_request' ? ' (elects per request)' : ''}`; }
+  const res = ready.map(p => p.results), conv = $('#conv');
+  if (res.length >= 2 && res.every(r => r === res[0])) { conv.className = 'pill good'; conv.textContent = `results tables: ${res[0]} on ${res.length} ready nodes`; }
+  else { conv.className = 'pill warn'; conv.textContent = `results: ${ready.map(p => 'n' + p.node_id + ' ' + p.results).join(' · ') || '–'}`; }
+  charts(clients);
+  const ev = [];
+  nodes.forEach(p => (p.node?.events || []).forEach(l => ev.push([l, p.pc])));
+  ev.sort((a, b) => a[0] < b[0] ? -1 : 1);
+  const log = $('#log'), atEnd = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
+  log.innerHTML = ev.slice(-60).map(([l, pc]) => `<div class="n${pc}">[node ${pc}] ${l.replace(/&/g, '&amp;').replace(/</g, '&lt;')}</div>`).join('');
+  if (atEnd) log.scrollTop = log.scrollHeight;
+  if (!last) { const m = mode[0]; if (m) $('#mode').value = m; }
+  last = c;
+}
+
+async function refresh() {
+  try { const r = await fetch('/api/cluster', {cache: 'no-store'}); render(await r.json()); }
+  catch (e) { $('#summary').className = 'pill bad'; $('#summary').textContent = 'dashboard agent unreachable'; }
+}
+
+document.addEventListener('click', e => {
+  const b = e.target.closest('button[data-a]'); if (!b) return;
+  const pc = +b.dataset.pc, a = b.dataset.a;
+  if (a === 'mute') run(`Mute node ${pc} for ${b.dataset.ms / 1000} s`, () => act(pc, 'mute', {ms: +b.dataset.ms}));
+  if (a === 'cpu') run(`CPU load on node ${pc}`, () => act(pc, 'cpu'));
+  if (a === 'kill') run(`Kill node ${pc}`, () => act(pc, 'kill'));
+  if (a === 'start') run(`Start node ${pc}`, () => act(pc, 'start', {mode: last?.pcs[pc - 1]?.node?.mode || $('#mode').value}));
+  if (a === 'cstart') run(`PC ${pc} load`, () => act(pc, 'start', {rate: +$('#r' + pc).value, complexity: +$('#cx').value}));
+  if (a === 'stop') run(`Stop PC ${pc}`, () => act(pc, 'stop'));
+});
+$('#restartAll').onclick = () => run(`Restart nodes in ${$('#mode').value}`, () => Promise.all([1, 2, 3].map(pc => act(pc, 'start', {mode: $('#mode').value}))));
+$('#goAll').onclick = () => run('Start all clients', () => Promise.all([4, 5, 6].map(pc => act(pc, 'start', {rate: +$('#rate').value, complexity: +$('#cx').value}))));
+$('#stopAll').onclick = () => run('Stop all clients', () => Promise.all([4, 5, 6].map(pc => act(pc, 'stop'))));
+$('#resetAll').onclick = () => run('Reset stats', () => Promise.all([4, 5, 6].map(pc => act(pc, 'reset'))));
+$('#verify').onclick = async () => {
+  const out = await Promise.all([1, 2, 3].map(pc => act(pc, 'digest').catch(e => ({node_id: pc, error: e.message}))));
+  const ok = out.filter(o => !o.error), same = ok.length > 1 && ok.every(o => o.results === ok[0].results && o.results_digest === ok[0].results_digest);
+  toast((same ? 'IDENTICAL results tables: ' : 'Tables differ / in flight: ') + out.map(o => o.error ? `n${o.node_id} down` : `n${o.node_id} ${o.results} #${Number(o.results_digest).toString(16).slice(-6)}`).join(' · '));
+};
+refresh(); setInterval(refresh, 1000);
+</script>
+</body>
+</html>

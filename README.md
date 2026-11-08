@@ -142,3 +142,7 @@ campus locally. Log level: `RUST_LOG=debug` for per-request lines.
 - [docs/deployment.md](docs/deployment.md): running on lab PCs and laptops
 - [docs/recovery.md](docs/recovery.md): server rejoin and state recovery, after a mute or a cold restart
 - [docs/stress-testing.md](docs/stress-testing.md): stress harness, metrics, results and analysis
+
+## Six-PC live demo
+
+Run the real cluster on six Ubuntu PCs (3 nodes, 3 clients) with a live dashboard: see [live-demo/README.md](live-demo/README.md).

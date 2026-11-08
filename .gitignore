@@ -14,3 +14,6 @@ experiments/recovery/sweep*.log
 lab.json
 .tools/
 __pycache__/
+live-demo/run/
+live-demo/lab.json
+__pycache__/
